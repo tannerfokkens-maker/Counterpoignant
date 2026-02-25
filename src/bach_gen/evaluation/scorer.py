@@ -37,13 +37,13 @@ class ScoreBreakdown:
 
 # Default weights
 DEFAULT_WEIGHTS = {
-    "voice_leading": 0.25,
-    "statistical": 0.15,
-    "structural": 0.15,
+    "structural": 0.25,
+    "statistical": 0.20,
+    "thematic_recall": 0.15,
     "information": 0.15,
-    "contrapuntal": 0.10,
-    "completeness": 0.10,
-    "thematic_recall": 0.10,
+    "voice_leading": 0.10,
+    "contrapuntal": 0.08,
+    "completeness": 0.07,
 }
 
 

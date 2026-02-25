@@ -500,11 +500,15 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
               help="Learning rate for DroPE recalibration (default: 1e-3)")
 @click.option("--fp16", is_flag=True, default=False,
               help="Enable mixed precision (fp16) training — CUDA only")
+@click.option("--pos-encoding", type=click.Choice(["rope", "pope"]),
+              default="rope", help="Positional encoding: rope (default) or pope")
+@click.option("--num-kv-heads", default=None, type=int,
+              help="Number of KV heads for GQA (default: same as num_heads = standard MHA)")
 def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: str | None,
           accumulation_steps: int, resume: str | None, data_dir: str | None,
           curriculum: bool, pretrain_epochs: int, finetune_data_dir: str,
           finetune_lr: float, drope: bool, drope_epochs: int, drope_lr: float,
-          fp16: bool) -> None:
+          fp16: bool, pos_encoding: str, num_kv_heads: int | None) -> None:
     """Train the Bach Transformer model."""
     import torch
     from bach_gen.data.dataset import BachDataset, create_dataset
@@ -563,6 +567,8 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
     config = ModelConfig(
         vocab_size=tokenizer.vocab_size,
         max_seq_len=seq_len,
+        pos_encoding=pos_encoding,
+        num_kv_heads=num_kv_heads,
     )
 
     model = BachTransformer(config)
@@ -571,7 +577,10 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
     console.print(f"  Parameters: {model.count_parameters():,}")
     console.print(f"  Device: {device}")
     console.print(f"  Vocab size: {config.vocab_size}")
-    console.print(f"  Config: {config.embed_dim}d, {config.num_heads}h, "
+    attn_desc = f"{config.num_heads}h"
+    if config.effective_num_kv_heads < config.num_heads:
+        attn_desc += f" (GQA: {config.effective_num_kv_heads} KV heads)"
+    console.print(f"  Config: {config.embed_dim}d, {attn_desc}, "
                   f"{config.num_layers}L, {config.ffn_dim}ff")
 
     # Train

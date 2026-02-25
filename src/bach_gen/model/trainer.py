@@ -349,7 +349,10 @@ class Trainer:
 
         history = {"train_loss": [], "val_loss": [], "lr": []}
 
-        logger.info(f"DroPE recalibration: {epochs} epochs, lr={lr}, use_rope=False")
+        logger.info(
+            f"DroPE recalibration: {epochs} epochs, lr={lr}, "
+            f"dropping {self.model.config.pos_encoding} positional encoding"
+        )
 
         for epoch in range(1, epochs + 1):
             self.epoch = epoch
@@ -410,8 +413,37 @@ class Trainer:
         device = device or get_device()
         checkpoint = torch.load(path, map_location=device, weights_only=False)
         config = checkpoint["config"]
+        # Backward compat: old checkpoints lack pos_encoding
+        if not hasattr(config, "pos_encoding"):
+            config.pos_encoding = "rope"
+        # Backward compat: old checkpoints lack num_kv_heads
+        if not hasattr(config, "num_kv_heads"):
+            config.num_kv_heads = None
         model = BachTransformer(config)
-        model.load_state_dict(checkpoint["model_state_dict"])
+
+        # Migrate old combined QKV weights to separate Q/K/V projections
+        state = checkpoint["model_state_dict"]
+        qkv_keys = [k for k in state if ".attn.qkv." in k]
+        if qkv_keys:
+            embed_dim = config.embed_dim
+            for key in list(state.keys()):
+                if ".attn.qkv.weight" in key:
+                    w = state.pop(key)  # (3*embed_dim, embed_dim)
+                    q_w, k_w, v_w = w.chunk(3, dim=0)
+                    prefix = key.replace(".qkv.weight", "")
+                    state[f"{prefix}.q_proj.weight"] = q_w
+                    state[f"{prefix}.k_proj.weight"] = k_w
+                    state[f"{prefix}.v_proj.weight"] = v_w
+                elif ".attn.qkv.bias" in key:
+                    b = state.pop(key)  # (3*embed_dim,)
+                    q_b, k_b, v_b = b.chunk(3, dim=0)
+                    prefix = key.replace(".qkv.bias", "")
+                    state[f"{prefix}.q_proj.bias"] = q_b
+                    state[f"{prefix}.k_proj.bias"] = k_b
+                    state[f"{prefix}.v_proj.bias"] = v_b
+            logger.info("Migrated old QKV weights to separate Q/K/V projections")
+
+        model.load_state_dict(state)
         model = model.to(device)
         model.eval()
         logger.info(f"Loaded checkpoint from {path} (epoch {checkpoint['epoch']})")
