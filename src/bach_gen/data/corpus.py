@@ -1,7 +1,7 @@
-"""Extract Bach works from music21 corpus.
+"""Extract works from music21 corpus and user-supplied files.
 
-Loads Bach works from multiple sources:
-1. Broad music21 corpus search (composer, title, catalog number)
+Loads works from multiple sources:
+1. Broad music21 corpus search (Bach, Palestrina, Monteverdi, Mozart, etc.)
 2. Targeted BWV loading from constants.py lists
 3. User-supplied MIDI files in data/midi/
 
@@ -22,11 +22,11 @@ from bach_gen.utils.constants import ALL_TARGETED_BWV, DIR_TO_STYLE
 logger = logging.getLogger(__name__)
 
 
-def _search_bach_broad() -> list[tuple[str, music21.stream.Score, str]]:
-    """Search music21 corpus broadly for Bach works.
+def _search_corpus_broad() -> list[tuple[str, music21.stream.Score, str]]:
+    """Search music21 corpus broadly for all relevant composers.
 
-    Searches by composer, title keywords, and catalog number to cast a
-    wide net.  Deduplicates by sourcePath so the same file is never
+    Searches by composer name to cast a wide net across the built-in
+    corpus.  Deduplicates by sourcePath so the same file is never
     loaded twice.
 
     Returns:
@@ -35,12 +35,33 @@ def _search_bach_broad() -> list[tuple[str, music21.stream.Score, str]]:
     seen_paths: set[str] = set()
     results: list[tuple[str, music21.stream.Score, str]] = []
 
-    search_queries = [
-        ("bach", "composer"),
-        ("bach", "title"),
+    # (search_query, field, style)
+    CORPUS_SEARCHES = [
+        # Bach — composer and title (catches BWV references)
+        ("bach", "composer", "bach"),
+        ("bach", "title", "bach"),
+        # Renaissance
+        ("palestrina", "composer", "renaissance"),
+        ("monteverdi", "composer", "renaissance"),
+        ("josquin", "composer", "renaissance"),
+        ("ciconia", "composer", "renaissance"),
+        ("luca", "composer", "renaissance"),
+        ("trecento", "composer", "renaissance"),
+        # Baroque
+        ("handel", "composer", "baroque"),
+        ("corelli", "composer", "baroque"),
+        ("cpebach", "composer", "baroque"),
+        # Classical
+        ("haydn", "composer", "classical"),
+        ("mozart", "composer", "classical"),
+        ("beethoven", "composer", "classical"),
+        # Romantic
+        ("schubert", "composer", "classical"),
+        ("schumann_robert", "composer", "classical"),
+        ("schumann_clara", "composer", "classical"),
     ]
 
-    for query, field in search_queries:
+    for query, field, style in CORPUS_SEARCHES:
         try:
             refs = corpus.search(query, field)
         except Exception as e:
@@ -57,7 +78,7 @@ def _search_bach_broad() -> list[tuple[str, music21.stream.Score, str]]:
                 score = ref.parse()
                 parts = list(score.parts)
                 if len(parts) >= 2:
-                    results.append((path, score, "bach"))
+                    results.append((path, score, style))
             except Exception as e:
                 logger.debug(f"Could not parse {path}: {e}")
 
@@ -205,7 +226,7 @@ def get_all_works(
         return style.lower() in accepted
 
     # Phase 1: broad search
-    works = _search_bach_broad()
+    works = _search_corpus_broad()
     loaded_paths = {path for path, _, _ in works}
 
     # Phase 2: targeted BWV loading

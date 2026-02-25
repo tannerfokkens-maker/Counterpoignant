@@ -151,9 +151,17 @@ DIR_TO_STYLE: dict[str, str] = {
     "buxtehude": "baroque",
     "pachelbel": "baroque",
     "corelli": "baroque",
+    "handel": "baroque",
     "vivaldi": "baroque",
     "frescobaldi": "baroque",
-    "monteverdi": "baroque",
+    "cpebach": "baroque",
+    "monteverdi": "renaissance",
+    # Renaissance (music21 corpus)
+    "palestrina": "renaissance",
+    "trecento": "renaissance",
+    "ciconia": "renaissance",
+    "luca": "renaissance",
+    "lusitano": "renaissance",
     # Renaissance
     "josquin": "renaissance",
     "ockeghem": "renaissance",
@@ -192,6 +200,8 @@ DIR_TO_STYLE: dict[str, str] = {
     "brahms": "classical",   # close enough for our purposes
     "schubert": "classical",
     "schumann": "classical",
+    "schumann_robert": "classical",
+    "schumann_clara": "classical",
     "cherubini": "classical",
     "hoffmeister": "classical",
 }
@@ -237,6 +247,13 @@ DIR_TO_FORM: dict[str, str] = {
     "cherubini": "quartet",
     "hoffmeister": "quartet",
     "boccherini": "quartet",
+    # Renaissance (music21 corpus)
+    "palestrina": "motet",
+    "trecento": "motet",
+    "ciconia": "motet",
+    "luca": "motet",
+    "lusitano": "motet",
+    "monteverdi": "motet",
 }
 
 
