@@ -498,10 +498,13 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
               help="Number of DroPE recalibration epochs (default: 10)")
 @click.option("--drope-lr", default=1e-3, type=float,
               help="Learning rate for DroPE recalibration (default: 1e-3)")
+@click.option("--fp16", is_flag=True, default=False,
+              help="Enable mixed precision (fp16) training — CUDA only")
 def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: str | None,
           accumulation_steps: int, resume: str | None, data_dir: str | None,
           curriculum: bool, pretrain_epochs: int, finetune_data_dir: str,
-          finetune_lr: float, drope: bool, drope_epochs: int, drope_lr: float) -> None:
+          finetune_lr: float, drope: bool, drope_epochs: int, drope_lr: float,
+          fp16: bool) -> None:
     """Train the Bach Transformer model."""
     import torch
     from bach_gen.data.dataset import BachDataset, create_dataset
@@ -582,6 +585,7 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
         checkpoint_dir=MODELS_DIR,
         device=device,
         accumulation_steps=accumulation_steps,
+        fp16=fp16,
     )
 
     start_epoch = 1
