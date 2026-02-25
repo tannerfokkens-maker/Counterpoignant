@@ -266,26 +266,31 @@ class CausalSelfAttention(nn.Module):
             q = apply_rotary_emb(q, cos, sin)
             k = apply_rotary_emb(k, cos, sin)
 
-        # Attention scores
-        scale = math.sqrt(self.head_dim)
-        attn = (q @ k.transpose(-2, -1)) / scale  # (B, H, T, T)
-
-        # Apply causal mask
-        attn = attn.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
-
-        # Apply padding mask
-        if pad_mask is not None:
-            attn = attn.masked_fill(pad_mask == 0, float("-inf"))
-
         # DroPE attention temperature scaling (Gelberg et al. 2025)
+        # Scale Q before SDPA (equivalent to dividing attn logits by temperature)
         if attn_temperature is not None and attn_temperature != 1.0:
-            attn = attn / attn_temperature
+            q = q / math.sqrt(attn_temperature)
 
-        attn = F.softmax(attn, dim=-1)
-        attn = self.attn_dropout(attn)
+        # Build attention mask combining causal + padding
+        attn_mask = None
+        if pad_mask is not None:
+            # pad_mask: (B, 1, T, T) where 0 = ignore
+            # Combine with causal mask: both must allow attention
+            combined = causal_mask.unsqueeze(0).unsqueeze(0) | (pad_mask == 0)
+            # Convert bool mask to float: True (blocked) -> -inf, False (attend) -> 0
+            attn_mask = torch.zeros_like(combined, dtype=q.dtype)
+            attn_mask.masked_fill_(combined, float("-inf"))
 
-        # Weighted sum
-        out = (attn @ v).transpose(1, 2).reshape(B, T, C)
+        # Use PyTorch's scaled_dot_product_attention (Flash Attention when available)
+        dropout_p = self.attn_dropout.p if self.training else 0.0
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attn_mask,
+            dropout_p=dropout_p,
+            is_causal=(attn_mask is None),  # use built-in causal mask when no padding
+        )
+
+        out = out.transpose(1, 2).reshape(B, T, C)
         out = self.proj_dropout(self.proj(out))
 
         return out
