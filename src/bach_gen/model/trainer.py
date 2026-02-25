@@ -49,6 +49,7 @@ class Trainer:
         checkpoint_dir: str | Path = "models",
         device: torch.device | None = None,
         accumulation_steps: int = 1,
+        fp16: bool = False,
     ):
         self.device = device or get_device()
         self.model = model.to(self.device)
@@ -58,6 +59,12 @@ class Trainer:
         self.accumulation_steps = accumulation_steps
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+        # Mixed precision — only on CUDA
+        self.fp16 = fp16 and self.device.type == "cuda"
+        self.scaler = torch.amp.GradScaler(self.device.type, enabled=self.fp16)
+        if self.fp16:
+            logger.info("Mixed precision (fp16) enabled")
 
         # Optimizer
         self.optimizer = torch.optim.AdamW(
@@ -235,26 +242,29 @@ class Trainer:
             # Create attention mask (non-PAD tokens)
             attention_mask = (input_ids != 0).long()
 
-            logits = self.model(input_ids, attention_mask=attention_mask, use_rope=use_rope)
+            with torch.amp.autocast(self.device.type, enabled=self.fp16):
+                logits = self.model(input_ids, attention_mask=attention_mask, use_rope=use_rope)
 
-            loss = self.criterion(
-                logits.reshape(-1, logits.size(-1)),
-                labels.reshape(-1),
-            )
+                loss = self.criterion(
+                    logits.reshape(-1, logits.size(-1)),
+                    labels.reshape(-1),
+                )
 
             # Scale loss for accumulation
             scaled_loss = loss / self.accumulation_steps
-            scaled_loss.backward()
+            self.scaler.scale(scaled_loss).backward()
 
             total_loss += loss.item()
             n_batches += 1
 
             # Step when we've accumulated enough, or at the last batch
             if (batch_idx + 1) % self.accumulation_steps == 0 or (batch_idx + 1) == len(loader):
-                # Gradient clipping
+                # Gradient clipping (unscale first for fp16)
+                self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
 
-                self.optimizer.step()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
                 self.optimizer.zero_grad()
 
         return total_loss / max(n_batches, 1)
@@ -271,12 +281,13 @@ class Trainer:
             labels = batch["labels"].to(self.device)
             attention_mask = (input_ids != 0).long()
 
-            logits = self.model(input_ids, attention_mask=attention_mask, use_rope=use_rope)
+            with torch.amp.autocast(self.device.type, enabled=self.fp16):
+                logits = self.model(input_ids, attention_mask=attention_mask, use_rope=use_rope)
 
-            loss = self.criterion(
-                logits.reshape(-1, logits.size(-1)),
-                labels.reshape(-1),
-            )
+                loss = self.criterion(
+                    logits.reshape(-1, logits.size(-1)),
+                    labels.reshape(-1),
+                )
 
             total_loss += loss.item()
             n_batches += 1
