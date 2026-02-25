@@ -246,7 +246,7 @@ def bwv_to_form(bwv: int) -> str | None:
         return "invention"
     if 787 <= bwv <= 801:
         return "sinfonia"
-    if bwv in set(WTC_BOOK1_FUGUES + WTC_BOOK2_FUGUES) or 1080 <= bwv <= 1080:
+    if bwv in set(WTC_BOOK1_FUGUES + WTC_BOOK2_FUGUES) or bwv in {565, 1080}:
         return "fugue"
     if 525 <= bwv <= 530:
         return "trio_sonata"
