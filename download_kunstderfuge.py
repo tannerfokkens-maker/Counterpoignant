@@ -268,7 +268,7 @@ def triage_midi(filepath: Path) -> dict:
 # De-perform: quantize + strip dynamics
 # ---------------------------------------------------------------------------
 
-def deperform_midi(src: Path, dest: Path, grid: int = 16, velocity: int = 64) -> bool:
+def deperform_midi(src: Path, dest: Path, grid: int = 24, velocity: int = 64) -> bool:
     """Quantize timing, normalize velocity, strip CCs from a MIDI file.
 
     Args:
