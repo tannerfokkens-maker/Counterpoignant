@@ -29,9 +29,20 @@ fi
 # mode=all, tokenizer=scale-degree, max-seq-len=4096,
 # max-source-voices=4, max-groups-per-work=1, max-pairs-per-work=2,
 # pair-strategy=adjacent+outer, sonata-policy=counterpoint-safe
-UV_CACHE_DIR="$UV_CACHE_DIR" uv run bach-gen prepare-data \
-  --data-dir "$OUT_DIR" \
-  | tee "$LOG_FILE"
+#
+# Prefer installed console script, but fall back to module execution with
+# PYTHONPATH=src for editable-less/dev environments.
+if UV_CACHE_DIR="$UV_CACHE_DIR" uv run bach-gen --help >/dev/null 2>&1; then
+  UV_CACHE_DIR="$UV_CACHE_DIR" uv run bach-gen prepare-data \
+    --data-dir "$OUT_DIR" \
+    | tee "$LOG_FILE"
+else
+  echo "Info: 'uv run bach-gen' unavailable; using module fallback (PYTHONPATH=src)."
+  UV_CACHE_DIR="$UV_CACHE_DIR" uv run env PYTHONPATH=src \
+    python -m bach_gen.cli prepare-data \
+    --data-dir "$OUT_DIR" \
+    | tee "$LOG_FILE"
+fi
 
 printf "\n== Parsed Summary ==\n"
 python - "$OUT_DIR" << 'PY'
