@@ -91,13 +91,16 @@ def compute_imitation(comp: VoiceComposition) -> str:
 
     Normalisation: total time-offset match count / total notes.
 
-    Thresholds (calibrated on corpus — p33=0.10, p67=0.30):
+    Thresholds (validated on Bach kern corpus: 77 chorales → 96% none,
+    13 inventions → 69% high, 44 WTC fugues → 93% high):
         normalised_matches > 0.30 → "high"
         normalised_matches > 0.10 → "low"
         else                      → "none"
     """
-    ngram_len = 4
-    min_offset = TICKS_PER_QUARTER  # 1 quarter note
+    ngram_len = 6  # 6-grams: long enough that coincidental cross-voice matches
+                   # in homophonic music are rare; short enough to catch 8-note
+                   # invention subjects and fugue answers.
+    min_offset = TICKS_PER_QUARTER  # ≥1 quarter note time gap required
 
     # Build per-voice: ngram → [start ticks]
     voice_ngram_times: list[dict[tuple[int, ...], list[int]]] = []
@@ -242,12 +245,11 @@ def compute_harmonic_tension(
 
     Chromaticism is now its own separate token; see ``compute_chromaticism``.
 
-    Thresholds (placeholder — recalibrate on full corpus with the diagnostic
-    script below.  p33 and p67 for Bach chorales sampled at union-of-attacks
-    are typically in the 0.25–0.45 range due to dense passing tones):
-        dissonance_ratio > 0.38 → "high"
-        dissonance_ratio > 0.25 → "moderate"
-        else                    → "low"
+    Thresholds (calibrated on 80-piece Bach corpus sample — p33=0.128,
+    p67=0.145; full range 0.070–0.223):
+        dissonance_ratio > 0.145 → "high"
+        dissonance_ratio > 0.128 → "moderate"
+        else                     → "low"
     """
     dissonant_set = {1, 2, 6, 10, 11}
     dissonant_intervals = 0
@@ -283,9 +285,9 @@ def compute_harmonic_tension(
 
     dissonance_ratio = dissonant_intervals / interval_count
 
-    if dissonance_ratio > 0.38:
+    if dissonance_ratio > 0.145:
         return "high"
-    elif dissonance_ratio > 0.25:
+    elif dissonance_ratio > 0.128:
         return "moderate"
     else:
         return "low"
