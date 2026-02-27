@@ -13,8 +13,6 @@ on the full corpus to update them.
 
 from __future__ import annotations
 
-from itertools import product
-
 from bach_gen.data.extraction import VoiceComposition
 from bach_gen.utils.constants import (
     TICKS_PER_QUARTER,
@@ -79,61 +77,78 @@ def compute_imitation(comp: VoiceComposition) -> str:
     """Classify imitation level as none, low, or high.
 
     Extracts melodic interval sequences per voice (consecutive pitch
-    intervals), builds a set of interval 4-grams for each voice, then
-    counts how many 4-grams from one voice appear in another.  The match
-    count is normalised by piece length (total notes).
+    intervals) and builds a dict mapping each 4-gram to the list of tick
+    positions where it starts.  A cross-voice match counts only when the
+    same n-gram (or a single-position ±1 variant, to catch tonal answers
+    where one interval shifts by a semitone) appears in two voices starting
+    at tick positions that differ by at least MIN_OFFSET ticks.
 
-    Thresholds (calibrated on corpus — p33=0.17, p67=0.27):
-        normalised_matches > 0.27 → "high"
-        normalised_matches > 0.17 → "low"
+    The time-offset requirement is what separates true imitation from
+    homophony: in a chorale all voices move together, so shared interval
+    patterns have zero (or near-zero) time offsets and are excluded.
+
+    MIN_OFFSET = TICKS_PER_QUARTER (one quarter note = 480 ticks at 480 tpq).
+
+    Normalisation: total time-offset match count / total notes.
+
+    Thresholds (calibrated on corpus — p33=0.10, p67=0.30):
+        normalised_matches > 0.30 → "high"
+        normalised_matches > 0.10 → "low"
         else                      → "none"
     """
-    # Extract interval sequences per voice
-    voice_intervals: list[list[int]] = []
-    for voice in comp.voices:
-        if len(voice) < 2:
-            voice_intervals.append([])
-            continue
-        sorted_notes = sorted(voice, key=lambda n: n[0])
-        intervals = []
-        for i in range(1, len(sorted_notes)):
-            intervals.append(sorted_notes[i][2] - sorted_notes[i - 1][2])
-        voice_intervals.append(intervals)
-
-    # Build 4-gram sets per voice
     ngram_len = 4
-    voice_ngrams: list[set[tuple[int, ...]]] = []
-    for intervals in voice_intervals:
-        ngrams: set[tuple[int, ...]] = set()
-        for i in range(len(intervals) - ngram_len + 1):
-            ngrams.add(tuple(intervals[i : i + ngram_len]))
-        voice_ngrams.append(ngrams)
+    min_offset = TICKS_PER_QUARTER  # 1 quarter note
 
-    # Count matches across voice pairs.
-    # Allow ±1 semitone tolerance per element so tonal fugue answers
-    # (where one interval shifts by a semitone, e.g. P5→P4) still match.
-    total_matches = 0
+    # Build per-voice: ngram → [start ticks]
+    voice_ngram_times: list[dict[tuple[int, ...], list[int]]] = []
+    for voice in comp.voices:
+        sorted_notes = sorted(voice, key=lambda n: n[0])
+        ngram_time_map: dict[tuple[int, ...], list[int]] = {}
+        for i in range(len(sorted_notes) - ngram_len):
+            ng = tuple(
+                sorted_notes[k + 1][2] - sorted_notes[k][2]
+                for k in range(i, i + ngram_len)
+            )
+            t = sorted_notes[i][0]
+            ngram_time_map.setdefault(ng, []).append(t)
+        voice_ngram_times.append(ngram_time_map)
+
     total_notes = sum(len(v) for v in comp.voices)
     if total_notes == 0:
         return "none"
 
-    for i in range(len(voice_ngrams)):
-        for j in range(i + 1, len(voice_ngrams)):
-            if not voice_ngrams[i] or not voice_ngrams[j]:
+    imitative_matches = 0
+
+    for vi in range(len(voice_ngram_times)):
+        for vj in range(vi + 1, len(voice_ngram_times)):
+            map_i = voice_ngram_times[vi]
+            map_j = voice_ngram_times[vj]
+            if not map_i or not map_j:
                 continue
-            # Expand voice i's 4-grams to all ±1 variants (3^4 = 81 per gram)
-            fuzzy_i: set[tuple[int, ...]] = set()
-            for ng in voice_ngrams[i]:
-                for deltas in product((-1, 0, 1), repeat=ngram_len):
-                    fuzzy_i.add(tuple(x + d for x, d in zip(ng, deltas)))
-            matches = fuzzy_i & voice_ngrams[j]
-            total_matches += len(matches)
 
-    normalised = total_matches / total_notes
+            for ng_i, times_i in map_i.items():
+                # Exact match + single-position ±1 (catches tonal answers)
+                candidates = {ng_i}
+                for pos in range(len(ng_i)):
+                    for delta in (-1, +1):
+                        v = list(ng_i)
+                        v[pos] += delta
+                        candidates.add(tuple(v))
 
-    if normalised > 0.27:
+                for ng_cand in candidates:
+                    if ng_cand not in map_j:
+                        continue
+                    times_j = map_j[ng_cand]
+                    for t_i in times_i:
+                        for t_j in times_j:
+                            if abs(t_j - t_i) >= min_offset:
+                                imitative_matches += 1
+
+    normalised = imitative_matches / total_notes
+
+    if normalised > 0.30:
         return "high"
-    elif normalised > 0.17:
+    elif normalised > 0.10:
         return "low"
     else:
         return "none"
@@ -227,10 +242,12 @@ def compute_harmonic_tension(
 
     Chromaticism is now its own separate token; see ``compute_chromaticism``.
 
-    Thresholds (calibrated on corpus — p33=0.067, p67=0.110):
-        dissonance_ratio > 0.110 → "high"
-        dissonance_ratio > 0.067 → "moderate"
-        else                     → "low"
+    Thresholds (placeholder — recalibrate on full corpus with the diagnostic
+    script below.  p33 and p67 for Bach chorales sampled at union-of-attacks
+    are typically in the 0.25–0.45 range due to dense passing tones):
+        dissonance_ratio > 0.38 → "high"
+        dissonance_ratio > 0.25 → "moderate"
+        else                    → "low"
     """
     dissonant_set = {1, 2, 6, 10, 11}
     dissonant_intervals = 0
@@ -266,9 +283,9 @@ def compute_harmonic_tension(
 
     dissonance_ratio = dissonant_intervals / interval_count
 
-    if dissonance_ratio > 0.110:
+    if dissonance_ratio > 0.38:
         return "high"
-    elif dissonance_ratio > 0.067:
+    elif dissonance_ratio > 0.25:
         return "moderate"
     else:
         return "low"
