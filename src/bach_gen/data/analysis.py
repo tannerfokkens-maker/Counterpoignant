@@ -189,7 +189,8 @@ def compute_harmonic_rhythm(
             if end > max_tick:
                 max_tick = end
 
-    n_measures = max(1, max_tick // measure_ticks)
+    # Ceiling division so a partial trailing bar still counts as a measure.
+    n_measures = max(1, (max_tick + measure_ticks - 1) // measure_ticks)
 
     # Build list of absolute beat positions
     abs_beats: list[int] = []

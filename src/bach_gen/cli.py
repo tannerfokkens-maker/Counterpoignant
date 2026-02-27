@@ -105,7 +105,7 @@ def _print_conditioning_histograms(sequences: list[list[int]], tokenizer) -> Non
             name = tokenizer.token_to_name.get(tok, "")
             if name.startswith(("STYLE_", "FORM_", "MODE_", "LENGTH_", "METER_",
                                 "TEXTURE_", "IMITATION_", "HARMONIC_RHYTHM_",
-                                "TENSION_", "ENCODE_")):
+                                "HARMONIC_TENSION_", "CHROMATICISM_", "ENCODE_")):
                 token_counts[name] += 1
 
     # Group by category
@@ -118,7 +118,8 @@ def _print_conditioning_histograms(sequences: list[list[int]], tokenizer) -> Non
         "Texture": {k: v for k, v in token_counts.items() if k.startswith("TEXTURE_")},
         "Imitation": {k: v for k, v in token_counts.items() if k.startswith("IMITATION_")},
         "Harmonic Rhythm": {k: v for k, v in token_counts.items() if k.startswith("HARMONIC_RHYTHM_")},
-        "Tension": {k: v for k, v in token_counts.items() if k.startswith("TENSION_")},
+        "Tension": {k: v for k, v in token_counts.items() if k.startswith("HARMONIC_TENSION_")},
+        "Chromaticism": {k: v for k, v in token_counts.items() if k.startswith("CHROMATICISM_")},
         "Encoding": {k: v for k, v in token_counts.items() if k.startswith("ENCODE_")},
     }
 
@@ -149,9 +150,20 @@ def _print_conditioning_histograms(sequences: list[list[int]], tokenizer) -> Non
               help="Comma-separated composer/style names to include (e.g. 'bach' or 'bach,baroque')")
 @click.option("--no-sequential", is_flag=True, default=False,
               help="Disable dual sequential encoding (skip voice-by-voice training data)")
+@click.option("--max-source-voices", default=4, type=int,
+              help="Skip works whose raw score has more than this many parts (default: 4)")
+@click.option("--max-groups-per-work", default=1, type=int,
+              help="Cap extracted N-voice groups per work (default: 1)")
+@click.option("--pair-strategy", type=click.Choice(["adjacent+outer", "adjacent-only", "all-combinations"]),
+              default="adjacent+outer",
+              help="How to derive 2-part pairs from multi-voice works (default: adjacent+outer)")
+@click.option("--max-pairs-per-work", default=2, type=int,
+              help="Cap extracted 2-part pairs per work (default: 2)")
 def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len: int,
                  no_chunk: bool, data_dir: str | None, composer_filter: str | None,
-                 no_sequential: bool) -> None:
+                 no_sequential: bool, max_source_voices: int,
+                 max_groups_per_work: int, pair_strategy: str,
+                 max_pairs_per_work: int) -> None:
     """Extract Bach corpus, tokenize, and cache statistics."""
     from bach_gen.data.corpus import get_all_works
     from bach_gen.data.extraction import extract_voice_pairs, extract_voice_groups, detect_form, VoicePair, VoiceComposition
@@ -184,6 +196,7 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
     else:
         console.print(f"  Mode: {mode} ({num_voices} voices)")
     console.print(f"  Tokenizer: {tokenizer_type}")
+    console.print(f"  Max source voices: {max_source_voices}")
     with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as progress:
         task = progress.add_task("Loading...", total=None)
         works = get_all_works(composer_filter=filter_list)
@@ -213,13 +226,24 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
             BarColumn(), TaskProgressColumn(), console=console,
         ) as progress:
             task = progress.add_task("Extracting", total=len(works))
+            skipped_by_voice_cap = 0
             for desc, score, style in works:
+                try:
+                    source_parts = len(list(score.parts))
+                except Exception:
+                    source_parts = 0
+                if source_parts > max_source_voices:
+                    skipped_by_voice_cap += 1
+                    progress.advance(task)
+                    continue
                 detected_form, detected_nv = detect_form(score, desc, style)
                 if voices is not None:
                     detected_nv = voices  # user override
                 extracted = extract_voice_groups(
                     score, num_voices=detected_nv, source=desc, form=detected_form,
                 )
+                if max_groups_per_work > 0:
+                    extracted = extracted[:max_groups_per_work]
                 for comp in extracted:
                     comp.style = style
                     compositions.append(comp)
@@ -229,6 +253,8 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
                 progress.advance(task)
 
         console.print(f"  Extracted {len(compositions)} voice groups from {len(works)} works")
+        if skipped_by_voice_cap:
+            console.print(f"  Skipped by source voice cap: {skipped_by_voice_cap}")
         console.print(f"  Form distribution: {dict(form_counter.most_common())}")
         console.print(f"  Voice count distribution: {dict(voice_count_counter.most_common())}")
 
@@ -308,13 +334,29 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
             BarColumn(), TaskProgressColumn(), console=console,
         ) as progress:
             task = progress.add_task("Extracting", total=len(works))
+            skipped_by_voice_cap = 0
             for desc, score, style in works:
-                extracted = extract_voice_pairs(score, source=desc)
+                try:
+                    source_parts = len(list(score.parts))
+                except Exception:
+                    source_parts = 0
+                if source_parts > max_source_voices:
+                    skipped_by_voice_cap += 1
+                    progress.advance(task)
+                    continue
+                extracted = extract_voice_pairs(
+                    score,
+                    source=desc,
+                    pair_strategy=pair_strategy,
+                    max_pairs=max_pairs_per_work,
+                )
                 for pair in extracted:
                     pair.style = style
                 pairs.extend(extracted)
                 progress.advance(task)
         console.print(f"  Extracted {len(pairs)} voice pairs from {len(works)} works")
+        if skipped_by_voice_cap:
+            console.print(f"  Skipped by source voice cap: {skipped_by_voice_cap}")
 
         if not pairs:
             console.print("[red]No voice pairs extracted.[/red]")
@@ -394,13 +436,26 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
             BarColumn(), TaskProgressColumn(), console=console,
         ) as progress:
             task = progress.add_task("Extracting", total=len(works))
+            skipped_by_voice_cap = 0
             for desc, score, style in works:
+                try:
+                    source_parts = len(list(score.parts))
+                except Exception:
+                    source_parts = 0
+                if source_parts > max_source_voices:
+                    skipped_by_voice_cap += 1
+                    progress.advance(task)
+                    continue
                 extracted = extract_voice_groups(score, num_voices=num_voices, source=desc, form=mode)
+                if max_groups_per_work > 0:
+                    extracted = extracted[:max_groups_per_work]
                 for comp in extracted:
                     comp.style = style
                 compositions.extend(extracted)
                 progress.advance(task)
         console.print(f"  Extracted {len(compositions)} {num_voices}-voice groups from {len(works)} works")
+        if skipped_by_voice_cap:
+            console.print(f"  Skipped by source voice cap: {skipped_by_voice_cap}")
 
         if not compositions:
             console.print(f"[red]No {num_voices}-voice groups extracted.[/red]")
@@ -871,6 +926,8 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
               default=None, help="Harmonic rhythm conditioning")
 @click.option("--tension", type=click.Choice(["low", "moderate", "high"]),
               default=None, help="Harmonic tension conditioning")
+@click.option("--chromaticism", type=click.Choice(["low", "moderate", "high"]),
+              default=None, help="Chromaticism conditioning")
 @click.option("--voice-by-voice", is_flag=True, default=False,
               help="Use voice-by-voice (sequential) generation")
 @click.option("--provide-voice", default=None, type=click.Path(exists=True),
@@ -894,6 +951,7 @@ def generate(
     imitation: str | None,
     harmonic_rhythm: str | None,
     tension: str | None,
+    chromaticism: str | None,
     voice_by_voice: bool,
     provide_voice: str | None,
 ) -> None:
@@ -993,6 +1051,7 @@ def generate(
             imitation=imitation,
             harmonic_rhythm=harmonic_rhythm,
             harmonic_tension=tension,
+            chromaticism=chromaticism,
         ) if not voice_by_voice else gen_vbv_fn(
             model=model,
             tokenizer=tokenizer,
@@ -1012,6 +1071,7 @@ def generate(
             imitation=imitation,
             harmonic_rhythm=harmonic_rhythm,
             harmonic_tension=tension,
+            chromaticism=chromaticism,
             provided_voice_midi=provide_voice,
         )
         progress.update(task, description="Done!")

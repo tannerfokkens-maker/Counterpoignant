@@ -91,6 +91,7 @@ def generate(
     imitation: str | None = None,
     harmonic_rhythm: str | None = None,
     harmonic_tension: str | None = None,
+    chromaticism: str | None = None,
 ) -> list[GenerationResult]:
     """Generate Bach-style compositions and return top results.
 
@@ -120,6 +121,7 @@ def generate(
         imitation: Imitation conditioning (none/low/high).
         harmonic_rhythm: Harmonic rhythm conditioning (slow/moderate/fast).
         harmonic_tension: Harmonic tension conditioning (low/moderate/high).
+        chromaticism: Chromaticism conditioning (low/moderate/high).
 
     Returns:
         List of top GenerationResult, sorted by score.
@@ -139,6 +141,7 @@ def generate(
         tokenizer, key_root, key_mode, key_name, subject_str, form, style,
         length=length, meter=meter, texture=texture, imitation=imitation,
         harmonic_rhythm=harmonic_rhythm, harmonic_tension=harmonic_tension,
+        chromaticism=chromaticism,
     )
 
     # Constraints — dispatch based on tokenizer type
@@ -277,6 +280,7 @@ def _build_prompt(
     imitation: str | None = None,
     harmonic_rhythm: str | None = None,
     harmonic_tension: str | None = None,
+    chromaticism: str | None = None,
     encoding_mode: str | None = None,
 ) -> list[int]:
     """Build the prompt token sequence.
@@ -332,6 +336,10 @@ def _build_prompt(
     # Harmonic tension conditioning token
     if harmonic_tension and hasattr(tokenizer, "HARMONIC_TENSION_TO_TOKEN") and harmonic_tension in tokenizer.HARMONIC_TENSION_TO_TOKEN:
         tokens.append(tokenizer.HARMONIC_TENSION_TO_TOKEN[harmonic_tension])
+
+    # Chromaticism conditioning token
+    if chromaticism and hasattr(tokenizer, "CHROMATICISM_TO_TOKEN") and chromaticism in tokenizer.CHROMATICISM_TO_TOKEN:
+        tokens.append(tokenizer.CHROMATICISM_TO_TOKEN[chromaticism])
 
     # Encoding mode token
     if encoding_mode is None:
@@ -389,6 +397,7 @@ def generate_voice_by_voice(
     imitation: str | None = None,
     harmonic_rhythm: str | None = None,
     harmonic_tension: str | None = None,
+    chromaticism: str | None = None,
     provided_voice_midi: str | None = None,
 ) -> list[GenerationResult]:
     """Generate compositions voice-by-voice using sequential encoding.
@@ -412,6 +421,7 @@ def generate_voice_by_voice(
         subject_str=None, form=form, style=style,
         length=length, meter=meter, texture=texture, imitation=imitation,
         harmonic_rhythm=harmonic_rhythm, harmonic_tension=harmonic_tension,
+        chromaticism=chromaticism,
         encoding_mode="sequential",
     )
 

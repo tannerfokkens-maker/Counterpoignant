@@ -68,7 +68,7 @@ class TestGetAllWorks:
 
     @patch("bach_gen.data.corpus.get_midi_files")
     @patch("bach_gen.data.corpus._load_by_bwv")
-    @patch("bach_gen.data.corpus._search_bach_broad")
+    @patch("bach_gen.data.corpus._search_corpus_broad")
     def test_no_filter_returns_all(self, mock_broad, mock_bwv, mock_midi):
         """With no filter, all works are returned."""
         mock_broad.return_value = _make_fake_works(["bach", "bach"])
@@ -80,7 +80,7 @@ class TestGetAllWorks:
 
     @patch("bach_gen.data.corpus.get_midi_files")
     @patch("bach_gen.data.corpus._load_by_bwv")
-    @patch("bach_gen.data.corpus._search_bach_broad")
+    @patch("bach_gen.data.corpus._search_corpus_broad")
     def test_filter_bach_only(self, mock_broad, mock_bwv, mock_midi):
         """Filter 'bach' should keep only works with style 'bach'."""
         mock_broad.return_value = _make_fake_works(["bach", "bach"])
@@ -94,7 +94,7 @@ class TestGetAllWorks:
 
     @patch("bach_gen.data.corpus.get_midi_files")
     @patch("bach_gen.data.corpus._load_by_bwv")
-    @patch("bach_gen.data.corpus._search_bach_broad")
+    @patch("bach_gen.data.corpus._search_corpus_broad")
     def test_filter_baroque_includes_dir_names(self, mock_broad, mock_bwv, mock_midi):
         """Filter 'baroque' should match works with style 'baroque'."""
         mock_broad.return_value = _make_fake_works(["bach"])
@@ -107,7 +107,7 @@ class TestGetAllWorks:
 
     @patch("bach_gen.data.corpus.get_midi_files")
     @patch("bach_gen.data.corpus._load_by_bwv")
-    @patch("bach_gen.data.corpus._search_bach_broad")
+    @patch("bach_gen.data.corpus._search_corpus_broad")
     def test_filter_multiple_styles(self, mock_broad, mock_bwv, mock_midi):
         """Multiple filter values should match any of them."""
         mock_broad.return_value = _make_fake_works(["bach"])
@@ -121,7 +121,7 @@ class TestGetAllWorks:
 
     @patch("bach_gen.data.corpus.get_midi_files")
     @patch("bach_gen.data.corpus._load_by_bwv")
-    @patch("bach_gen.data.corpus._search_bach_broad")
+    @patch("bach_gen.data.corpus._search_corpus_broad")
     def test_filter_case_insensitive(self, mock_broad, mock_bwv, mock_midi):
         """Filter should be case-insensitive."""
         mock_broad.return_value = _make_fake_works(["bach"])
@@ -133,7 +133,7 @@ class TestGetAllWorks:
 
     @patch("bach_gen.data.corpus.get_midi_files")
     @patch("bach_gen.data.corpus._load_by_bwv")
-    @patch("bach_gen.data.corpus._search_bach_broad")
+    @patch("bach_gen.data.corpus._search_corpus_broad")
     def test_filter_by_dir_name_expands_to_style(self, mock_broad, mock_bwv, mock_midi):
         """Filtering by a dir name (e.g. 'buxtehude') should also match
         other works with the same style ('baroque')."""
@@ -148,7 +148,7 @@ class TestGetAllWorks:
 
     @patch("bach_gen.data.corpus.get_midi_files")
     @patch("bach_gen.data.corpus._load_by_bwv")
-    @patch("bach_gen.data.corpus._search_bach_broad")
+    @patch("bach_gen.data.corpus._search_corpus_broad")
     def test_filter_no_match_returns_empty(self, mock_broad, mock_bwv, mock_midi):
         """Filter with no matching styles returns empty list."""
         mock_broad.return_value = _make_fake_works(["bach"])

@@ -12,17 +12,22 @@ uv run bach-gen prepare-data --mode fugue --tokenizer scale-degree
 
 1. **Load works** from music21 corpus + `data/midi/`. Deduplicate by source path. Optional `--composer-filter` (e.g. `bach,baroque`).
 
-2. **Extract voices** per mode. `--mode all` auto-detects form and voice count per piece. Otherwise extracts the specified voicing (2-part pairs, 4-voice groups, etc.).
+2. **Extract voices** per mode.
+   - `--mode all` auto-detects form/voice target per piece, but extraction is now guarded by source-level caps.
+   - `--mode 2-part` extracts voice pairs using configurable pairing strategy.
+   - Safety defaults (recommended): `--max-source-voices 4`, `--max-groups-per-work 1`, `--max-pairs-per-work 2`, `--pair-strategy adjacent+outer`.
 
 3. **Augment** to all 12 keys by transposition (skipped for scale-degree tokenizer since it's already key-agnostic). Transpositions that push notes outside MIDI 36-84 are dropped.
 
 4. **Analyze** each piece for Phase 2 conditioning labels:
-   - **Texture** — onset synchronization ratio classifies as `homophonic` (>0.7), `polyphonic` (<0.3), or `mixed`.
-   - **Imitation** — interval 4-gram matching across voice pairs, normalized by piece length: `high` (>0.15), `low` (>0.05), or `none`.
-   - **Harmonic rhythm** — beat-to-beat pitch-class set changes per measure: `slow` (≤1), `moderate` (1–3), or `fast` (>3).
+   - **Texture** — onset synchronization ratio: `homophonic` (>0.60), `polyphonic` (<0.54), else `mixed`.
+   - **Imitation** — cross-voice interval 6-gram matching with time-offset gating and ±1 tolerance: `high` (>0.30), `low` (>0.10), else `none`.
+   - **Harmonic rhythm** — beat-to-beat pitch-class-set changes per measure: `slow` (≤2.77), `moderate` (2.77–3.18), `fast` (>3.18).
+   - **Harmonic tension** — dissonance ratio at union-of-attacks: `high` (>0.145), `moderate` (>0.128), else `low`.
+   - **Chromaticism** — fraction of non-diatonic notes: `high` (>0.15), `moderate` (>0.05), else `low`.
 
 5. **Tokenize** each piece twice (dual encoding):
-   - **Interleaved** — all voices merged chronologically with `VOICE_N` markers per note. Prefix: `BOS STYLE FORM MODE LENGTH METER TEXTURE IMITATION HARMONIC_RHYTHM ENCODE_INTERLEAVED KEY <events> EOS`.
+   - **Interleaved** — all voices merged chronologically with `VOICE_N` markers per note. Prefix: `BOS STYLE FORM MODE LENGTH METER TEXTURE IMITATION HARMONIC_RHYTHM HARMONIC_TENSION CHROMATICISM ENCODE_INTERLEAVED KEY <events> EOS`.
    - **Sequential** — each voice serialized separately with its own timeline. Format: `BOS <conditioning> ENCODE_SEQUENTIAL KEY VOICE_1 <notes> VOICE_SEP VOICE_2 <notes> VOICE_SEP ... VOICE_N <notes> EOS`.
 
    Both encodings share the same `piece_id` so train/val split keeps them together. Use `--no-sequential` to skip dual encoding if compute is tight. Sequences under 20 tokens are dropped.
@@ -43,10 +48,14 @@ uv run bach-gen prepare-data --mode fugue --tokenizer scale-degree
 
 **Key flags:**
 
-- `--tokenizer absolute|scale-degree` — absolute pitch (148 tokens) or key-agnostic scale degrees (114 tokens)
 - `--max-seq-len 2048` — context window ceiling
 - `--mode` — determines voice count and form token
 - `--no-sequential` — skip dual sequential encoding (halves training data)
+- `--tokenizer absolute|scale-degree` — absolute pitch (154 tokens) or key-agnostic scale degrees (120 tokens)
+- `--max-source-voices` — skip works whose raw score has too many parts (default: 4)
+- `--max-groups-per-work` — cap extracted N-voice groups per source work (default: 1)
+- `--pair-strategy adjacent+outer|adjacent-only|all-combinations` — how 2-part pairs are derived from multi-voice works
+- `--max-pairs-per-work` — cap extracted 2-part pairs per source work (default: 2)
 
 ---
 
@@ -123,6 +132,7 @@ These ranges anchor the information-theoretic evaluation score so it reflects "n
 ```bash
 uv run bach-gen generate --key "C minor" --mode fugue \
   --texture polyphonic --imitation high --harmonic-rhythm fast \
+  --tension high --chromaticism moderate \
   --candidates 100 --top 3 --temperature 0.9
 ```
 
@@ -145,7 +155,7 @@ uv run bach-gen generate --key "C minor" --mode fugue \
 
 1. **Load checkpoint** — searches for `best.pt`, then `latest.pt`, then `final.pt` in `models/`.
 
-2. **Build prompt** — assembles conditioning prefix: `BOS STYLE FORM MODE LENGTH METER TEXTURE IMITATION HARMONIC_RHYTHM ENCODE_* KEY [SUBJECT]`. Subject is parsed from `--subject` or generated randomly (interleaved mode only; sequential mode skips subject generation). For `--voice-by-voice`, the prompt includes `ENCODE_SEQUENTIAL`; if `--provide-voice` is given, voice 1 is serialized into the prompt followed by `VOICE_SEP`.
+2. **Build prompt** — assembles conditioning prefix: `BOS STYLE FORM MODE LENGTH METER TEXTURE IMITATION HARMONIC_RHYTHM HARMONIC_TENSION CHROMATICISM ENCODE_* KEY [SUBJECT]`. Subject is parsed from `--subject` or generated randomly (interleaved mode only; sequential mode skips subject generation). For `--voice-by-voice`, the prompt includes `ENCODE_SEQUENTIAL`; if `--provide-voice` is given, voice 1 is serialized into the prompt followed by `VOICE_SEP`.
 
 3. **Decode** — either autoregressive sampling (default) or beam search (`--beam-width`, interleaved mode only). Decoding constraints enforce key membership and pitch range at each step. In sequential mode, `VOICE_SEP` is blocked until at least 4 notes have been generated for the current voice, preventing empty voices.
 
@@ -171,6 +181,8 @@ uv run bach-gen generate --key "C minor" --mode fugue \
 - `--texture homophonic|polyphonic|mixed` — texture conditioning
 - `--imitation none|low|high` — imitation density conditioning
 - `--harmonic-rhythm slow|moderate|fast` — harmonic rhythm conditioning
+- `--tension low|moderate|high` — harmonic tension conditioning
+- `--chromaticism low|moderate|high` — chromaticism conditioning
 - `--voice-by-voice` — use sequential (voice-by-voice) generation
 - `--provide-voice path.mid` — supply voice 1 as MIDI (requires `--voice-by-voice`)
 - `--beam-width` — beam search with length-normalized scoring (Wu et al.)
@@ -195,7 +207,7 @@ Scores real Bach vs. three baselines (shuffled notes, random pitches, repetitive
 
 ## Vocabulary Summary
 
-12 tokens were added after `METER_ALLA_BREVE` (ID 40), shifting KEY and everything after by +12.
+18 tokens are reserved for Phase 2/3 conditioning and encoding mode after `METER_ALLA_BREVE` (ID 40).
 
 | ID Range | Tokens |
 |---|---|
@@ -203,9 +215,12 @@ Scores real Bach vs. three baselines (shuffled notes, random pitches, repetitive
 | 41–43 | TEXTURE_HOMOPHONIC, TEXTURE_POLYPHONIC, TEXTURE_MIXED |
 | 44–46 | IMITATION_NONE, IMITATION_LOW, IMITATION_HIGH |
 | 47–49 | HARMONIC_RHYTHM_SLOW, HARMONIC_RHYTHM_MODERATE, HARMONIC_RHYTHM_FAST |
-| 50–51 | ENCODE_INTERLEAVED, ENCODE_SEQUENTIAL |
-| 52 | VOICE_SEP |
-| 53+ | KEY_*, then OCT/DEG/ACC/DUR/TS (scale-degree) or Pitch/DUR/TS (absolute) |
+| 50–52 | HARMONIC_TENSION_LOW, HARMONIC_TENSION_MODERATE, HARMONIC_TENSION_HIGH |
+| 53–55 | CHROMATICISM_LOW, CHROMATICISM_MODERATE, CHROMATICISM_HIGH |
+| 56–57 | ENCODE_INTERLEAVED, ENCODE_SEQUENTIAL |
+| 58 | VOICE_SEP |
+| 59–82 | KEY_* |
+| 83+ | Scale-degree: OCT/DEG/ACC/DUR/TS (to 119). Absolute: Pitch/DUR/TS (to 153). |
 
 **Breaking change:** all cached data and trained models from before this vocabulary update are invalidated. Re-run `prepare-data` and retrain.
 

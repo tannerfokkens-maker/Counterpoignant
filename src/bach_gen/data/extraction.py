@@ -215,6 +215,8 @@ def extract_voice_groups(
 def extract_voice_pairs(
     score: music21.stream.Score,
     source: str = "",
+    pair_strategy: str = "adjacent+outer",
+    max_pairs: int | None = None,
 ) -> list[VoicePair]:
     """Extract voice pairs from a music21 Score.
 
@@ -222,8 +224,17 @@ def extract_voice_pairs(
     For 3-voice works: returns up to 3 pairs (all combinations).
     For 4+ voice works: extracts adjacent voice pairs.
 
+    Args:
+        score: The parsed score.
+        source: Description of the source work.
+        pair_strategy: One of:
+            - "adjacent+outer": adjacent pairs plus outer pair (default)
+            - "adjacent-only": only adjacent pairs
+            - "all-combinations": all unique voice pairs
+        max_pairs: Optional cap on returned pairs per work.
+
     Returns:
-        List of VoicePair.
+        List of VoicePair (possibly capped by ``max_pairs``).
     """
     # Detect key
     key_root, key_mode = _detect_key(score)
@@ -257,24 +268,27 @@ def extract_voice_pairs(
             time_signature=time_sig,
         ))
     else:
-        # For 3+ voices, extract all adjacent pairs
-        for i in range(len(voices) - 1):
+        n = len(voices)
+        pair_indices: list[tuple[int, int]] = []
+        if pair_strategy == "adjacent-only":
+            pair_indices = [(i, i + 1) for i in range(n - 1)]
+        elif pair_strategy == "all-combinations":
+            pair_indices = [(i, j) for i in range(n - 1) for j in range(i + 1, n)]
+        else:
+            # Default: adjacent plus outer voices.
+            pair_indices = [(i, i + 1) for i in range(n - 1)]
+            if n >= 3:
+                outer = (0, n - 1)
+                if outer not in pair_indices:
+                    pair_indices.append(outer)
+
+        for i, j in pair_indices:
             pairs.append(VoicePair(
                 upper=voices[i],
-                lower=voices[i + 1],
+                lower=voices[j],
                 key_root=key_root,
                 key_mode=key_mode,
-                source=f"{source} (voices {i+1}-{i+2})",
-                time_signature=time_sig,
-            ))
-        # Also add outer voices (voice 1 and last)
-        if len(voices) >= 3:
-            pairs.append(VoicePair(
-                upper=voices[0],
-                lower=voices[-1],
-                key_root=key_root,
-                key_mode=key_mode,
-                source=f"{source} (voices 1-{len(voices)})",
+                source=f"{source} (voices {i+1}-{j+1})",
                 time_signature=time_sig,
             ))
 
@@ -283,6 +297,9 @@ def extract_voice_pairs(
     for pair in pairs:
         if _validate_voice_pair(pair):
             valid_pairs.append(pair)
+
+    if max_pairs is not None and max_pairs > 0:
+        return valid_pairs[:max_pairs]
 
     return valid_pairs
 
