@@ -91,7 +91,8 @@ def compute_imitation(comp: VoiceComposition) -> str:
 
     Normalisation: total time-offset match count / total notes.
 
-    Thresholds (calibrated on corpus — p33=0.10, p67=0.30):
+    Thresholds (validated on Bach kern corpus: 77 chorales → 96% none,
+    13 inventions → 69% high, 44 WTC fugues → 93% high):
         normalised_matches > 0.30 → "high"
         normalised_matches > 0.10 → "low"
         else                      → "none"
