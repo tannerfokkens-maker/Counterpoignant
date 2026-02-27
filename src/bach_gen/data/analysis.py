@@ -1,15 +1,19 @@
 """Algorithmic analysis of VoiceComposition for conditioning labels.
 
 Computes texture (homophonic/polyphonic/mixed), imitation level
-(none/low/high), harmonic rhythm (slow/moderate/fast), and harmonic
-tension (low/moderate/high) from note data.
+(none/low/high), harmonic rhythm (slow/moderate/fast), harmonic
+tension (low/moderate/high), and chromaticism (low/moderate/high)
+from note data.
 
 Thresholds were calibrated on a 97-piece sample of the training corpus
 (Renaissance motets, Bach chorales, Classical quartets) targeting roughly
-even thirds across buckets (p33/p67 split).
+even thirds across buckets (p33/p67 split).  Re-run ``bach-gen calibrate``
+on the full corpus to update them.
 """
 
 from __future__ import annotations
+
+from itertools import product
 
 from bach_gen.data.extraction import VoiceComposition
 from bach_gen.utils.constants import (
@@ -105,7 +109,9 @@ def compute_imitation(comp: VoiceComposition) -> str:
             ngrams.add(tuple(intervals[i : i + ngram_len]))
         voice_ngrams.append(ngrams)
 
-    # Count matches across voice pairs
+    # Count matches across voice pairs.
+    # Allow ±1 semitone tolerance per element so tonal fugue answers
+    # (where one interval shifts by a semitone, e.g. P5→P4) still match.
     total_matches = 0
     total_notes = sum(len(v) for v in comp.voices)
     if total_notes == 0:
@@ -113,9 +119,15 @@ def compute_imitation(comp: VoiceComposition) -> str:
 
     for i in range(len(voice_ngrams)):
         for j in range(i + 1, len(voice_ngrams)):
-            if voice_ngrams[i] and voice_ngrams[j]:
-                matches = voice_ngrams[i] & voice_ngrams[j]
-                total_matches += len(matches)
+            if not voice_ngrams[i] or not voice_ngrams[j]:
+                continue
+            # Expand voice i's 4-grams to all ±1 variants (3^4 = 81 per gram)
+            fuzzy_i: set[tuple[int, ...]] = set()
+            for ng in voice_ngrams[i]:
+                for deltas in product((-1, 0, 1), repeat=ngram_len):
+                    fuzzy_i.add(tuple(x + d for x, d in zip(ng, deltas)))
+            matches = fuzzy_i & voice_ngrams[j]
+            total_matches += len(matches)
 
     normalised = total_matches / total_notes
 
@@ -205,25 +217,82 @@ def compute_harmonic_tension(
 ) -> str:
     """Classify harmonic tension as low, moderate, or high.
 
-    Combines two signals:
-    - **Chromatic ratio**: fraction of notes whose pitch class falls outside
-      the key's diatonic scale.
-    - **Dissonance ratio**: fraction of simultaneous note pairs that form
-      dissonant intervals (minor 2nd, major 2nd, tritone, minor 7th,
-      major 7th — intervals 1, 2, 6, 10, 11 in semitones mod 12).
+    Measures the **dissonance ratio**: the fraction of simultaneously
+    sounding voice pairs whose interval is dissonant (minor 2nd, major 2nd,
+    tritone, minor 7th, major 7th — semitone classes 1, 2, 6, 10, 11).
 
-    The tension score is 0.5 * chromatic_ratio + 0.5 * dissonance_ratio.
+    Sampling is performed at the **union** of both voices' attack times so
+    that suspensions (dissonances created when one voice attacks a new
+    harmony while another sustains) are not missed.
+
+    Chromaticism is now its own separate token; see ``compute_chromaticism``.
 
     Thresholds (calibrated on corpus — p33=0.067, p67=0.110):
-        tension > 0.110 → "high"
-        tension > 0.067 → "moderate"
-        else            → "low"
+        dissonance_ratio > 0.110 → "high"
+        dissonance_ratio > 0.067 → "moderate"
+        else                     → "low"
+    """
+    dissonant_set = {1, 2, 6, 10, 11}
+    dissonant_intervals = 0
+    interval_count = 0
+
+    for vi in range(len(comp.voices)):
+        for vj in range(vi + 1, len(comp.voices)):
+            notes_i = sorted(comp.voices[vi], key=lambda n: n[0])
+            notes_j = sorted(comp.voices[vj], key=lambda n: n[0])
+
+            # Sample at the union of both voices' attack times
+            attacks = sorted(
+                {n[0] for n in notes_i} | {n[0] for n in notes_j}
+            )
+
+            def _pitch_at(notes: list, tick: int) -> int | None:
+                for start, dur, pitch in notes:
+                    if start <= tick < start + dur:
+                        return pitch
+                return None
+
+            for tick in attacks:
+                pi = _pitch_at(notes_i, tick)
+                pj = _pitch_at(notes_j, tick)
+                if pi is not None and pj is not None:
+                    interval = abs(pi - pj) % 12
+                    interval_count += 1
+                    if interval in dissonant_set:
+                        dissonant_intervals += 1
+
+    if interval_count == 0:
+        return "moderate"
+
+    dissonance_ratio = dissonant_intervals / interval_count
+
+    if dissonance_ratio > 0.110:
+        return "high"
+    elif dissonance_ratio > 0.067:
+        return "moderate"
+    else:
+        return "low"
+
+
+def compute_chromaticism(
+    comp: VoiceComposition,
+) -> str:
+    """Classify chromaticism as low, moderate, or high.
+
+    Measures the fraction of note events whose pitch class falls outside
+    the diatonic scale of the piece's key.  Harmonic-minor raised 7th
+    degrees are treated as diatonic (via ``get_scale`` which returns the
+    harmonic minor scale for minor-mode pieces).
+
+    Thresholds (calibrated on corpus — p33=0.05, p67=0.15):
+        chromatic_ratio > 0.15 → "high"
+        chromatic_ratio > 0.05 → "moderate"
+        else                   → "low"
     """
     from bach_gen.utils.music_theory import get_scale
 
     scale_pcs = set(get_scale(comp.key_root, comp.key_mode))
 
-    # Chromatic ratio
     total_notes = 0
     chromatic_notes = 0
     for voice in comp.voices:
@@ -235,35 +304,11 @@ def compute_harmonic_tension(
     if total_notes == 0:
         return "moderate"
 
-    # Dissonance ratio: at each onset in one voice, check the interval
-    # against the note sounding in each other voice
-    dissonant_intervals = 0
-    interval_count = 0
-    dissonant_set = {1, 2, 6, 10, 11}
-
-    for vi in range(len(comp.voices)):
-        for vj in range(vi + 1, len(comp.voices)):
-            notes_i = sorted(comp.voices[vi], key=lambda n: n[0])
-            notes_j = sorted(comp.voices[vj], key=lambda n: n[0])
-            for start_i, dur_i, pitch_i in notes_i:
-                for start_j, dur_j, pitch_j in notes_j:
-                    if start_j <= start_i < start_j + dur_j:
-                        interval = abs(pitch_i - pitch_j) % 12
-                        interval_count += 1
-                        if interval in dissonant_set:
-                            dissonant_intervals += 1
-                        break  # only the sounding note in voice j
-
-    if interval_count == 0:
-        return "moderate"
-
     chromatic_ratio = chromatic_notes / total_notes
-    dissonance_ratio = dissonant_intervals / interval_count
-    tension = 0.5 * chromatic_ratio + 0.5 * dissonance_ratio
 
-    if tension > 0.110:
+    if chromatic_ratio > 0.15:
         return "high"
-    elif tension > 0.067:
+    elif chromatic_ratio > 0.05:
         return "moderate"
     else:
         return "low"
@@ -273,10 +318,11 @@ def analyze_composition(
     comp: VoiceComposition,
     time_sig: tuple[int, int] | None = None,
 ) -> dict[str, str]:
-    """Convenience wrapper returning all four analysis labels."""
+    """Convenience wrapper returning all five analysis labels."""
     return {
         "texture": compute_texture(comp),
         "imitation": compute_imitation(comp),
         "harmonic_rhythm": compute_harmonic_rhythm(comp, time_sig),
         "harmonic_tension": compute_harmonic_tension(comp),
+        "chromaticism": compute_chromaticism(comp),
     }

@@ -280,6 +280,7 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
                     texture=labels["texture"], imitation=labels["imitation"],
                     harmonic_rhythm=labels["harmonic_rhythm"],
                     harmonic_tension=labels["harmonic_tension"],
+                    chromaticism=labels["chromaticism"],
                 )
                 if len(tokens) >= 20:
                     sequences.append(tokens)
@@ -291,7 +292,8 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
                         item, form=item_form, length_bars=num_bars,
                         texture=labels["texture"], imitation=labels["imitation"],
                         harmonic_rhythm=labels["harmonic_rhythm"],
-                    harmonic_tension=labels["harmonic_tension"],
+                        harmonic_tension=labels["harmonic_tension"],
+                        chromaticism=labels["chromaticism"],
                     )
                     if len(tokens_seq) >= 20:
                         sequences.append(tokens_seq)
@@ -365,6 +367,7 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
                     texture=labels["texture"], imitation=labels["imitation"],
                     harmonic_rhythm=labels["harmonic_rhythm"],
                     harmonic_tension=labels["harmonic_tension"],
+                    chromaticism=labels["chromaticism"],
                 )
                 if len(tokens) >= 20:
                     sequences.append(tokens)
@@ -376,7 +379,8 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
                         item, form=mode, length_bars=num_bars,
                         texture=labels["texture"], imitation=labels["imitation"],
                         harmonic_rhythm=labels["harmonic_rhythm"],
-                    harmonic_tension=labels["harmonic_tension"],
+                        harmonic_tension=labels["harmonic_tension"],
+                        chromaticism=labels["chromaticism"],
                     )
                     if len(tokens_seq) >= 20:
                         sequences.append(tokens_seq)
@@ -440,6 +444,7 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
                     texture=labels["texture"], imitation=labels["imitation"],
                     harmonic_rhythm=labels["harmonic_rhythm"],
                     harmonic_tension=labels["harmonic_tension"],
+                    chromaticism=labels["chromaticism"],
                 )
                 if len(tokens) >= 20:
                     sequences.append(tokens)
@@ -451,7 +456,8 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
                         item, form=mode, length_bars=num_bars,
                         texture=labels["texture"], imitation=labels["imitation"],
                         harmonic_rhythm=labels["harmonic_rhythm"],
-                    harmonic_tension=labels["harmonic_tension"],
+                        harmonic_tension=labels["harmonic_tension"],
+                        chromaticism=labels["chromaticism"],
                     )
                     if len(tokens_seq) >= 20:
                         sequences.append(tokens_seq)

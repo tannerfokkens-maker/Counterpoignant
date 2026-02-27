@@ -132,6 +132,9 @@ SPECIAL_TOKENS = [
     "HARMONIC_TENSION_LOW",
     "HARMONIC_TENSION_MODERATE",
     "HARMONIC_TENSION_HIGH",
+    "CHROMATICISM_LOW",
+    "CHROMATICISM_MODERATE",
+    "CHROMATICISM_HIGH",
     "ENCODE_INTERLEAVED",
     "ENCODE_SEQUENTIAL",
     "VOICE_SEP",
@@ -155,6 +158,7 @@ TEXTURE_NAMES = ["homophonic", "polyphonic", "mixed"]
 IMITATION_NAMES = ["none", "low", "high"]
 HARMONIC_RHYTHM_NAMES = ["slow", "moderate", "fast"]
 HARMONIC_TENSION_NAMES = ["low", "moderate", "high"]
+CHROMATICISM_NAMES = ["low", "moderate", "high"]
 
 # Phase 3: encoding mode (interleaved vs sequential voice-by-voice)
 ENCODING_MODE_NAMES = ["interleaved", "sequential"]
