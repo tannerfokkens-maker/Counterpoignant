@@ -5,7 +5,7 @@ End-to-end guide: data preparation, training, and generation.
 ## 1. Prepare Data
 
 ```bash
-uv run bach-gen prepare-data --mode fugue --tokenizer absolute
+uv run bach-gen prepare-data --mode fugue --tokenizer scale-degree
 ```
 
 **What happens:**
@@ -16,27 +16,37 @@ uv run bach-gen prepare-data --mode fugue --tokenizer absolute
 
 3. **Augment** to all 12 keys by transposition (skipped for scale-degree tokenizer since it's already key-agnostic). Transpositions that push notes outside MIDI 36-84 are dropped.
 
-4. **Tokenize** each piece. Computes `length_bars` from the score and encodes the full prefix: `BOS STYLE FORM MODE LENGTH METER KEY [SUBJECT] <events> EOS`. Sequences under 20 tokens are dropped.
+4. **Analyze** each piece for Phase 2 conditioning labels:
+   - **Texture** — onset synchronization ratio classifies as `homophonic` (>0.7), `polyphonic` (<0.3), or `mixed`.
+   - **Imitation** — interval 4-gram matching across voice pairs, normalized by piece length: `high` (>0.15), `low` (>0.05), or `none`.
+   - **Harmonic rhythm** — beat-to-beat pitch-class set changes per measure: `slow` (≤1), `moderate` (1–3), or `fast` (>3).
 
-5. **Chunk or drop** long sequences. By default, sequences exceeding `--max-seq-len` are split into overlapping windows (75% stride). Use `--no-chunk` to drop them instead.
+5. **Tokenize** each piece twice (dual encoding):
+   - **Interleaved** — all voices merged chronologically with `VOICE_N` markers per note. Prefix: `BOS STYLE FORM MODE LENGTH METER TEXTURE IMITATION HARMONIC_RHYTHM ENCODE_INTERLEAVED KEY <events> EOS`.
+   - **Sequential** — each voice serialized separately with its own timeline. Format: `BOS <conditioning> ENCODE_SEQUENTIAL KEY VOICE_1 <notes> VOICE_SEP VOICE_2 <notes> VOICE_SEP ... VOICE_N <notes> EOS`.
 
-6. **Save** to the output directory (default `data/`).
+   Both encodings share the same `piece_id` so train/val split keeps them together. Use `--no-sequential` to skip dual encoding if compute is tight. Sequences under 20 tokens are dropped.
+
+6. **Chunk or drop** long sequences. By default, sequences exceeding `--max-seq-len` are split into overlapping windows (75% stride). Use `--no-chunk` to drop them instead.
+
+7. **Save** to the output directory (default `data/`).
 
 **Output files:**
 
 | File | Contents |
 |---|---|
 | `tokenizer.json` | Serialized vocab mappings |
-| `sequences.json` | All token sequences |
+| `sequences.json` | All token sequences (interleaved + sequential) |
 | `piece_ids.json` | Source piece ID per sequence (for leak-free splits) |
 | `mode.json` | Mode, voice count, tokenizer type |
 | `corpus_stats.json` | Pitch-class, interval, duration distributions |
 
 **Key flags:**
 
-- `--tokenizer absolute|scale-degree` — absolute pitch (135 tokens) or key-agnostic scale degrees (101 tokens)
+- `--tokenizer absolute|scale-degree` — absolute pitch (148 tokens) or key-agnostic scale degrees (114 tokens)
 - `--max-seq-len 2048` — context window ceiling
 - `--mode` — determines voice count and form token
+- `--no-sequential` — skip dual sequential encoding (halves training data)
 
 ---
 
@@ -48,9 +58,9 @@ uv run bach-gen train --epochs 500 --lr 3e-4 --batch-size 8 --pos-encoding pope 
 
 **What happens:**
 
-1. **Load data** from `--data-dir` (default `data/`). Auto-detects mode and seq_len from saved metadata.
+1. **Load data** from `--data-dir` (default `data/`). Auto-detects mode and seq_len from saved metadata. Training data now includes both interleaved and sequential encodings of every piece (unless `--no-sequential` was used during preparation).
 
-2. **Split** into train/val at the piece level (90/10) using `piece_ids.json` to prevent chunk leakage.
+2. **Split** into train/val at the piece level (90/10) using `piece_ids.json` to prevent chunk leakage. Both encoding variants of the same piece stay together in the same split.
 
 3. **Build model** — BachTransformer (256d, 8 heads, 8 layers, SwiGLU FFN, RMSNorm, weight tying). Key options:
    - `--pos-encoding rope|pope` — RoPE (standard) or PoPE (polar coordinate, better what-where separation)
@@ -108,17 +118,36 @@ These ranges anchor the information-theoretic evaluation score so it reflects "n
 
 ## 4. Generate
 
+### Standard (interleaved) generation
+
 ```bash
-uv run bach-gen generate --key "C minor" --candidates 100 --top 3 --temperature 0.9
+uv run bach-gen generate --key "C minor" --mode fugue \
+  --texture polyphonic --imitation high --harmonic-rhythm fast \
+  --candidates 100 --top 3 --temperature 0.9
+```
+
+### Voice-by-voice (sequential) generation
+
+```bash
+uv run bach-gen generate --key "C minor" --mode fugue \
+  --texture polyphonic --imitation high \
+  --voice-by-voice --candidates 50 --top 3
+```
+
+Optionally provide a MIDI file for voice 1 — the model generates the remaining voices:
+
+```bash
+uv run bach-gen generate --key "C minor" --mode fugue \
+  --voice-by-voice --provide-voice soprano.mid
 ```
 
 **What happens:**
 
 1. **Load checkpoint** — searches for `best.pt`, then `latest.pt`, then `final.pt` in `models/`.
 
-2. **Build prompt** — assembles conditioning prefix: `BOS STYLE FORM MODE LENGTH METER KEY [SUBJECT]`. Subject is parsed from `--subject` or generated randomly in the given key.
+2. **Build prompt** — assembles conditioning prefix: `BOS STYLE FORM MODE LENGTH METER TEXTURE IMITATION HARMONIC_RHYTHM ENCODE_* KEY [SUBJECT]`. Subject is parsed from `--subject` or generated randomly (interleaved mode only; sequential mode skips subject generation). For `--voice-by-voice`, the prompt includes `ENCODE_SEQUENTIAL`; if `--provide-voice` is given, voice 1 is serialized into the prompt followed by `VOICE_SEP`.
 
-3. **Decode** — either autoregressive sampling (default) or beam search (`--beam-width`). Decoding constraints enforce key membership and pitch range at each step.
+3. **Decode** — either autoregressive sampling (default) or beam search (`--beam-width`, interleaved mode only). Decoding constraints enforce key membership and pitch range at each step. In sequential mode, `VOICE_SEP` is blocked until at least 4 notes have been generated for the current voice, preventing empty voices.
 
 4. **Score** each candidate on 7 dimensions:
 
@@ -139,6 +168,11 @@ uv run bach-gen generate --key "C minor" --candidates 100 --top 3 --temperature 
 - `--style bach|baroque|renaissance|classical` — style conditioning token
 - `--length short|medium|long|extended` — target length (default inferred from form)
 - `--meter 4_4|3_4|6_8|...` — meter conditioning
+- `--texture homophonic|polyphonic|mixed` — texture conditioning
+- `--imitation none|low|high` — imitation density conditioning
+- `--harmonic-rhythm slow|moderate|fast` — harmonic rhythm conditioning
+- `--voice-by-voice` — use sequential (voice-by-voice) generation
+- `--provide-voice path.mid` — supply voice 1 as MIDI (requires `--voice-by-voice`)
 - `--beam-width` — beam search with length-normalized scoring (Wu et al.)
 
 ---
@@ -159,12 +193,30 @@ Scores real Bach vs. three baselines (shuffled notes, random pitches, repetitive
 
 ---
 
+## Vocabulary Summary
+
+12 tokens were added after `METER_ALLA_BREVE` (ID 40), shifting KEY and everything after by +12.
+
+| ID Range | Tokens |
+|---|---|
+| 0–40 | PAD, BOS, EOS, VOICE_1–4, SUBJECT_*, BAR, BEAT_1–6, MODE_*, STYLE_*, FORM_*, LENGTH_*, METER_* |
+| 41–43 | TEXTURE_HOMOPHONIC, TEXTURE_POLYPHONIC, TEXTURE_MIXED |
+| 44–46 | IMITATION_NONE, IMITATION_LOW, IMITATION_HIGH |
+| 47–49 | HARMONIC_RHYTHM_SLOW, HARMONIC_RHYTHM_MODERATE, HARMONIC_RHYTHM_FAST |
+| 50–51 | ENCODE_INTERLEAVED, ENCODE_SEQUENTIAL |
+| 52 | VOICE_SEP |
+| 53+ | KEY_*, then OCT/DEG/ACC/DUR/TS (scale-degree) or Pitch/DUR/TS (absolute) |
+
+**Breaking change:** all cached data and trained models from before this vocabulary update are invalidated. Re-run `prepare-data` and retrain.
+
+---
+
 ## Quick Reference: File Layout
 
 ```
 data/
   tokenizer.json          # vocab mappings
-  sequences.json          # token sequences
+  sequences.json          # token sequences (interleaved + sequential)
   piece_ids.json          # source IDs
   corpus_stats.json       # distribution stats
   mode.json               # metadata
@@ -179,7 +231,7 @@ models/
   drope_final.pt          # after DroPE (if --drope)
 
 output/
-  fugue_C_minor_1.mid     # top-ranked generation
+  fugue_C_minor_1.mid     # top-ranked generation (interleaved)
   fugue_C_minor_2.mid
-  fugue_C_minor_3.mid
+  fugue_C_minor_vbv_1.mid # top-ranked generation (voice-by-voice)
 ```

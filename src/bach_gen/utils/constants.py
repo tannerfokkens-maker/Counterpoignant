@@ -120,6 +120,21 @@ SPECIAL_TOKENS = [
     "METER_6_8",
     "METER_3_8",
     "METER_ALLA_BREVE",
+    "TEXTURE_HOMOPHONIC",
+    "TEXTURE_POLYPHONIC",
+    "TEXTURE_MIXED",
+    "IMITATION_NONE",
+    "IMITATION_LOW",
+    "IMITATION_HIGH",
+    "HARMONIC_RHYTHM_SLOW",
+    "HARMONIC_RHYTHM_MODERATE",
+    "HARMONIC_RHYTHM_FAST",
+    "HARMONIC_TENSION_LOW",
+    "HARMONIC_TENSION_MODERATE",
+    "HARMONIC_TENSION_HIGH",
+    "ENCODE_INTERLEAVED",
+    "ENCODE_SEQUENTIAL",
+    "VOICE_SEP",
 ]
 
 # Style token names (order matches SPECIAL_TOKENS)
@@ -134,6 +149,16 @@ LENGTH_BOUNDARIES = [16, 32, 64]  # short ≤16, medium 17-32, long 33-64, exten
 
 # Meter token names and mapping from time signature tuples
 METER_NAMES = ["2_4", "3_4", "4_4", "6_8", "3_8", "alla_breve"]
+
+# Phase 2 conditioning: texture, imitation, harmonic rhythm
+TEXTURE_NAMES = ["homophonic", "polyphonic", "mixed"]
+IMITATION_NAMES = ["none", "low", "high"]
+HARMONIC_RHYTHM_NAMES = ["slow", "moderate", "fast"]
+HARMONIC_TENSION_NAMES = ["low", "moderate", "high"]
+
+# Phase 3: encoding mode (interleaved vs sequential voice-by-voice)
+ENCODING_MODE_NAMES = ["interleaved", "sequential"]
+
 METER_MAP: dict[tuple[int, int], str] = {
     (2, 4): "2_4",
     (3, 4): "3_4",

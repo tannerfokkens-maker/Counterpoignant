@@ -7,7 +7,7 @@ augmentation unnecessary.
 
 Token ordering per note: VOICE_N -> OCT_x -> [SHARP|FLAT] -> DEG_y -> DUR_z
 
-Vocabulary layout (102 tokens):
+Vocabulary layout (117 tokens):
      0-9:   10 special tokens (PAD, BOS, EOS, VOICE_1-4, SUBJECT_*, BAR)
     10-15:   6 beat tokens (BEAT_1..BEAT_6)
     16-19:   4 voice-count tokens (MODE_2PART..MODE_FUGUE)
@@ -15,12 +15,18 @@ Vocabulary layout (102 tokens):
     24-30:   7 form tokens (FORM_CHORALE..FORM_MOTET)
     31-34:   4 length tokens (LENGTH_SHORT..LENGTH_EXTENDED)
     35-40:   6 meter tokens (METER_2_4..METER_ALLA_BREVE)
-    41-64:  24 key tokens (needed at decode time)
-    65-70:   6 octave tokens (OCT_2 .. OCT_7)
-    71-77:   7 degree tokens (DEG_1 .. DEG_7)
-    78-79:   2 accidental tokens (SHARP, FLAT)
-    80-90:  11 duration tokens
-    91-101: 11 time shift tokens
+    41-43:   3 texture tokens (TEXTURE_HOMOPHONIC..TEXTURE_MIXED)
+    44-46:   3 imitation tokens (IMITATION_NONE..IMITATION_HIGH)
+    47-49:   3 harmonic rhythm tokens (HARMONIC_RHYTHM_SLOW..FAST)
+    50-52:   3 harmonic tension tokens (HARMONIC_TENSION_LOW..HIGH)
+    53-54:   2 encoding mode tokens (ENCODE_INTERLEAVED, ENCODE_SEQUENTIAL)
+    55:      1 voice separator (VOICE_SEP)
+    56-79:  24 key tokens (needed at decode time)
+    80-85:   6 octave tokens (OCT_2 .. OCT_7)
+    86-92:   7 degree tokens (DEG_1 .. DEG_7)
+    93-94:   2 accidental tokens (SHARP, FLAT)
+    95-105: 11 duration tokens
+   106-116: 11 time shift tokens
 """
 
 from __future__ import annotations
@@ -36,6 +42,8 @@ from bach_gen.utils.constants import (
     MIN_PITCH, MAX_PITCH, DURATION_BINS, TIME_SHIFT_BINS,
     KEY_NAMES, SD_MIN_OCTAVE, SD_MAX_OCTAVE, STYLE_NAMES, FORM_NAMES,
     LENGTH_NAMES, LENGTH_BOUNDARIES, METER_NAMES, METER_MAP,
+    TEXTURE_NAMES, IMITATION_NAMES, HARMONIC_RHYTHM_NAMES, HARMONIC_TENSION_NAMES,
+    ENCODING_MODE_NAMES,
     TICKS_PER_QUARTER, ticks_per_measure, beat_tick_positions,
     length_bucket,
 )
@@ -108,6 +116,25 @@ class ScaleDegreeTokenizer:
     METER_3_8 = 39
     METER_ALLA_BREVE = 40
 
+    # Phase 2 conditioning tokens
+    TEXTURE_HOMOPHONIC = 41
+    TEXTURE_POLYPHONIC = 42
+    TEXTURE_MIXED = 43
+    IMITATION_NONE = 44
+    IMITATION_LOW = 45
+    IMITATION_HIGH = 46
+    HARMONIC_RHYTHM_SLOW = 47
+    HARMONIC_RHYTHM_MODERATE = 48
+    HARMONIC_RHYTHM_FAST = 49
+    HARMONIC_TENSION_LOW = 50
+    HARMONIC_TENSION_MODERATE = 51
+    HARMONIC_TENSION_HIGH = 52
+
+    # Phase 3 encoding mode tokens
+    ENCODE_INTERLEAVED = 53
+    ENCODE_SEQUENTIAL = 54
+    VOICE_SEP = 55
+
     # Voice-count tokens (how many voices)
     FORM_TO_MODE_TOKEN: dict[str, int] = {
         "2-part": 16, "invention": 16,
@@ -150,6 +177,36 @@ class ScaleDegreeTokenizer:
         "alla_breve": 40,
     }
 
+    # Phase 2 mapping dicts
+    TEXTURE_TO_TOKEN: dict[str, int] = {
+        "homophonic": 41,
+        "polyphonic": 42,
+        "mixed": 43,
+    }
+
+    IMITATION_TO_TOKEN: dict[str, int] = {
+        "none": 44,
+        "low": 45,
+        "high": 46,
+    }
+
+    HARMONIC_RHYTHM_TO_TOKEN: dict[str, int] = {
+        "slow": 47,
+        "moderate": 48,
+        "fast": 49,
+    }
+
+    HARMONIC_TENSION_TO_TOKEN: dict[str, int] = {
+        "low": 50,
+        "moderate": 51,
+        "high": 52,
+    }
+
+    ENCODING_MODE_TO_TOKEN: dict[str, int] = {
+        "interleaved": 53,
+        "sequential": 54,
+    }
+
     def __init__(self, config: ScaleDegreeTokenizerConfig | None = None):
         self.config = config or ScaleDegreeTokenizerConfig()
         self._build_vocab()
@@ -182,26 +239,66 @@ class ScaleDegreeTokenizer:
             self.name_to_token[name] = idx
             idx += 1
 
-        # Form tokens (24-29)
+        # Form tokens (24-30)
         for form_name in FORM_NAMES:
             name = f"FORM_{form_name.upper()}"
             self.token_to_name[idx] = name
             self.name_to_token[name] = idx
             idx += 1
 
-        # Length tokens (30-33)
+        # Length tokens (31-34)
         for length_name in LENGTH_NAMES:
             name = f"LENGTH_{length_name.upper()}"
             self.token_to_name[idx] = name
             self.name_to_token[name] = idx
             idx += 1
 
-        # Meter tokens (34-39)
+        # Meter tokens (35-40)
         for meter_name in METER_NAMES:
             name = f"METER_{meter_name.upper()}"
             self.token_to_name[idx] = name
             self.name_to_token[name] = idx
             idx += 1
+
+        # Texture tokens (41-43)
+        for texture_name in TEXTURE_NAMES:
+            name = f"TEXTURE_{texture_name.upper()}"
+            self.token_to_name[idx] = name
+            self.name_to_token[name] = idx
+            idx += 1
+
+        # Imitation tokens (44-46)
+        for imitation_name in IMITATION_NAMES:
+            name = f"IMITATION_{imitation_name.upper()}"
+            self.token_to_name[idx] = name
+            self.name_to_token[name] = idx
+            idx += 1
+
+        # Harmonic rhythm tokens (47-49)
+        for hr_name in HARMONIC_RHYTHM_NAMES:
+            name = f"HARMONIC_RHYTHM_{hr_name.upper()}"
+            self.token_to_name[idx] = name
+            self.name_to_token[name] = idx
+            idx += 1
+
+        # Harmonic tension tokens (50-52)
+        for ht_name in HARMONIC_TENSION_NAMES:
+            name = f"HARMONIC_TENSION_{ht_name.upper()}"
+            self.token_to_name[idx] = name
+            self.name_to_token[name] = idx
+            idx += 1
+
+        # Encoding mode tokens (53-54)
+        for em_name in ENCODING_MODE_NAMES:
+            name = f"ENCODE_{em_name.upper()}"
+            self.token_to_name[idx] = name
+            self.name_to_token[name] = idx
+            idx += 1
+
+        # Voice separator (52)
+        self.token_to_name[idx] = "VOICE_SEP"
+        self.name_to_token["VOICE_SEP"] = idx
+        idx += 1
 
         # Key tokens — needed at decode time
         self._key_start = idx
@@ -258,21 +355,37 @@ class ScaleDegreeTokenizer:
 
         self._vocab_size = idx
 
+        # Verify hardcoded class-level constants match dynamic vocab
+        assert self.name_to_token.get("TEXTURE_HOMOPHONIC") == self.TEXTURE_HOMOPHONIC
+        assert self.name_to_token.get("HARMONIC_TENSION_LOW") == self.HARMONIC_TENSION_LOW
+        assert self.name_to_token.get("VOICE_SEP") == self.VOICE_SEP
+        assert self.name_to_token.get("ENCODE_SEQUENTIAL") == self.ENCODE_SEQUENTIAL
+
     @property
     def vocab_size(self) -> int:
         return self._vocab_size
 
     # ------------------------------------------------------------------
-    # Encode
+    # Conditioning prefix (shared by encode and encode_sequential)
     # ------------------------------------------------------------------
 
-    def encode(
-        self, item: Union[VoicePair, VoiceComposition], form: str | None = None,
-        style: str = "", length_bars: int | None = None, meter: str | None = None,
-    ) -> list[int]:
-        """Encode a VoicePair or VoiceComposition into a scale-degree token sequence.
+    def _build_conditioning_prefix(
+        self,
+        item: Union[VoicePair, VoiceComposition],
+        form: str | None = None,
+        style: str = "",
+        length_bars: int | None = None,
+        meter: str | None = None,
+        texture: str | None = None,
+        imitation: str | None = None,
+        harmonic_rhythm: str | None = None,
+        harmonic_tension: str | None = None,
+        encoding_mode: str | None = None,
+    ) -> tuple[list[int], VoiceComposition]:
+        """Build the conditioning prefix up to (but not including) KEY.
 
-        Prefix order: BOS STYLE FORM MODE LENGTH METER KEY <events> EOS
+        Returns (prefix_tokens, comp) where comp is the resolved
+        VoiceComposition (converted from VoicePair if needed).
         """
         tokens = [self.BOS]
 
@@ -311,6 +424,43 @@ class ScaleDegreeTokenizer:
             if auto_meter and auto_meter in self.METER_TO_TOKEN:
                 tokens.append(self.METER_TO_TOKEN[auto_meter])
 
+        # Phase 2 conditioning tokens
+        if texture is not None and texture in self.TEXTURE_TO_TOKEN:
+            tokens.append(self.TEXTURE_TO_TOKEN[texture])
+        if imitation is not None and imitation in self.IMITATION_TO_TOKEN:
+            tokens.append(self.IMITATION_TO_TOKEN[imitation])
+        if harmonic_rhythm is not None and harmonic_rhythm in self.HARMONIC_RHYTHM_TO_TOKEN:
+            tokens.append(self.HARMONIC_RHYTHM_TO_TOKEN[harmonic_rhythm])
+        if harmonic_tension is not None and harmonic_tension in self.HARMONIC_TENSION_TO_TOKEN:
+            tokens.append(self.HARMONIC_TENSION_TO_TOKEN[harmonic_tension])
+
+        # Encoding mode token
+        if encoding_mode is not None and encoding_mode in self.ENCODING_MODE_TO_TOKEN:
+            tokens.append(self.ENCODING_MODE_TO_TOKEN[encoding_mode])
+
+        return tokens, comp
+
+    # ------------------------------------------------------------------
+    # Encode (interleaved — default)
+    # ------------------------------------------------------------------
+
+    def encode(
+        self, item: Union[VoicePair, VoiceComposition], form: str | None = None,
+        style: str = "", length_bars: int | None = None, meter: str | None = None,
+        texture: str | None = None, imitation: str | None = None,
+        harmonic_rhythm: str | None = None, harmonic_tension: str | None = None,
+    ) -> list[int]:
+        """Encode a VoicePair or VoiceComposition into a scale-degree token sequence.
+
+        Prefix order: BOS STYLE FORM MODE LENGTH METER TEXTURE IMITATION
+                      HARMONIC_RHYTHM TENSION ENCODE_INTERLEAVED KEY <events> EOS
+        """
+        tokens, comp = self._build_conditioning_prefix(
+            item, form=form, style=style, length_bars=length_bars, meter=meter,
+            texture=texture, imitation=imitation, harmonic_rhythm=harmonic_rhythm,
+            harmonic_tension=harmonic_tension, encoding_mode="interleaved",
+        )
+
         # Emit key token (needed for decode)
         key_name = get_key_signature_name(comp.key_root, comp.key_mode)
         key_token_name = f"KEY_{key_name}"
@@ -326,6 +476,137 @@ class ScaleDegreeTokenizer:
         tokens.extend(events)
         tokens.append(self.EOS)
         return tokens
+
+    # ------------------------------------------------------------------
+    # Encode sequential (voice-by-voice)
+    # ------------------------------------------------------------------
+
+    def encode_sequential(
+        self, item: Union[VoicePair, VoiceComposition], form: str | None = None,
+        style: str = "", length_bars: int | None = None, meter: str | None = None,
+        texture: str | None = None, imitation: str | None = None,
+        harmonic_rhythm: str | None = None, harmonic_tension: str | None = None,
+    ) -> list[int]:
+        """Encode using sequential (voice-by-voice) format.
+
+        Format: BOS <conditioning> ENCODE_SEQUENTIAL KEY
+                VOICE_1 <voice1_notes> VOICE_SEP
+                VOICE_2 <voice2_notes> VOICE_SEP
+                ...
+                VOICE_N <voiceN_notes> EOS
+        """
+        tokens, comp = self._build_conditioning_prefix(
+            item, form=form, style=style, length_bars=length_bars, meter=meter,
+            texture=texture, imitation=imitation, harmonic_rhythm=harmonic_rhythm,
+            harmonic_tension=harmonic_tension, encoding_mode="sequential",
+        )
+
+        # Emit key token
+        key_name = get_key_signature_name(comp.key_root, comp.key_mode)
+        key_token_name = f"KEY_{key_name}"
+        if key_token_name in self.name_to_token:
+            tokens.append(self.name_to_token[key_token_name])
+
+        # Store key info for pitch-to-degree conversion
+        self._encode_key_root = comp.key_root
+        self._encode_key_mode = comp.key_mode
+
+        time_sig = comp.time_signature if hasattr(comp, "time_signature") else (4, 4)
+
+        # Serialize each voice sequentially
+        for voice_idx, voice_notes in enumerate(comp.voices):
+            voice_num = voice_idx + 1
+            if voice_num > 4:
+                break
+
+            # Emit VOICE_N marker
+            voice_tok = self.VOICE_TOKENS[voice_num - 1]
+            tokens.append(voice_tok)
+
+            # Serialize this voice's notes with its own timeline
+            voice_tokens = self._serialize_single_voice(voice_notes, time_sig)
+            tokens.extend(voice_tokens)
+
+            # VOICE_SEP between voices; EOS after last voice
+            if voice_idx < len(comp.voices) - 1:
+                tokens.append(self.VOICE_SEP)
+            else:
+                tokens.append(self.EOS)
+
+        return tokens
+
+    def _serialize_single_voice(
+        self,
+        voice_notes: list[tuple[int, int, int]],
+        time_sig: tuple[int, int] = (4, 4),
+    ) -> list[int]:
+        """Serialize one voice's notes with its own timeline starting from tick 0.
+
+        Emits BAR/BEAT markers and OCT/ACC/DEG/DUR tokens.  No per-note VOICE_N
+        tokens (unlike interleaved mode) — the caller emits VOICE_N once before
+        the voice block.
+        """
+        tokens: list[int] = []
+        if not voice_notes:
+            return tokens
+
+        sorted_notes = sorted(voice_notes, key=lambda n: n[0])
+
+        # Pre-compute beat boundaries
+        measure_ticks = ticks_per_measure(time_sig)
+        beat_offsets = beat_tick_positions(time_sig)
+        max_tick = max(n[0] + n[1] for n in sorted_notes)
+        n_measures = (max_tick // measure_ticks) + 2
+
+        beat_boundaries: list[tuple[int, int]] = []
+        for m in range(n_measures):
+            for beat_idx, offset in enumerate(beat_offsets):
+                abs_tick = m * measure_ticks + offset
+                beat_boundaries.append((abs_tick, beat_idx + 1))
+
+        current_time = 0
+        beat_ptr = 0
+
+        for start, dur, pitch in sorted_notes:
+            # Emit BAR/BEAT tokens
+            while beat_ptr < len(beat_boundaries) and beat_boundaries[beat_ptr][0] <= start:
+                b_tick, b_num = beat_boundaries[beat_ptr]
+                if b_tick >= current_time:
+                    gap = b_tick - current_time
+                    if gap > 0:
+                        ts_tokens = self._quantize_time_shift(gap)
+                        tokens.extend(ts_tokens)
+                        current_time = b_tick
+
+                    if b_num == 1:
+                        tokens.append(self.BAR)
+                    beat_tok_name = f"BEAT_{b_num}"
+                    beat_tok = self.name_to_token.get(beat_tok_name)
+                    if beat_tok is not None:
+                        tokens.append(beat_tok)
+
+                beat_ptr += 1
+
+            # Time shift to event
+            dt = start - current_time
+            if dt > 0:
+                ts_tokens = self._quantize_time_shift(dt)
+                tokens.extend(ts_tokens)
+                current_time = start
+
+            # Emit OCT [SHARP|FLAT] DEG DUR
+            degree_toks = self._pitch_to_degree_tokens(pitch)
+            tokens.extend(degree_toks)
+
+            dur_tok = self._duration_to_token(dur)
+            if dur_tok is not None:
+                tokens.append(dur_tok)
+
+        return tokens
+
+    # ------------------------------------------------------------------
+    # Interleaved encoding helpers
+    # ------------------------------------------------------------------
 
     def _interleave_n_voices(
         self, voices: list[list[tuple[int, int, int]]],
@@ -459,8 +740,20 @@ class ScaleDegreeTokenizer:
                 "LENGTH_SHORT", "LENGTH_MEDIUM", "LENGTH_LONG", "LENGTH_EXTENDED",
                 "METER_2_4", "METER_3_4", "METER_4_4", "METER_6_8",
                 "METER_3_8", "METER_ALLA_BREVE",
+                "TEXTURE_HOMOPHONIC", "TEXTURE_POLYPHONIC", "TEXTURE_MIXED",
+                "IMITATION_NONE", "IMITATION_LOW", "IMITATION_HIGH",
+                "HARMONIC_RHYTHM_SLOW", "HARMONIC_RHYTHM_MODERATE", "HARMONIC_RHYTHM_FAST",
+                "HARMONIC_TENSION_LOW", "HARMONIC_TENSION_MODERATE", "HARMONIC_TENSION_HIGH",
+                "ENCODE_INTERLEAVED", "ENCODE_SEQUENTIAL",
             ):
                 continue
+
+            elif name == "VOICE_SEP":
+                # Voice separator: reset timeline for next voice (sequential mode)
+                current_time = 0
+                pending_octave = None
+                pending_degree = None
+                pending_accidental = ""
 
             elif name.startswith("VOICE_"):
                 # Reset pending state on voice change

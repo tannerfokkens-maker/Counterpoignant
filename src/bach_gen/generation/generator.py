@@ -87,6 +87,10 @@ def generate(
     style: str = "bach",
     length: str | None = None,
     meter: str | None = None,
+    texture: str | None = None,
+    imitation: str | None = None,
+    harmonic_rhythm: str | None = None,
+    harmonic_tension: str | None = None,
 ) -> list[GenerationResult]:
     """Generate Bach-style compositions and return top results.
 
@@ -112,6 +116,10 @@ def generate(
         style: Style conditioning token name (e.g. "bach", "baroque").
         length: Length conditioning (short/medium/long/extended). Default: infer from form.
         meter: Meter conditioning (e.g. "4_4", "3_4"). Default: METER_4_4.
+        texture: Texture conditioning (homophonic/polyphonic/mixed).
+        imitation: Imitation conditioning (none/low/high).
+        harmonic_rhythm: Harmonic rhythm conditioning (slow/moderate/fast).
+        harmonic_tension: Harmonic tension conditioning (low/moderate/high).
 
     Returns:
         List of top GenerationResult, sorted by score.
@@ -129,7 +137,8 @@ def generate(
     # Build prompt
     prompt_tokens = _build_prompt(
         tokenizer, key_root, key_mode, key_name, subject_str, form, style,
-        length=length, meter=meter,
+        length=length, meter=meter, texture=texture, imitation=imitation,
+        harmonic_rhythm=harmonic_rhythm, harmonic_tension=harmonic_tension,
     )
 
     # Constraints — dispatch based on tokenizer type
@@ -264,10 +273,16 @@ def _build_prompt(
     style: str = "bach",
     length: str | None = None,
     meter: str | None = None,
+    texture: str | None = None,
+    imitation: str | None = None,
+    harmonic_rhythm: str | None = None,
+    harmonic_tension: str | None = None,
+    encoding_mode: str | None = None,
 ) -> list[int]:
     """Build the prompt token sequence.
 
-    Prefix order: BOS STYLE FORM MODE LENGTH METER KEY [SUBJECT]
+    Prefix order: BOS STYLE FORM MODE LENGTH METER TEXTURE IMITATION
+                  HARMONIC_RHYTHM ENCODE_* KEY [SUBJECT]
     """
     tokens = [tokenizer.BOS]
 
@@ -302,12 +317,38 @@ def _build_prompt(
     if meter and hasattr(tokenizer, "METER_TO_TOKEN") and meter in tokenizer.METER_TO_TOKEN:
         tokens.append(tokenizer.METER_TO_TOKEN[meter])
 
+    # Texture conditioning token
+    if texture and hasattr(tokenizer, "TEXTURE_TO_TOKEN") and texture in tokenizer.TEXTURE_TO_TOKEN:
+        tokens.append(tokenizer.TEXTURE_TO_TOKEN[texture])
+
+    # Imitation conditioning token
+    if imitation and hasattr(tokenizer, "IMITATION_TO_TOKEN") and imitation in tokenizer.IMITATION_TO_TOKEN:
+        tokens.append(tokenizer.IMITATION_TO_TOKEN[imitation])
+
+    # Harmonic rhythm conditioning token
+    if harmonic_rhythm and hasattr(tokenizer, "HARMONIC_RHYTHM_TO_TOKEN") and harmonic_rhythm in tokenizer.HARMONIC_RHYTHM_TO_TOKEN:
+        tokens.append(tokenizer.HARMONIC_RHYTHM_TO_TOKEN[harmonic_rhythm])
+
+    # Harmonic tension conditioning token
+    if harmonic_tension and hasattr(tokenizer, "HARMONIC_TENSION_TO_TOKEN") and harmonic_tension in tokenizer.HARMONIC_TENSION_TO_TOKEN:
+        tokens.append(tokenizer.HARMONIC_TENSION_TO_TOKEN[harmonic_tension])
+
+    # Encoding mode token
+    if encoding_mode is None:
+        encoding_mode = "interleaved"
+    if hasattr(tokenizer, "ENCODING_MODE_TO_TOKEN") and encoding_mode in tokenizer.ENCODING_MODE_TO_TOKEN:
+        tokens.append(tokenizer.ENCODING_MODE_TO_TOKEN[encoding_mode])
+
     # Key token
     key_token_name = f"KEY_{key_name}"
     if key_token_name in tokenizer.name_to_token:
         tokens.append(tokenizer.name_to_token[key_token_name])
 
     # Subject — dispatch based on tokenizer type
+    # Skip subject in sequential mode (subjects are interleaved-mode only)
+    if encoding_mode == "sequential":
+        return tokens
+
     from bach_gen.data.scale_degree_tokenizer import ScaleDegreeTokenizer
     if isinstance(tokenizer, ScaleDegreeTokenizer):
         if subject_str:
@@ -324,6 +365,148 @@ def _build_prompt(
 
     tokens.extend(subject_tokens)
     return tokens
+
+
+def generate_voice_by_voice(
+    model: BachTransformer,
+    tokenizer: BachTokenizer,
+    key_str: str,
+    num_candidates: int = DEFAULT_NUM_CANDIDATES,
+    top_k_results: int = DEFAULT_TOP_K_RESULTS,
+    temperature: float = DEFAULT_TEMPERATURE,
+    top_k: int = DEFAULT_TOP_K_SAMPLING,
+    top_p: float = DEFAULT_TOP_P,
+    max_length: int = DEFAULT_MAX_GEN_LENGTH,
+    output_dir: str | Path = "output",
+    enforce_range: bool = True,
+    form: str = "2-part",
+    num_voices: int | None = None,
+    progress_callback: callable | None = None,
+    style: str = "bach",
+    length: str | None = None,
+    meter: str | None = None,
+    texture: str | None = None,
+    imitation: str | None = None,
+    harmonic_rhythm: str | None = None,
+    harmonic_tension: str | None = None,
+    provided_voice_midi: str | None = None,
+) -> list[GenerationResult]:
+    """Generate compositions voice-by-voice using sequential encoding.
+
+    1. Builds prompt with encoding_mode="sequential" + conditioning + KEY
+    2. If provided_voice_midi given: loads MIDI, encodes voice 1 notes, appends VOICE_SEP
+    3. Generates remaining voices autoregressively (model emits VOICE_SEP between voices)
+    4. Decodes full sequence, scores, returns top K
+    """
+    device = next(model.parameters()).device
+
+    if num_voices is None:
+        num_voices = FORM_DEFAULTS.get(form, (2, 768))[0]
+
+    key_root, key_mode = parse_key(key_str)
+    key_name = get_key_signature_name(key_root, key_mode)
+
+    # Build prompt with sequential encoding mode
+    prompt_tokens = _build_prompt(
+        tokenizer, key_root, key_mode, key_name,
+        subject_str=None, form=form, style=style,
+        length=length, meter=meter, texture=texture, imitation=imitation,
+        harmonic_rhythm=harmonic_rhythm, harmonic_tension=harmonic_tension,
+        encoding_mode="sequential",
+    )
+
+    # If a MIDI file is provided for voice 1, encode it and append
+    if provided_voice_midi:
+        from bach_gen.utils.midi_io import load_midi, midi_to_note_events
+        mid = load_midi(provided_voice_midi)
+        tracks = midi_to_note_events(mid)
+        if tracks:
+            voice1_notes = tracks[0]  # Use first track as voice 1
+            prompt_tokens.append(tokenizer.VOICE_1)
+
+            from bach_gen.data.scale_degree_tokenizer import ScaleDegreeTokenizer
+            time_sig = (4, 4)  # Default; could be detected from MIDI
+            if isinstance(tokenizer, ScaleDegreeTokenizer):
+                tokenizer._encode_key_root = key_root
+                tokenizer._encode_key_mode = key_mode
+            voice_tokens = tokenizer._serialize_single_voice(voice1_notes, time_sig)
+            prompt_tokens.extend(voice_tokens)
+            prompt_tokens.append(tokenizer.VOICE_SEP)
+
+    # Constraints
+    from bach_gen.data.scale_degree_tokenizer import ScaleDegreeTokenizer
+    if isinstance(tokenizer, ScaleDegreeTokenizer):
+        from bach_gen.generation.scale_degree_constraints import ScaleDegreeDecodingConstraints
+        constraints = ScaleDegreeDecodingConstraints(
+            tokenizer=tokenizer,
+            key_root=key_root,
+            key_mode=key_mode,
+            enforce_range=enforce_range,
+            form=form,
+            num_voices=num_voices,
+        )
+    else:
+        constraints = DecodingConstraints(
+            tokenizer=tokenizer,
+            key_root=key_root,
+            key_mode=key_mode,
+            enforce_key=True,
+            enforce_range=enforce_range,
+            form=form,
+            num_voices=num_voices,
+        )
+
+    candidates: list[GenerationResult] = []
+    form_label = form.replace("-", "")
+
+    logger.info(f"Voice-by-voice generation (candidates={num_candidates})")
+    for i in range(num_candidates):
+        tokens = _generate_one(
+            model=model,
+            tokenizer=tokenizer,
+            prompt=prompt_tokens,
+            constraints=constraints,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            max_length=max_length,
+            device=device,
+        )
+
+        comp = tokenizer.decode(tokens)
+        comp.key_root = key_root
+        comp.key_mode = key_mode
+        comp.source = f"vbv_generated_{i+1}"
+
+        non_empty = sum(1 for v in comp.voices if v)
+        if non_empty < 2:
+            continue
+
+        score = score_composition(comp, token_sequence=tokens, model=model, tokenizer=tokenizer)
+        candidates.append(GenerationResult(
+            composition=comp,
+            tokens=tokens,
+            score=score,
+        ))
+
+        if progress_callback:
+            progress_callback(i + 1, num_candidates)
+
+    candidates.sort(key=lambda r: r.score.composite, reverse=True)
+    top_results = candidates[:top_k_results]
+
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    for i, result in enumerate(top_results):
+        filename = f"{form_label}_{key_name}_vbv_{i+1}.mid"
+        midi_path = output_path / filename
+        mid = note_events_to_midi(voices=result.composition.voices)
+        save_midi(mid, midi_path)
+        result.midi_path = str(midi_path)
+        logger.info(f"Saved {midi_path} (score: {result.score.composite:.3f})")
+
+    return top_results
 
 
 @torch.no_grad()

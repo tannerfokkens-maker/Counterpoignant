@@ -27,6 +27,7 @@ class ScaleDegreeConstraintState:
     recent_tokens: list[int] = field(default_factory=list)
     pending_octave: int | None = None
     pending_accidental: str = ""
+    notes_in_current_voice: int = 0
 
 
 class ScaleDegreeDecodingConstraints:
@@ -89,6 +90,7 @@ class ScaleDegreeDecodingConstraints:
         current_voice = state.current_voice
         pending_octave = state.pending_octave
         pending_accidental = state.pending_accidental
+        notes_in_voice = state.notes_in_current_voice
 
         name = self.tokenizer.token_to_name.get(token, "")
 
@@ -96,6 +98,12 @@ class ScaleDegreeDecodingConstraints:
             current_voice = self._voice_token_ids[token]
             pending_octave = None
             pending_accidental = ""
+            notes_in_voice = 0
+        elif name == "VOICE_SEP":
+            # Voice separator: reset pending state, advance voice
+            pending_octave = None
+            pending_accidental = ""
+            notes_in_voice = 0
         elif name.startswith("OCT_"):
             pending_octave = int(name[4:])
             pending_accidental = ""
@@ -103,8 +111,12 @@ class ScaleDegreeDecodingConstraints:
             pending_accidental = "sharp"
         elif name == "FLAT":
             pending_accidental = "flat"
-        elif name.startswith("Dur_") or name.startswith("TimeShift_"):
-            # Note completed — reset pending state
+        elif name.startswith("Dur_"):
+            # Note completed — reset pending state, increment note count
+            pending_octave = None
+            pending_accidental = ""
+            notes_in_voice += 1
+        elif name.startswith("TimeShift_"):
             pending_octave = None
             pending_accidental = ""
 
@@ -116,6 +128,7 @@ class ScaleDegreeDecodingConstraints:
             recent_tokens=recent,
             pending_octave=pending_octave,
             pending_accidental=pending_accidental,
+            notes_in_current_voice=notes_in_voice,
         )
 
     # ------------------------------------------------------------------
@@ -283,6 +296,14 @@ class ScaleDegreeDecodingConstraints:
 
         logits[self.tokenizer.PAD] = float("-inf")
         logits[self.tokenizer.BOS] = float("-inf")
+
+        # Prevent VOICE_SEP if current voice has too few notes (avoid empty voices)
+        min_notes_before_sep = 4
+        voice_sep_tok = self.tokenizer.name_to_token.get("VOICE_SEP")
+        if voice_sep_tok is not None and voice_sep_tok < logits.size(0):
+            if state.notes_in_current_voice < min_notes_before_sep:
+                logits[voice_sep_tok] = float("-inf")
+
         return logits
 
     # ------------------------------------------------------------------

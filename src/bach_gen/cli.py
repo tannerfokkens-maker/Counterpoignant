@@ -97,13 +97,15 @@ def _print_conditioning_histograms(sequences: list[list[int]], tokenizer) -> Non
     """Print distribution of conditioning tokens across sequences."""
     from collections import Counter
 
-    # Only check the first ~20 tokens of each sequence (prefix region)
-    prefix_len = 20
+    # Only check the first ~30 tokens of each sequence (prefix region — now longer)
+    prefix_len = 30
     token_counts: Counter = Counter()
     for seq in sequences:
         for tok in seq[:prefix_len]:
             name = tokenizer.token_to_name.get(tok, "")
-            if name.startswith(("STYLE_", "FORM_", "MODE_", "LENGTH_", "METER_")):
+            if name.startswith(("STYLE_", "FORM_", "MODE_", "LENGTH_", "METER_",
+                                "TEXTURE_", "IMITATION_", "HARMONIC_RHYTHM_",
+                                "TENSION_", "ENCODE_")):
                 token_counts[name] += 1
 
     # Group by category
@@ -113,6 +115,11 @@ def _print_conditioning_histograms(sequences: list[list[int]], tokenizer) -> Non
         "Mode": {k: v for k, v in token_counts.items() if k.startswith("MODE_")},
         "Length": {k: v for k, v in token_counts.items() if k.startswith("LENGTH_")},
         "Meter": {k: v for k, v in token_counts.items() if k.startswith("METER_")},
+        "Texture": {k: v for k, v in token_counts.items() if k.startswith("TEXTURE_")},
+        "Imitation": {k: v for k, v in token_counts.items() if k.startswith("IMITATION_")},
+        "Harmonic Rhythm": {k: v for k, v in token_counts.items() if k.startswith("HARMONIC_RHYTHM_")},
+        "Tension": {k: v for k, v in token_counts.items() if k.startswith("TENSION_")},
+        "Encoding": {k: v for k, v in token_counts.items() if k.startswith("ENCODE_")},
     }
 
     console.print("\n  [bold]Conditioning token distributions:[/bold]")
@@ -140,8 +147,11 @@ def _print_conditioning_histograms(sequences: list[list[int]], tokenizer) -> Non
               help="Output directory for prepared data (default: data/)")
 @click.option("--composer-filter", default=None, type=str,
               help="Comma-separated composer/style names to include (e.g. 'bach' or 'bach,baroque')")
+@click.option("--no-sequential", is_flag=True, default=False,
+              help="Disable dual sequential encoding (skip voice-by-voice training data)")
 def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len: int,
-                 no_chunk: bool, data_dir: str | None, composer_filter: str | None) -> None:
+                 no_chunk: bool, data_dir: str | None, composer_filter: str | None,
+                 no_sequential: bool) -> None:
     """Extract Bach corpus, tokenize, and cache statistics."""
     from bach_gen.data.corpus import get_all_works
     from bach_gen.data.extraction import extract_voice_pairs, extract_voice_groups, detect_form, VoicePair, VoiceComposition
@@ -260,10 +270,33 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
                 item_form = forms_to_tokenize[i] if i < len(forms_to_tokenize) else "chorale"
                 time_sig = item.time_signature if hasattr(item, "time_signature") else (4, 4)
                 num_bars = compute_measure_count(item.voices, time_sig)
-                tokens = tokenizer.encode(item, form=item_form, length_bars=num_bars)
+
+                # Compute analysis labels for Phase 2 conditioning
+                from bach_gen.data.analysis import analyze_composition
+                labels = analyze_composition(item, time_sig)
+
+                tokens = tokenizer.encode(
+                    item, form=item_form, length_bars=num_bars,
+                    texture=labels["texture"], imitation=labels["imitation"],
+                    harmonic_rhythm=labels["harmonic_rhythm"],
+                    harmonic_tension=labels["harmonic_tension"],
+                )
                 if len(tokens) >= 20:
                     sequences.append(tokens)
                     piece_ids.append(item.source)
+
+                # Dual encoding: also produce sequential encoding
+                if not no_sequential:
+                    tokens_seq = tokenizer.encode_sequential(
+                        item, form=item_form, length_bars=num_bars,
+                        texture=labels["texture"], imitation=labels["imitation"],
+                        harmonic_rhythm=labels["harmonic_rhythm"],
+                    harmonic_tension=labels["harmonic_tension"],
+                    )
+                    if len(tokens_seq) >= 20:
+                        sequences.append(tokens_seq)
+                        piece_ids.append(item.source)
+
                 progress.advance(task)
 
     elif num_voices == 2:
@@ -317,10 +350,38 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
                 else:
                     item_voices = item.voices
                 num_bars = compute_measure_count(item_voices, time_sig)
-                tokens = tokenizer.encode(item, form=mode, length_bars=num_bars)
+
+                # Compute analysis labels for Phase 2 conditioning
+                from bach_gen.data.analysis import analyze_composition
+                from bach_gen.data.extraction import VoiceComposition as VC
+                if isinstance(item, VoicePair):
+                    analysis_comp = VC.from_voice_pair(item)
+                else:
+                    analysis_comp = item
+                labels = analyze_composition(analysis_comp, time_sig)
+
+                tokens = tokenizer.encode(
+                    item, form=mode, length_bars=num_bars,
+                    texture=labels["texture"], imitation=labels["imitation"],
+                    harmonic_rhythm=labels["harmonic_rhythm"],
+                    harmonic_tension=labels["harmonic_tension"],
+                )
                 if len(tokens) >= 20:
                     sequences.append(tokens)
                     piece_ids.append(item.source)
+
+                # Dual encoding: also produce sequential encoding
+                if not no_sequential:
+                    tokens_seq = tokenizer.encode_sequential(
+                        item, form=mode, length_bars=num_bars,
+                        texture=labels["texture"], imitation=labels["imitation"],
+                        harmonic_rhythm=labels["harmonic_rhythm"],
+                    harmonic_tension=labels["harmonic_tension"],
+                    )
+                    if len(tokens_seq) >= 20:
+                        sequences.append(tokens_seq)
+                        piece_ids.append(item.source)
+
                 progress.advance(task)
     else:
         compositions: list[VoiceComposition] = []
@@ -369,10 +430,33 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
                 # Compute measure count for length conditioning
                 time_sig = item.time_signature if hasattr(item, "time_signature") else (4, 4)
                 num_bars = compute_measure_count(item.voices, time_sig)
-                tokens = tokenizer.encode(item, form=mode, length_bars=num_bars)
+
+                # Compute analysis labels for Phase 2 conditioning
+                from bach_gen.data.analysis import analyze_composition
+                labels = analyze_composition(item, time_sig)
+
+                tokens = tokenizer.encode(
+                    item, form=mode, length_bars=num_bars,
+                    texture=labels["texture"], imitation=labels["imitation"],
+                    harmonic_rhythm=labels["harmonic_rhythm"],
+                    harmonic_tension=labels["harmonic_tension"],
+                )
                 if len(tokens) >= 20:
                     sequences.append(tokens)
                     piece_ids.append(item.source)
+
+                # Dual encoding: also produce sequential encoding
+                if not no_sequential:
+                    tokens_seq = tokenizer.encode_sequential(
+                        item, form=mode, length_bars=num_bars,
+                        texture=labels["texture"], imitation=labels["imitation"],
+                        harmonic_rhythm=labels["harmonic_rhythm"],
+                    harmonic_tension=labels["harmonic_tension"],
+                    )
+                    if len(tokens_seq) >= 20:
+                        sequences.append(tokens_seq)
+                        piece_ids.append(item.source)
+
                 progress.advance(task)
 
     console.print(f"  Tokenized {len(sequences)} sequences")
@@ -773,6 +857,18 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
               default=None, help="Length conditioning (default: infer from form)")
 @click.option("--meter", type=click.Choice(["2_4", "3_4", "4_4", "6_8", "3_8", "alla_breve"]),
               default=None, help="Meter conditioning (default: 4/4)")
+@click.option("--texture", type=click.Choice(["homophonic", "polyphonic", "mixed"]),
+              default=None, help="Texture conditioning")
+@click.option("--imitation", type=click.Choice(["none", "low", "high"]),
+              default=None, help="Imitation conditioning")
+@click.option("--harmonic-rhythm", type=click.Choice(["slow", "moderate", "fast"]),
+              default=None, help="Harmonic rhythm conditioning")
+@click.option("--tension", type=click.Choice(["low", "moderate", "high"]),
+              default=None, help="Harmonic tension conditioning")
+@click.option("--voice-by-voice", is_flag=True, default=False,
+              help="Use voice-by-voice (sequential) generation")
+@click.option("--provide-voice", default=None, type=click.Path(exists=True),
+              help="Path to MIDI file for voice 1 (use with --voice-by-voice)")
 def generate(
     key: str,
     subject: str | None,
@@ -788,11 +884,18 @@ def generate(
     style: str,
     length: str | None,
     meter: str | None,
+    texture: str | None,
+    imitation: str | None,
+    harmonic_rhythm: str | None,
+    tension: str | None,
+    voice_by_voice: bool,
+    provide_voice: str | None,
 ) -> None:
     """Generate Bach-style compositions."""
     from bach_gen.data.tokenizer import load_tokenizer
     from bach_gen.model.trainer import Trainer
     from bach_gen.generation.generator import generate as gen_fn
+    from bach_gen.generation.generator import generate_voice_by_voice as gen_vbv_fn
     from bach_gen.evaluation.statistical import load_corpus_stats
 
     # Auto-detect mode
@@ -880,6 +983,30 @@ def generate(
             style=style,
             length=length,
             meter=meter,
+            texture=texture,
+            imitation=imitation,
+            harmonic_rhythm=harmonic_rhythm,
+            harmonic_tension=tension,
+        ) if not voice_by_voice else gen_vbv_fn(
+            model=model,
+            tokenizer=tokenizer,
+            key_str=key,
+            num_candidates=candidates,
+            top_k_results=top,
+            temperature=temperature,
+            max_length=max_length,
+            output_dir=OUTPUT_DIR,
+            form=mode,
+            num_voices=num_voices if voices else None,
+            progress_callback=on_progress,
+            style=style,
+            length=length,
+            meter=meter,
+            texture=texture,
+            imitation=imitation,
+            harmonic_rhythm=harmonic_rhythm,
+            harmonic_tension=tension,
+            provided_voice_midi=provide_voice,
         )
         progress.update(task, description="Done!")
 

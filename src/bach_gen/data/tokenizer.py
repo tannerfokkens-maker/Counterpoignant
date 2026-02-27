@@ -28,6 +28,11 @@ from bach_gen.utils.constants import (
     LENGTH_BOUNDARIES,
     METER_NAMES,
     METER_MAP,
+    TEXTURE_NAMES,
+    IMITATION_NAMES,
+    HARMONIC_RHYTHM_NAMES,
+    HARMONIC_TENSION_NAMES,
+    ENCODING_MODE_NAMES,
     ticks_per_measure,
     beat_tick_positions,
     length_bucket,
@@ -73,7 +78,12 @@ class BachTokenizer:
         24-30: FORM_CHORALE..FORM_MOTET (form conditioning tokens)
         31-34: LENGTH_SHORT..LENGTH_EXTENDED (length conditioning tokens)
         35-40: METER_2_4..METER_ALLA_BREVE (meter conditioning tokens)
-        41..64: KEY tokens (C_major, C_minor, ...)
+        41-43: TEXTURE_HOMOPHONIC..TEXTURE_MIXED
+        44-46: IMITATION_NONE..IMITATION_HIGH
+        47-49: HARMONIC_RHYTHM_SLOW..HARMONIC_RHYTHM_FAST
+        50-51: ENCODE_INTERLEAVED, ENCODE_SEQUENTIAL
+        52: VOICE_SEP
+        53..76: KEY tokens (C_major, C_minor, ...)
         next: PITCH tokens (Pitch_36 .. Pitch_84)
         next: DURATION tokens (Dur_60, Dur_120, ...)
         next: TIME_SHIFT tokens (TimeShift_60, TimeShift_120, ...)
@@ -122,6 +132,25 @@ class BachTokenizer:
     METER_3_8 = 39
     METER_ALLA_BREVE = 40
 
+    # Phase 2 conditioning tokens
+    TEXTURE_HOMOPHONIC = 41
+    TEXTURE_POLYPHONIC = 42
+    TEXTURE_MIXED = 43
+    IMITATION_NONE = 44
+    IMITATION_LOW = 45
+    IMITATION_HIGH = 46
+    HARMONIC_RHYTHM_SLOW = 47
+    HARMONIC_RHYTHM_MODERATE = 48
+    HARMONIC_RHYTHM_FAST = 49
+    HARMONIC_TENSION_LOW = 50
+    HARMONIC_TENSION_MODERATE = 51
+    HARMONIC_TENSION_HIGH = 52
+
+    # Phase 3 encoding mode tokens
+    ENCODE_INTERLEAVED = 53
+    ENCODE_SEQUENTIAL = 54
+    VOICE_SEP = 55
+
     # Voice-count tokens (how many voices)
     FORM_TO_MODE_TOKEN: dict[str, int] = {
         "2-part": 16, "invention": 16,
@@ -165,6 +194,36 @@ class BachTokenizer:
         "alla_breve": 40,
     }
 
+    # Phase 2 mapping dicts
+    TEXTURE_TO_TOKEN: dict[str, int] = {
+        "homophonic": 41,
+        "polyphonic": 42,
+        "mixed": 43,
+    }
+
+    IMITATION_TO_TOKEN: dict[str, int] = {
+        "none": 44,
+        "low": 45,
+        "high": 46,
+    }
+
+    HARMONIC_RHYTHM_TO_TOKEN: dict[str, int] = {
+        "slow": 47,
+        "moderate": 48,
+        "fast": 49,
+    }
+
+    HARMONIC_TENSION_TO_TOKEN: dict[str, int] = {
+        "low": 50,
+        "moderate": 51,
+        "high": 52,
+    }
+
+    ENCODING_MODE_TO_TOKEN: dict[str, int] = {
+        "interleaved": 53,
+        "sequential": 54,
+    }
+
     def __init__(self, config: TokenConfig | None = None):
         self.config = config or TokenConfig()
         self._build_vocab()
@@ -189,19 +248,59 @@ class BachTokenizer:
             self.name_to_token[name] = idx
             idx += 1
 
-        # Length tokens (30-33)
+        # Length tokens (31-34)
         for length_name in LENGTH_NAMES:
             name = f"LENGTH_{length_name.upper()}"
             self.token_to_name[idx] = name
             self.name_to_token[name] = idx
             idx += 1
 
-        # Meter tokens (34-39)
+        # Meter tokens (35-40)
         for meter_name in METER_NAMES:
             name = f"METER_{meter_name.upper()}"
             self.token_to_name[idx] = name
             self.name_to_token[name] = idx
             idx += 1
+
+        # Texture tokens (41-43)
+        for texture_name in TEXTURE_NAMES:
+            name = f"TEXTURE_{texture_name.upper()}"
+            self.token_to_name[idx] = name
+            self.name_to_token[name] = idx
+            idx += 1
+
+        # Imitation tokens (44-46)
+        for imitation_name in IMITATION_NAMES:
+            name = f"IMITATION_{imitation_name.upper()}"
+            self.token_to_name[idx] = name
+            self.name_to_token[name] = idx
+            idx += 1
+
+        # Harmonic rhythm tokens (47-49)
+        for hr_name in HARMONIC_RHYTHM_NAMES:
+            name = f"HARMONIC_RHYTHM_{hr_name.upper()}"
+            self.token_to_name[idx] = name
+            self.name_to_token[name] = idx
+            idx += 1
+
+        # Harmonic tension tokens (50-52)
+        for ht_name in HARMONIC_TENSION_NAMES:
+            name = f"HARMONIC_TENSION_{ht_name.upper()}"
+            self.token_to_name[idx] = name
+            self.name_to_token[name] = idx
+            idx += 1
+
+        # Encoding mode tokens (53-54)
+        for em_name in ENCODING_MODE_NAMES:
+            name = f"ENCODE_{em_name.upper()}"
+            self.token_to_name[idx] = name
+            self.name_to_token[name] = idx
+            idx += 1
+
+        # Voice separator (52)
+        self.token_to_name[idx] = "VOICE_SEP"
+        self.name_to_token["VOICE_SEP"] = idx
+        idx += 1
 
         # Key tokens
         self._key_start = idx
@@ -241,24 +340,37 @@ class BachTokenizer:
 
         self._vocab_size = idx
 
+        # Verify hardcoded class-level constants match dynamic vocab
+        assert self.name_to_token.get("TEXTURE_HOMOPHONIC") == self.TEXTURE_HOMOPHONIC
+        assert self.name_to_token.get("HARMONIC_TENSION_LOW") == self.HARMONIC_TENSION_LOW
+        assert self.name_to_token.get("VOICE_SEP") == self.VOICE_SEP
+        assert self.name_to_token.get("ENCODE_SEQUENTIAL") == self.ENCODE_SEQUENTIAL
+
     @property
     def vocab_size(self) -> int:
         return self._vocab_size
 
-    def encode(
+    # ------------------------------------------------------------------
+    # Conditioning prefix (shared by encode and encode_sequential)
+    # ------------------------------------------------------------------
+
+    def _build_conditioning_prefix(
         self,
         item: Union[VoicePair, VoiceComposition],
         form: str | None = None,
         style: str = "",
         length_bars: int | None = None,
         meter: str | None = None,
-    ) -> list[int]:
-        """Encode a VoicePair or VoiceComposition into a token sequence.
+        texture: str | None = None,
+        imitation: str | None = None,
+        harmonic_rhythm: str | None = None,
+        harmonic_tension: str | None = None,
+        encoding_mode: str | None = None,
+    ) -> tuple[list[int], VoiceComposition]:
+        """Build the conditioning prefix up to (but not including) KEY.
 
-        Prefix order: BOS STYLE FORM MODE LENGTH METER KEY <events> EOS
-
-        Voice events are interleaved chronologically:
-            At each time step, emit VOICE_N events in order, then TIME_SHIFT.
+        Returns (prefix_tokens, comp) where comp is the resolved
+        VoiceComposition (converted from VoicePair if needed).
         """
         tokens = [self.BOS]
 
@@ -298,6 +410,49 @@ class BachTokenizer:
             if auto_meter and auto_meter in self.METER_TO_TOKEN:
                 tokens.append(self.METER_TO_TOKEN[auto_meter])
 
+        # Phase 2 conditioning tokens
+        if texture is not None and texture in self.TEXTURE_TO_TOKEN:
+            tokens.append(self.TEXTURE_TO_TOKEN[texture])
+        if imitation is not None and imitation in self.IMITATION_TO_TOKEN:
+            tokens.append(self.IMITATION_TO_TOKEN[imitation])
+        if harmonic_rhythm is not None and harmonic_rhythm in self.HARMONIC_RHYTHM_TO_TOKEN:
+            tokens.append(self.HARMONIC_RHYTHM_TO_TOKEN[harmonic_rhythm])
+        if harmonic_tension is not None and harmonic_tension in self.HARMONIC_TENSION_TO_TOKEN:
+            tokens.append(self.HARMONIC_TENSION_TO_TOKEN[harmonic_tension])
+
+        # Encoding mode token
+        if encoding_mode is not None and encoding_mode in self.ENCODING_MODE_TO_TOKEN:
+            tokens.append(self.ENCODING_MODE_TO_TOKEN[encoding_mode])
+
+        return tokens, comp
+
+    # ------------------------------------------------------------------
+    # Encode (interleaved — default)
+    # ------------------------------------------------------------------
+
+    def encode(
+        self,
+        item: Union[VoicePair, VoiceComposition],
+        form: str | None = None,
+        style: str = "",
+        length_bars: int | None = None,
+        meter: str | None = None,
+        texture: str | None = None,
+        imitation: str | None = None,
+        harmonic_rhythm: str | None = None,
+        harmonic_tension: str | None = None,
+    ) -> list[int]:
+        """Encode a VoicePair or VoiceComposition into a token sequence.
+
+        Prefix order: BOS STYLE FORM MODE LENGTH METER TEXTURE IMITATION
+                      HARMONIC_RHYTHM TENSION ENCODE_INTERLEAVED KEY <events> EOS
+        """
+        tokens, comp = self._build_conditioning_prefix(
+            item, form=form, style=style, length_bars=length_bars, meter=meter,
+            texture=texture, imitation=imitation, harmonic_rhythm=harmonic_rhythm,
+            harmonic_tension=harmonic_tension, encoding_mode="interleaved",
+        )
+
         # Key token
         key_name = get_key_signature_name(comp.key_root, comp.key_mode)
         key_token_name = f"KEY_{key_name}"
@@ -311,6 +466,140 @@ class BachTokenizer:
 
         tokens.append(self.EOS)
         return tokens
+
+    # ------------------------------------------------------------------
+    # Encode sequential (voice-by-voice)
+    # ------------------------------------------------------------------
+
+    def encode_sequential(
+        self,
+        item: Union[VoicePair, VoiceComposition],
+        form: str | None = None,
+        style: str = "",
+        length_bars: int | None = None,
+        meter: str | None = None,
+        texture: str | None = None,
+        imitation: str | None = None,
+        harmonic_rhythm: str | None = None,
+        harmonic_tension: str | None = None,
+    ) -> list[int]:
+        """Encode using sequential (voice-by-voice) format.
+
+        Format: BOS <conditioning> ENCODE_SEQUENTIAL KEY
+                VOICE_1 <voice1_notes> VOICE_SEP
+                VOICE_2 <voice2_notes> VOICE_SEP
+                ...
+                VOICE_N <voiceN_notes> EOS
+        """
+        tokens, comp = self._build_conditioning_prefix(
+            item, form=form, style=style, length_bars=length_bars, meter=meter,
+            texture=texture, imitation=imitation, harmonic_rhythm=harmonic_rhythm,
+            harmonic_tension=harmonic_tension, encoding_mode="sequential",
+        )
+
+        # Key token
+        key_name = get_key_signature_name(comp.key_root, comp.key_mode)
+        key_token_name = f"KEY_{key_name}"
+        if key_token_name in self.name_to_token:
+            tokens.append(self.name_to_token[key_token_name])
+
+        time_sig = comp.time_signature if hasattr(comp, "time_signature") else (4, 4)
+
+        # Serialize each voice sequentially
+        for voice_idx, voice_notes in enumerate(comp.voices):
+            voice_num = voice_idx + 1
+            if voice_num > 4:
+                break
+
+            # Emit VOICE_N marker
+            voice_tok = self.VOICE_TOKENS[voice_num - 1]
+            tokens.append(voice_tok)
+
+            # Serialize this voice's notes with its own timeline
+            voice_tokens = self._serialize_single_voice(voice_notes, time_sig)
+            tokens.extend(voice_tokens)
+
+            # VOICE_SEP between voices; EOS after last voice
+            if voice_idx < len(comp.voices) - 1:
+                tokens.append(self.VOICE_SEP)
+            else:
+                tokens.append(self.EOS)
+
+        return tokens
+
+    def _serialize_single_voice(
+        self,
+        voice_notes: list[tuple[int, int, int]],
+        time_sig: tuple[int, int] = (4, 4),
+    ) -> list[int]:
+        """Serialize one voice's notes with its own timeline starting from tick 0.
+
+        Emits BAR/BEAT markers and Pitch/DUR tokens.  No per-note VOICE_N
+        tokens (unlike interleaved mode) — the caller emits VOICE_N once before
+        the voice block.
+        """
+        tokens: list[int] = []
+        if not voice_notes:
+            return tokens
+
+        sorted_notes = sorted(voice_notes, key=lambda n: n[0])
+
+        # Pre-compute beat boundaries
+        measure_ticks = ticks_per_measure(time_sig)
+        beat_offsets = beat_tick_positions(time_sig)
+        max_tick = max(n[0] + n[1] for n in sorted_notes)
+        n_measures = (max_tick // measure_ticks) + 2
+
+        beat_boundaries: list[tuple[int, int]] = []
+        for m in range(n_measures):
+            for beat_idx, offset in enumerate(beat_offsets):
+                abs_tick = m * measure_ticks + offset
+                beat_boundaries.append((abs_tick, beat_idx + 1))
+
+        current_time = 0
+        beat_ptr = 0
+
+        for start, dur, pitch in sorted_notes:
+            # Emit BAR/BEAT tokens
+            while beat_ptr < len(beat_boundaries) and beat_boundaries[beat_ptr][0] <= start:
+                b_tick, b_num = beat_boundaries[beat_ptr]
+                if b_tick >= current_time:
+                    gap = b_tick - current_time
+                    if gap > 0:
+                        ts_tokens = self._quantize_time_shift(gap)
+                        tokens.extend(ts_tokens)
+                        current_time = b_tick
+
+                    if b_num == 1:
+                        tokens.append(self.BAR)
+                    beat_tok_name = f"BEAT_{b_num}"
+                    beat_tok = self.name_to_token.get(beat_tok_name)
+                    if beat_tok is not None:
+                        tokens.append(beat_tok)
+
+                beat_ptr += 1
+
+            # Time shift to event
+            dt = start - current_time
+            if dt > 0:
+                ts_tokens = self._quantize_time_shift(dt)
+                tokens.extend(ts_tokens)
+                current_time = start
+
+            # Emit Pitch DUR
+            pitch_tok = self._pitch_to_token(pitch)
+            if pitch_tok is not None:
+                tokens.append(pitch_tok)
+
+            dur_tok = self._duration_to_token(dur)
+            if dur_tok is not None:
+                tokens.append(dur_tok)
+
+        return tokens
+
+    # ------------------------------------------------------------------
+    # Decode
+    # ------------------------------------------------------------------
 
     def decode(self, tokens: list[int]) -> VoiceComposition:
         """Decode a token sequence back into a VoiceComposition.
@@ -338,8 +627,17 @@ class BachTokenizer:
                         "FORM_SINFONIA", "FORM_QUARTET", "FORM_TRIO_SONATA", "FORM_MOTET",
                         "LENGTH_SHORT", "LENGTH_MEDIUM", "LENGTH_LONG", "LENGTH_EXTENDED",
                         "METER_2_4", "METER_3_4", "METER_4_4", "METER_6_8",
-                        "METER_3_8", "METER_ALLA_BREVE"):
+                        "METER_3_8", "METER_ALLA_BREVE",
+                        "TEXTURE_HOMOPHONIC", "TEXTURE_POLYPHONIC", "TEXTURE_MIXED",
+                        "IMITATION_NONE", "IMITATION_LOW", "IMITATION_HIGH",
+                        "HARMONIC_RHYTHM_SLOW", "HARMONIC_RHYTHM_MODERATE", "HARMONIC_RHYTHM_FAST",
+                        "HARMONIC_TENSION_LOW", "HARMONIC_TENSION_MODERATE", "HARMONIC_TENSION_HIGH",
+                        "ENCODE_INTERLEAVED", "ENCODE_SEQUENTIAL"):
                 continue
+            elif name == "VOICE_SEP":
+                # Voice separator: reset timeline for next voice (sequential mode)
+                current_time = 0
+                pending_pitch = None
             elif name == "VOICE_1":
                 pending_pitch = None
                 current_voice = 1
@@ -400,6 +698,10 @@ class BachTokenizer:
         """
         comp = self.decode(tokens)
         return comp.to_voice_pair()
+
+    # ------------------------------------------------------------------
+    # Interleaved encoding helpers
+    # ------------------------------------------------------------------
 
     def _interleave_n_voices(
         self,
