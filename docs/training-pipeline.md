@@ -5,8 +5,18 @@ End-to-end guide: data preparation, training, and generation.
 ## 1. Prepare Data
 
 ```bash
-uv run bach-gen prepare-data --mode fugue --tokenizer scale-degree
+uv run bach-gen prepare-data
 ```
+
+Current defaults:
+- `--mode all`
+- `--tokenizer scale-degree`
+- `--max-seq-len 4096`
+- `--max-source-voices 4`
+- `--max-groups-per-work 1`
+- `--max-pairs-per-work 2`
+- `--pair-strategy adjacent+outer`
+- `--sonata-policy counterpoint-safe`
 
 **What happens:**
 
@@ -44,12 +54,12 @@ uv run bach-gen prepare-data --mode fugue --tokenizer scale-degree
 | `tokenizer.json` | Serialized vocab mappings |
 | `sequences.json` | All token sequences (interleaved + sequential) |
 | `piece_ids.json` | Source piece ID per sequence (for leak-free splits) |
-| `mode.json` | Mode, voice count, tokenizer type |
+| `mode.json` | Mode metadata: mode, voice count, tokenizer type, max seq len, sequential enabled |
 | `corpus_stats.json` | Pitch-class, interval, duration distributions |
 
 **Key flags:**
 
-- `--max-seq-len 2048` — context window ceiling
+- `--max-seq-len 4096` — context window ceiling (default)
 - `--mode` — determines voice count and form token
 - `--no-sequential` — skip dual sequential encoding (halves training data)
 - `--tokenizer absolute|scale-degree` — absolute pitch (155 tokens) or key-agnostic scale degrees (121 tokens)
@@ -70,6 +80,7 @@ uv run bach-gen train --epochs 500 --lr 3e-4 --batch-size 8 --pos-encoding pope 
 **What happens:**
 
 1. **Load data** from `--data-dir` (default `data/`). Auto-detects mode and seq_len from saved metadata. Training data now includes both interleaved and sequential encodings of every piece (unless `--no-sequential` was used during preparation).
+   - If `--seq-len` is omitted, training uses `mode.json["max_seq_len"]` when available.
 
 2. **Split** into train/val at the piece level (90/10) using `piece_ids.json` to prevent chunk leakage. Both encoding variants of the same piece stay together in the same split.
 
@@ -98,13 +109,7 @@ uv sync
 2. **Prepare data with safe defaults**
 ```bash
 uv run bach-gen prepare-data \
-  --mode all \
-  --tokenizer scale-degree \
-  --max-source-voices 4 \
-  --max-groups-per-work 1 \
-  --max-pairs-per-work 2 \
-  --pair-strategy adjacent+outer \
-  --sonata-policy counterpoint-safe
+  --data-dir data
 ```
 
 3. **Train on GPU**
@@ -198,6 +203,8 @@ uv run bach-gen generate --key "C minor" --mode fugue \
 **What happens:**
 
 1. **Load checkpoint** — searches for `best.pt`, then `latest.pt`, then `final.pt` in `models/`.
+
+   If `--mode` is omitted, generation reads `data/mode.json`. If it finds `mode=all`, it automatically falls back to `chorale` (because `all` is a prep mode, not a concrete generation form).
 
 2. **Build prompt** — assembles conditioning prefix: `BOS STYLE FORM MODE LENGTH METER TEXTURE IMITATION HARMONIC_RHYTHM HARMONIC_TENSION CHROMATICISM ENCODE_* KEY [SUBJECT]`. Subject is parsed from `--subject` or generated randomly (interleaved mode only; sequential mode skips subject generation). For `--voice-by-voice`, the prompt includes `ENCODE_SEQUENTIAL`; if `--provide-voice` is given, voice 1 is serialized into the prompt followed by `VOICE_SEP`.
 
