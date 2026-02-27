@@ -71,7 +71,7 @@ Counterpoignant/
 │   │   ├── dataset.py      # PyTorch BachDataset
 │   │   ├── extraction.py   # Voice extraction (2–4 voices)
 │   │   ├── tokenizer.py    # Main tokenizer dispatcher
-│   │   ├── scale_degree_tokenizer.py  # Key-agnostic 91-token mode
+│   │   ├── scale_degree_tokenizer.py  # Key-agnostic 117-token mode
 │   │   ├── augmentation.py # Transposition, voice reordering augmentation
 │   │   └── analysis.py     # Texture, imitation, harmonic-rhythm analysis
 │   ├── generation/
@@ -147,7 +147,7 @@ All commands are accessed via `uv run bach-gen <command>` (or `bach-gen <command
 | `prepare-data` | Tokenize corpus, extract voices, augment, analyze, chunk into dataset |
 | `train` | Train Transformer; supports curriculum learning and DroPE recalibration |
 | `generate` | Generate N candidates, score, return top K MIDI files |
-| `evaluate` | Score a single MIDI file across all 7 evaluation dimensions |
+| `evaluate` | Score a single MIDI file across all 7 evaluation dimensions (rule-based, no checkpoint needed) |
 | `calibrate` | Baseline calibration study (real Bach vs. degenerate baselines) |
 | `play` | Play a MIDI file via FluidSynth, timidity, or system player |
 
@@ -165,7 +165,7 @@ Key CLI flags to know:
 
 | Component | Detail |
 |-----------|--------|
-| Vocab size | 400 (default); 91 in scale-degree mode |
+| Vocab size | 117 (scale-degree) / 151 (absolute pitch); `ModelConfig` defaults to 400 but CLI always overrides with `tokenizer.vocab_size` |
 | Embedding dim | 256 |
 | Attention heads | 8 (with optional GQA) |
 | Layers | 8 |
@@ -213,11 +213,12 @@ Two tokenizer modes exist:
     106-116: 11 time shift tokens
      ```
 
-2. **Absolute pitch** — ~148-151 tokens (verify from `src/bach_gen/data/tokenizer.py` — Phase 2 additions may have shifted this)
+2. **Absolute pitch** — 151 tokens
    - Uses MIDI pitch numbers directly (MIDI 36–84 = 49 pitch tokens)
+   - Shares the same header layout (indices 0–79) as scale-degree; differs in pitch representation (49 absolute pitches instead of octave+degree+accidental)
    - File: `src/bach_gen/data/tokenizer.py`
 
-> **Warning:** Token counts shift whenever new conditioning token groups are added. The scale-degree tokenizer's docstring is the authoritative source. Always verify `tokenizer.vocab_size` at runtime rather than hardcoding a count.
+> **Warning:** Token counts shift whenever new conditioning token groups are added. The tokenizer docstrings are the authoritative source. Always verify `tokenizer.vocab_size` at runtime rather than hardcoding a count. Note: `docs/training-pipeline.md` still references older counts (148/114) from before Phase 2 conditioning additions.
 
 Special tokens include voice separators, key/meter conditioning tokens, texture/style conditioning tokens (added in Phase 2), and structural markers (bar lines, rests, duration modifiers).
 
@@ -258,8 +259,8 @@ uv run bach-gen train --data-dir ./data --output-dir ./models
 # 3. Generate
 uv run bach-gen generate --checkpoint ./models/best.pt --output-dir ./output
 
-# 4. Evaluate
-uv run bach-gen evaluate --checkpoint ./models/best.pt --input ./output/piece.mid
+# 4. Evaluate (positional arg, no checkpoint needed — scoring is rule-based)
+uv run bach-gen evaluate ./output/piece.mid
 ```
 
 ### Curriculum Learning
