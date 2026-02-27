@@ -18,6 +18,44 @@ This file provides context for AI coding assistants (Claude, Copilot, etc.) work
 
 ---
 
+## Confidence Reporting Protocol
+
+When performing any implementation task, for each **mission-critical step** attach a confidence rating and surface low-confidence steps for review before proceeding.
+
+### What counts as mission-critical?
+
+A step is mission-critical when a subtle bug would **still run without crashing** but produce silently wrong results — discovered only after an expensive training run or by listening carefully to generated output. Examples specific to this codebase:
+
+| Area | Why it's mission-critical |
+|------|--------------------------|
+| Tokenizer encode/decode logic | A bug silently corrupts all downstream training data; the model still trains and generates, but learns garbage |
+| Token vocabulary layout / ID assignments | Adding or reordering tokens invalidates existing checkpoints; training continues with wrong embeddings |
+| Evaluation dimension weights or formulas | Scores still print as floats in [0,1]; wrong metric only surfaces when generated pieces sound bad |
+| Curriculum training stage transitions | Wrong stage detection means fine-tuning without a proper pretrained base; loss may still decrease |
+| Checkpoint save/load (`state_dict` keys, config fields) | Silent key mismatch loads wrong weights; generation still works but quality degrades mysteriously |
+| Data augmentation filtering (transposition limits, voice range checks) | Bad examples silently enter training; model still converges but on an altered distribution |
+| DroPE recalibration sequencing | Using a DroPE checkpoint for further RoPE training silently degrades positional generalization |
+| Evaluation calibration ranges (`calibrate` baseline) | Miscalibrated ranges make scorer output numerically correct but meaningless for ranking |
+
+### Format
+
+For each mission-critical step in an implementation, include a confidence annotation:
+
+```
+Step N — <description>  [confidence: XX%]
+```
+
+### Rule
+
+**If any step has confidence < 80%, stop and surface it for discussion before writing or committing that code.**
+
+Confidence < 80% signals one or more of:
+- Ambiguity about the current behavior of the code being changed
+- Uncertainty about whether existing tests would catch a regression
+- A change touching token IDs, checkpoint keys, or metric formulas without end-to-end verification
+
+---
+
 ## Repository Structure
 
 ```
@@ -148,14 +186,38 @@ Key CLI flags to know:
 
 Two tokenizer modes exist:
 
-1. **Scale-degree (default, key-agnostic)** — 91 tokens
+1. **Scale-degree (default, key-agnostic)** — 117 tokens
    - Represents notes as scale degrees (e.g., `^1`, `^3`, `^5`) relative to the active key
    - Enables transposition-invariant training and better generalization
-   - File: `src/bach_gen/scale_degree_tokenizer.py`
+   - File: `src/bach_gen/data/scale_degree_tokenizer.py`
+   - Vocabulary layout (authoritative — read from the source file docstring):
+     ```
+      0-9:   10 special tokens (PAD, BOS, EOS, VOICE_1-4, SUBJECT_*, BAR)
+     10-15:   6 beat tokens (BEAT_1..BEAT_6)
+     16-19:   4 voice-count tokens (MODE_2PART..MODE_FUGUE)
+     20-23:   4 style tokens (STYLE_BACH..STYLE_CLASSICAL)
+     24-30:   7 form tokens (FORM_CHORALE..FORM_MOTET)
+     31-34:   4 length tokens (LENGTH_SHORT..LENGTH_EXTENDED)
+     35-40:   6 meter tokens (METER_2_4..METER_ALLA_BREVE)
+     41-43:   3 texture tokens (TEXTURE_HOMOPHONIC..TEXTURE_MIXED)
+     44-46:   3 imitation tokens (IMITATION_NONE..IMITATION_HIGH)
+     47-49:   3 harmonic rhythm tokens (HARMONIC_RHYTHM_SLOW..FAST)
+     50-52:   3 harmonic tension tokens (HARMONIC_TENSION_LOW..HIGH)
+     53-54:   2 encoding mode tokens (ENCODE_INTERLEAVED, ENCODE_SEQUENTIAL)
+     55:      1 voice separator (VOICE_SEP)
+     56-79:  24 key tokens
+     80-85:   6 octave tokens (OCT_2..OCT_7)
+     86-92:   7 degree tokens (DEG_1..DEG_7)
+     93-94:   2 accidental tokens (SHARP, FLAT)
+     95-105: 11 duration tokens
+    106-116: 11 time shift tokens
+     ```
 
-2. **Absolute pitch** — 148 tokens
-   - Uses MIDI pitch numbers directly
-   - File: `src/bach_gen/tokenizer.py`
+2. **Absolute pitch** — ~148-151 tokens (verify from `src/bach_gen/data/tokenizer.py` — Phase 2 additions may have shifted this)
+   - Uses MIDI pitch numbers directly (MIDI 36–84 = 49 pitch tokens)
+   - File: `src/bach_gen/data/tokenizer.py`
+
+> **Warning:** Token counts shift whenever new conditioning token groups are added. The scale-degree tokenizer's docstring is the authoritative source. Always verify `tokenizer.vocab_size` at runtime rather than hardcoding a count.
 
 Special tokens include voice separators, key/meter conditioning tokens, texture/style conditioning tokens (added in Phase 2), and structural markers (bar lines, rests, duration modifiers).
 
