@@ -103,9 +103,10 @@ def detect_form(score: music21.stream.Score, source: str, style: str) -> tuple[s
         ("chorale", "chorale"),
         ("invention", "invention"),
         ("sinfonia", "sinfonia"),
+        ("trio sonata", "trio_sonata"),
+        ("sonata", "sonata"),
         ("fugue", "fugue"),
         ("quartet", "quartet"),
-        ("trio sonata", "trio_sonata"),
         ("motet", "motet"),
         ("wtc1f", "fugue"),
         ("wtc2f", "fugue"),
@@ -442,3 +443,139 @@ def _validate_voice_group(comp: VoiceComposition) -> bool:
             return False
 
     return True
+
+
+def _median_duration(voice: list[tuple[int, int, int]]) -> float:
+    durs = sorted(n[1] for n in voice)
+    if not durs:
+        return 0.0
+    mid = len(durs) // 2
+    if len(durs) % 2 == 1:
+        return float(durs[mid])
+    return float(durs[mid - 1] + durs[mid]) / 2.0
+
+
+def _notes_per_measure(
+    voice: list[tuple[int, int, int]], time_signature: tuple[int, int] = (4, 4)
+) -> float:
+    if not voice:
+        return 0.0
+    measure_ticks = TICKS_PER_QUARTER * 4 * time_signature[0] // time_signature[1]
+    if measure_ticks <= 0:
+        return 0.0
+    max_tick = max(s + d for s, d, _ in voice)
+    n_measures = max(1, (max_tick + measure_ticks - 1) // measure_ticks)
+    return len(voice) / n_measures
+
+
+def _repeated_cell_ratio(voice: list[tuple[int, int, int]], cell_len: int = 4) -> float:
+    """Return max frequency ratio of repeated interval cells in a voice."""
+    if len(voice) < cell_len + 1:
+        return 0.0
+    pitches = [p for _, _, p in sorted(voice, key=lambda n: n[0])]
+    cells: list[tuple[int, ...]] = []
+    for i in range(len(pitches) - cell_len):
+        iv = tuple(pitches[i + k + 1] - pitches[i + k] for k in range(cell_len))
+        cells.append(iv)
+    if not cells:
+        return 0.0
+    from collections import Counter
+
+    ctr = Counter(cells)
+    return max(ctr.values()) / len(cells)
+
+
+def accompaniment_texture_severity(
+    voices: list[list[tuple[int, int, int]]],
+    time_signature: tuple[int, int] = (4, 4),
+) -> float:
+    """Return accompaniment-likeness severity score.
+
+    Lower means more counterpoint-like; higher means more stereotypical
+    melody + broken-chord accompaniment.
+    """
+    if len(voices) < 2:
+        return 0.0
+
+    non_empty = [v for v in voices if v]
+    if len(non_empty) < 2:
+        return 0.0
+
+    def avg_pitch(v: list[tuple[int, int, int]]) -> float:
+        return sum(n[2] for n in v) / len(v)
+
+    ordered = sorted(non_empty, key=avg_pitch)
+    bass = ordered[0]
+    top = ordered[-1]
+
+    if len(bass) < 24 or len(top) < 8:
+        return 0.0
+
+    bass_short_ratio = sum(1 for _, d, _ in bass if d <= TICKS_PER_QUARTER // 2) / len(bass)
+    bass_density = _notes_per_measure(bass, time_signature)
+    bass_repeat = _repeated_cell_ratio(bass, cell_len=4)
+    bass_med_dur = _median_duration(bass)
+    top_med_dur = _median_duration(top)
+    note_count_ratio = len(bass) / max(1, len(top))
+
+    short_term = bass_short_ratio / 0.70
+    density_term = bass_density / 8.0
+    repeat_term = bass_repeat / 0.20
+    dur_term = (top_med_dur / max(1.0, bass_med_dur)) / 1.8
+    count_term = note_count_ratio / 1.5
+
+    return (short_term + density_term + repeat_term + dur_term + count_term) / 5.0
+
+
+def is_accompaniment_texture_like(
+    voices: list[list[tuple[int, int, int]]],
+    time_signature: tuple[int, int] = (4, 4),
+) -> bool:
+    """Heuristic: detect repetitive broken-chord accompaniment texture.
+
+    Intended as a conservative filter for sonata excerpts that look like
+    melody + accompaniment rather than multi-voice counterpoint.
+    """
+    return accompaniment_texture_severity(voices, time_signature) >= 1.0
+
+
+def is_accompaniment_texture_like_pair(pair: VoicePair) -> bool:
+    return is_accompaniment_texture_like(
+        [pair.upper, pair.lower], time_signature=pair.time_signature
+    )
+
+
+def is_accompaniment_texture_like_comp(comp: VoiceComposition) -> bool:
+    return is_accompaniment_texture_like(comp.voices, time_signature=comp.time_signature)
+
+
+def accompaniment_texture_severity_pair(pair: VoicePair) -> float:
+    return accompaniment_texture_severity(
+        [pair.upper, pair.lower], time_signature=pair.time_signature
+    )
+
+
+def accompaniment_texture_severity_comp(comp: VoiceComposition) -> float:
+    return accompaniment_texture_severity(comp.voices, time_signature=comp.time_signature)
+
+
+def is_keyboard_like_source(source: str) -> bool:
+    """Best-effort keyword check for keyboard-oriented repertoire."""
+    s = source.lower()
+    keywords = (
+        "sonata",
+        "partita",
+        "suite",
+        "toccata",
+        "fantasia",
+        "prelude",
+        "fughetta",
+        "invention",
+        "sinfonia",
+        "keyboard",
+        "klavier",
+        "piano",
+        "harpsichord",
+        "clavier",
+    )
+    return any(k in s for k in keywords)

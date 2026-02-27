@@ -16,6 +16,7 @@ uv run bach-gen prepare-data --mode fugue --tokenizer scale-degree
    - `--mode all` auto-detects form/voice target per piece, but extraction is now guarded by source-level caps.
    - `--mode 2-part` extracts voice pairs using configurable pairing strategy.
    - Safety defaults (recommended): `--max-source-voices 4`, `--max-groups-per-work 1`, `--max-pairs-per-work 2`, `--pair-strategy adjacent+outer`.
+   - Sonata default policy: `--sonata-policy counterpoint-safe` keeps all non-accompaniment slices and at most one accompaniment-like slice per sonata/keyboard-like work (least accompaniment-heavy candidate). Use `--sonata-policy all` when explicitly training for sonata/keyboard generation.
 
 3. **Augment** to all 12 keys by transposition (skipped for scale-degree tokenizer since it's already key-agnostic). Transpositions that push notes outside MIDI 36-84 are dropped.
 
@@ -51,11 +52,12 @@ uv run bach-gen prepare-data --mode fugue --tokenizer scale-degree
 - `--max-seq-len 2048` — context window ceiling
 - `--mode` — determines voice count and form token
 - `--no-sequential` — skip dual sequential encoding (halves training data)
-- `--tokenizer absolute|scale-degree` — absolute pitch (154 tokens) or key-agnostic scale degrees (120 tokens)
+- `--tokenizer absolute|scale-degree` — absolute pitch (155 tokens) or key-agnostic scale degrees (121 tokens)
 - `--max-source-voices` — skip works whose raw score has too many parts (default: 4)
 - `--max-groups-per-work` — cap extracted N-voice groups per source work (default: 1)
 - `--pair-strategy adjacent+outer|adjacent-only|all-combinations` — how 2-part pairs are derived from multi-voice works
 - `--max-pairs-per-work` — cap extracted 2-part pairs per source work (default: 2)
+- `--sonata-policy counterpoint-safe|all` — default keeps non-accompaniment slices plus at most one least-accompaniment slice per sonata/keyboard-like work
 
 ---
 
@@ -81,6 +83,48 @@ uv run bach-gen train --epochs 500 --lr 3e-4 --batch-size 8 --pos-encoding pope 
    - `latest.pt` — after every epoch (safe to resume from)
    - `best.pt` — when validation loss improves
    - `final.pt` — end of training
+
+### Lambda Setup (GPU)
+
+Recommended workflow for Lambda instances:
+
+1. **Environment bootstrap**
+```bash
+git clone <your-repo-url>
+cd Counterpoignant
+uv sync
+```
+
+2. **Prepare data with safe defaults**
+```bash
+uv run bach-gen prepare-data \
+  --mode all \
+  --tokenizer scale-degree \
+  --max-source-voices 4 \
+  --max-groups-per-work 1 \
+  --max-pairs-per-work 2 \
+  --pair-strategy adjacent+outer \
+  --sonata-policy counterpoint-safe
+```
+
+3. **Train on GPU**
+```bash
+uv run bach-gen train \
+  --epochs 500 \
+  --batch-size 8 \
+  --lr 3e-4 \
+  --pos-encoding pope \
+  --num-kv-heads 2 \
+  --fp16
+```
+
+4. **Resume safely after preemption**
+```bash
+uv run bach-gen train --resume models/latest.pt --epochs 500 --fp16
+```
+
+5. **Persist artifacts off-instance**
+- Sync `data/`, `models/`, and `output/` to durable storage (S3/remote disk) between sessions.
 
 ### Curriculum Training (optional)
 
@@ -207,7 +251,8 @@ Scores real Bach vs. three baselines (shuffled notes, random pitches, repetitive
 
 ## Vocabulary Summary
 
-18 tokens are reserved for Phase 2/3 conditioning and encoding mode after `METER_ALLA_BREVE` (ID 40).
+18 tokens are reserved for Phase 2/3 conditioning and encoding mode after `METER_ALLA_BREVE` (ID 40).  
+`FORM_SONATA` is appended at the end of the vocabulary to avoid shifting legacy token IDs.
 
 | ID Range | Tokens |
 |---|---|
@@ -220,7 +265,7 @@ Scores real Bach vs. three baselines (shuffled notes, random pitches, repetitive
 | 56–57 | ENCODE_INTERLEAVED, ENCODE_SEQUENTIAL |
 | 58 | VOICE_SEP |
 | 59–82 | KEY_* |
-| 83+ | Scale-degree: OCT/DEG/ACC/DUR/TS (to 119). Absolute: Pitch/DUR/TS (to 153). |
+| 83+ | Scale-degree: OCT/DEG/ACC/DUR/TS, then FORM_SONATA (to 120). Absolute: Pitch/DUR/TS, then FORM_SONATA (to 154). |
 
 **Breaking change:** all cached data and trained models from before this vocabulary update are invalidated. Re-run `prepare-data` and retrain.
 

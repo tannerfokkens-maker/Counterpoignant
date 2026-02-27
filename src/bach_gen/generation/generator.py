@@ -308,7 +308,7 @@ def _build_prompt(
         _form_to_default_length = {
             "chorale": "short", "invention": "medium", "sinfonia": "medium",
             "trio_sonata": "medium", "2-part": "medium",
-            "fugue": "long", "quartet": "long", "motet": "long",
+            "fugue": "long", "quartet": "long", "sonata": "long", "motet": "long",
         }
         length = _form_to_default_length.get(form)
     if length and hasattr(tokenizer, "LENGTH_TO_TOKEN") and length in tokenizer.LENGTH_TO_TOKEN:

@@ -22,6 +22,7 @@ class ConstraintState:
     current_voice: int = 1
     last_token: int | None = None
     recent_tokens: list[int] = field(default_factory=list)
+    notes_in_current_voice: int = 0
 
 
 class DecodingConstraints:
@@ -78,8 +79,16 @@ class DecodingConstraints:
     def update_state(self, state: ConstraintState, token: int) -> ConstraintState:
         """Return a new ConstraintState reflecting *token* appended (O(1))."""
         current_voice = state.current_voice
+        notes_in_voice = state.notes_in_current_voice
         if token in self._voice_token_ids:
             current_voice = self._voice_token_ids[token]
+            notes_in_voice = 0
+        else:
+            name = self.tokenizer.token_to_name.get(token, "")
+            if name == "VOICE_SEP":
+                notes_in_voice = 0
+            elif name.startswith("Dur_"):
+                notes_in_voice += 1
 
         recent = state.recent_tokens[-5:] + [token]  # keep last 6
 
@@ -87,6 +96,7 @@ class DecodingConstraints:
             current_voice=current_voice,
             last_token=token,
             recent_tokens=recent,
+            notes_in_current_voice=notes_in_voice,
         )
 
     def apply(
@@ -193,6 +203,13 @@ class DecodingConstraints:
         logits[self.tokenizer.PAD] = float("-inf")
         logits[self.tokenizer.BOS] = float("-inf")
 
+        # In sequential mode, prevent VOICE_SEP before minimum notes.
+        min_notes_before_sep = 4
+        voice_sep_tok = self.tokenizer.name_to_token.get("VOICE_SEP")
+        if voice_sep_tok is not None and voice_sep_tok < logits.size(0):
+            if self._notes_in_current_voice(tokens) < min_notes_before_sep:
+                logits[voice_sep_tok] = float("-inf")
+
         return logits
 
     def _prevent_degenerate_from_state(
@@ -220,4 +237,22 @@ class DecodingConstraints:
         logits[self.tokenizer.PAD] = float("-inf")
         logits[self.tokenizer.BOS] = float("-inf")
 
+        # In sequential mode, prevent VOICE_SEP before minimum notes.
+        min_notes_before_sep = 4
+        voice_sep_tok = self.tokenizer.name_to_token.get("VOICE_SEP")
+        if voice_sep_tok is not None and voice_sep_tok < logits.size(0):
+            if state.notes_in_current_voice < min_notes_before_sep:
+                logits[voice_sep_tok] = float("-inf")
+
         return logits
+
+    def _notes_in_current_voice(self, tokens: list[int]) -> int:
+        """Fallback note counter for list-based constraint path."""
+        count = 0
+        for tok in reversed(tokens):
+            name = self.tokenizer.token_to_name.get(tok, "")
+            if name.startswith("VOICE_") or name == "VOICE_SEP":
+                break
+            if name.startswith("Dur_"):
+                count += 1
+        return count

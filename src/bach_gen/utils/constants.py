@@ -30,6 +30,11 @@ FORM_VOICE_RANGES: dict[tuple[str, int], tuple[int, int]] = {
     ("fugue", 2): ALTO_RANGE,
     ("fugue", 3): TENOR_RANGE,
     ("fugue", 4): BASS_RANGE,
+    # Sonata (keyboard/chamber reduction target): SATB-like cap at 4 voices
+    ("sonata", 1): SOPRANO_RANGE,
+    ("sonata", 2): ALTO_RANGE,
+    ("sonata", 3): TENOR_RANGE,
+    ("sonata", 4): BASS_RANGE,
     # Motet: same as chorale (capped at 4 voices)
     ("motet", 1): SOPRANO_RANGE,
     ("motet", 2): ALTO_RANGE,
@@ -45,6 +50,7 @@ FORM_DEFAULTS: dict[str, tuple[int, int]] = {
     "trio_sonata": (3, 1024),
     "chorale": (4, 1024),
     "quartet": (4, 1024),
+    "sonata": (4, 1536),
     "fugue": (4, 2048),
     "motet": (4, 1024),
 }
@@ -109,6 +115,7 @@ SPECIAL_TOKENS = [
     "FORM_SINFONIA",
     "FORM_QUARTET",
     "FORM_TRIO_SONATA",
+    "FORM_SONATA",
     "FORM_MOTET",
     "LENGTH_SHORT",
     "LENGTH_MEDIUM",

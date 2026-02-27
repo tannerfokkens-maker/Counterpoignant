@@ -13,6 +13,7 @@ Vocabulary layout (120 tokens):
     16-19:   4 voice-count tokens (MODE_2PART..MODE_FUGUE)
     20-23:   4 style tokens (STYLE_BACH..STYLE_CLASSICAL)
     24-30:   7 form tokens (FORM_CHORALE..FORM_MOTET)
+    end:     FORM_SONATA (appended form token; keeps prior IDs stable)
     31-34:   4 length tokens (LENGTH_SHORT..LENGTH_EXTENDED)
     35-40:   6 meter tokens (METER_2_4..METER_ALLA_BREVE)
     41-43:   3 texture tokens (TEXTURE_HOMOPHONIC..TEXTURE_MIXED)
@@ -220,6 +221,12 @@ class ScaleDegreeTokenizer:
     def __init__(self, config: ScaleDegreeTokenizerConfig | None = None):
         self.config = config or ScaleDegreeTokenizerConfig()
         self._build_vocab()
+        self.FORM_TO_MODE_TOKEN = dict(type(self).FORM_TO_MODE_TOKEN)
+        self.FORM_TO_FORM_TOKEN = dict(type(self).FORM_TO_FORM_TOKEN)
+        self.FORM_TO_MODE_TOKEN["sonata"] = self.MODE_4PART
+        sonata_tok = self.name_to_token.get("FORM_SONATA")
+        if sonata_tok is not None:
+            self.FORM_TO_FORM_TOKEN["sonata"] = sonata_tok
 
     # ------------------------------------------------------------------
     # Vocabulary construction
@@ -369,6 +376,12 @@ class ScaleDegreeTokenizer:
             self.name_to_token[name] = idx
             idx += 1
         self._ts_end = idx
+
+        # Appended form token: keep legacy token IDs stable while introducing
+        # a dedicated sonata designator.
+        self.token_to_name[idx] = "FORM_SONATA"
+        self.name_to_token["FORM_SONATA"] = idx
+        idx += 1
 
         self._vocab_size = idx
 
@@ -539,6 +552,7 @@ class ScaleDegreeTokenizer:
         time_sig = comp.time_signature if hasattr(comp, "time_signature") else (4, 4)
 
         # Serialize each voice sequentially
+        emitted_voices = 0
         for voice_idx, voice_notes in enumerate(comp.voices):
             voice_num = voice_idx + 1
             if voice_num > 4:
@@ -557,6 +571,12 @@ class ScaleDegreeTokenizer:
                 tokens.append(self.VOICE_SEP)
             else:
                 tokens.append(self.EOS)
+            emitted_voices += 1
+
+        # If input had >4 voices, loop exits early and may leave trailing VOICE_SEP.
+        # Ensure sequential sequences always terminate with EOS.
+        if emitted_voices > 0 and tokens[-1] != self.EOS:
+            tokens.append(self.EOS)
 
         return tokens
 
@@ -761,7 +781,7 @@ class ScaleDegreeTokenizer:
                 "MODE_2PART", "MODE_3PART", "MODE_4PART", "MODE_FUGUE",
                 "STYLE_BACH", "STYLE_BAROQUE", "STYLE_RENAISSANCE", "STYLE_CLASSICAL",
                 "FORM_CHORALE", "FORM_INVENTION", "FORM_FUGUE",
-                "FORM_SINFONIA", "FORM_QUARTET", "FORM_TRIO_SONATA", "FORM_MOTET",
+                "FORM_SINFONIA", "FORM_QUARTET", "FORM_TRIO_SONATA", "FORM_MOTET", "FORM_SONATA",
                 "LENGTH_SHORT", "LENGTH_MEDIUM", "LENGTH_LONG", "LENGTH_EXTENDED",
                 "METER_2_4", "METER_3_4", "METER_4_4", "METER_6_8",
                 "METER_3_8", "METER_ALLA_BREVE",

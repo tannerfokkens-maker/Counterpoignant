@@ -133,14 +133,14 @@ def _print_conditioning_histograms(sequences: list[list[int]], tokenizer) -> Non
 
 
 @cli.command()
-@click.option("--mode", "-m", type=click.Choice(VALID_FORMS), default="2-part",
+@click.option("--mode", "-m", type=click.Choice(VALID_FORMS), default="all",
               help="Composition mode (determines voice count)")
 @click.option("--voices", type=int, default=None,
               help="Override number of voices (default: from mode)")
 @click.option("--tokenizer", "tokenizer_type",
-              type=click.Choice(["absolute", "scale-degree"]), default="absolute",
+              type=click.Choice(["absolute", "scale-degree"]), default="scale-degree",
               help="Tokenizer type: absolute (default) or scale-degree (key-agnostic)")
-@click.option("--max-seq-len", default=DEFAULT_SEQ_LEN, type=int,
+@click.option("--max-seq-len", default=4096, type=int,
               help="Drop sequences longer than this (default: model max_seq_len)")
 @click.option("--no-chunk", is_flag=True, default=False,
               help="Drop long sequences instead of chunking them")
@@ -159,14 +159,23 @@ def _print_conditioning_histograms(sequences: list[list[int]], tokenizer) -> Non
               help="How to derive 2-part pairs from multi-voice works (default: adjacent+outer)")
 @click.option("--max-pairs-per-work", default=2, type=int,
               help="Cap extracted 2-part pairs per work (default: 2)")
+@click.option("--sonata-policy", type=click.Choice(["counterpoint-safe", "all"]),
+              default="counterpoint-safe",
+              help="How to treat sonata data in broad training (default: counterpoint-safe)")
 def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len: int,
                  no_chunk: bool, data_dir: str | None, composer_filter: str | None,
                  no_sequential: bool, max_source_voices: int,
                  max_groups_per_work: int, pair_strategy: str,
-                 max_pairs_per_work: int) -> None:
+                 max_pairs_per_work: int, sonata_policy: str) -> None:
     """Extract Bach corpus, tokenize, and cache statistics."""
     from bach_gen.data.corpus import get_all_works
-    from bach_gen.data.extraction import extract_voice_pairs, extract_voice_groups, detect_form, VoicePair, VoiceComposition
+    from bach_gen.data.extraction import (
+        extract_voice_pairs, extract_voice_groups, detect_form,
+        is_accompaniment_texture_like_pair, is_accompaniment_texture_like_comp,
+        accompaniment_texture_severity_pair, accompaniment_texture_severity_comp,
+        is_keyboard_like_source,
+        VoicePair, VoiceComposition,
+    )
     from bach_gen.data.augmentation import augment_to_all_keys
     from bach_gen.data.tokenizer import BachTokenizer
     from bach_gen.data.dataset import compute_corpus_stats
@@ -197,6 +206,7 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
         console.print(f"  Mode: {mode} ({num_voices} voices)")
     console.print(f"  Tokenizer: {tokenizer_type}")
     console.print(f"  Max source voices: {max_source_voices}")
+    console.print(f"  Sonata policy: {sonata_policy}")
     with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as progress:
         task = progress.add_task("Loading...", total=None)
         works = get_all_works(composer_filter=filter_list)
@@ -227,6 +237,7 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
         ) as progress:
             task = progress.add_task("Extracting", total=len(works))
             skipped_by_voice_cap = 0
+            skipped_by_sonata_policy = 0
             for desc, score, style in works:
                 try:
                     source_parts = len(list(score.parts))
@@ -244,6 +255,26 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
                 )
                 if max_groups_per_work > 0:
                     extracted = extracted[:max_groups_per_work]
+                apply_texture_filter = (
+                    sonata_policy == "counterpoint-safe"
+                    and (detected_form == "sonata" or is_keyboard_like_source(desc))
+                )
+                if apply_texture_filter:
+                    kept: list[VoiceComposition] = []
+                    accompaniment_like: list[tuple[float, VoiceComposition]] = []
+                    for comp in extracted:
+                        if is_accompaniment_texture_like_comp(comp):
+                            sev = accompaniment_texture_severity_comp(comp)
+                            accompaniment_like.append((sev, comp))
+                            continue
+                        kept.append(comp)
+                    # Keep at most one accompaniment-like sample per work, choosing
+                    # the least accompaniment-heavy candidate deterministically.
+                    if accompaniment_like:
+                        accompaniment_like.sort(key=lambda x: x[0])
+                        kept.append(accompaniment_like[0][1])
+                        skipped_by_sonata_policy += max(0, len(accompaniment_like) - 1)
+                    extracted = kept
                 for comp in extracted:
                     comp.style = style
                     compositions.append(comp)
@@ -255,6 +286,8 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
         console.print(f"  Extracted {len(compositions)} voice groups from {len(works)} works")
         if skipped_by_voice_cap:
             console.print(f"  Skipped by source voice cap: {skipped_by_voice_cap}")
+        if skipped_by_sonata_policy:
+            console.print(f"  Skipped by sonata policy: {skipped_by_sonata_policy}")
         console.print(f"  Form distribution: {dict(form_counter.most_common())}")
         console.print(f"  Voice count distribution: {dict(voice_count_counter.most_common())}")
 
@@ -335,6 +368,7 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
         ) as progress:
             task = progress.add_task("Extracting", total=len(works))
             skipped_by_voice_cap = 0
+            skipped_by_sonata_policy = 0
             for desc, score, style in works:
                 try:
                     source_parts = len(list(score.parts))
@@ -344,12 +378,31 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
                     skipped_by_voice_cap += 1
                     progress.advance(task)
                     continue
+                detected_form, _ = detect_form(score, desc, style)
                 extracted = extract_voice_pairs(
                     score,
                     source=desc,
                     pair_strategy=pair_strategy,
                     max_pairs=max_pairs_per_work,
                 )
+                apply_texture_filter = (
+                    sonata_policy == "counterpoint-safe"
+                    and (detected_form == "sonata" or is_keyboard_like_source(desc))
+                )
+                if apply_texture_filter:
+                    kept_pairs: list[VoicePair] = []
+                    accompaniment_like: list[tuple[float, VoicePair]] = []
+                    for pair in extracted:
+                        if is_accompaniment_texture_like_pair(pair):
+                            sev = accompaniment_texture_severity_pair(pair)
+                            accompaniment_like.append((sev, pair))
+                            continue
+                        kept_pairs.append(pair)
+                    if accompaniment_like:
+                        accompaniment_like.sort(key=lambda x: x[0])
+                        kept_pairs.append(accompaniment_like[0][1])
+                        skipped_by_sonata_policy += max(0, len(accompaniment_like) - 1)
+                    extracted = kept_pairs
                 for pair in extracted:
                     pair.style = style
                 pairs.extend(extracted)
@@ -357,6 +410,8 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
         console.print(f"  Extracted {len(pairs)} voice pairs from {len(works)} works")
         if skipped_by_voice_cap:
             console.print(f"  Skipped by source voice cap: {skipped_by_voice_cap}")
+        if skipped_by_sonata_policy:
+            console.print(f"  Skipped by sonata policy: {skipped_by_sonata_policy}")
 
         if not pairs:
             console.print("[red]No voice pairs extracted.[/red]")
@@ -437,6 +492,7 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
         ) as progress:
             task = progress.add_task("Extracting", total=len(works))
             skipped_by_voice_cap = 0
+            skipped_by_sonata_policy = 0
             for desc, score, style in works:
                 try:
                     source_parts = len(list(score.parts))
@@ -449,6 +505,24 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
                 extracted = extract_voice_groups(score, num_voices=num_voices, source=desc, form=mode)
                 if max_groups_per_work > 0:
                     extracted = extracted[:max_groups_per_work]
+                apply_texture_filter = (
+                    sonata_policy == "counterpoint-safe"
+                    and (mode == "sonata" or is_keyboard_like_source(desc))
+                )
+                if apply_texture_filter:
+                    kept_groups: list[VoiceComposition] = []
+                    accompaniment_like: list[tuple[float, VoiceComposition]] = []
+                    for comp in extracted:
+                        if is_accompaniment_texture_like_comp(comp):
+                            sev = accompaniment_texture_severity_comp(comp)
+                            accompaniment_like.append((sev, comp))
+                            continue
+                        kept_groups.append(comp)
+                    if accompaniment_like:
+                        accompaniment_like.sort(key=lambda x: x[0])
+                        kept_groups.append(accompaniment_like[0][1])
+                        skipped_by_sonata_policy += max(0, len(accompaniment_like) - 1)
+                    extracted = kept_groups
                 for comp in extracted:
                     comp.style = style
                 compositions.extend(extracted)
@@ -456,6 +530,8 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
         console.print(f"  Extracted {len(compositions)} {num_voices}-voice groups from {len(works)} works")
         if skipped_by_voice_cap:
             console.print(f"  Skipped by source voice cap: {skipped_by_voice_cap}")
+        if skipped_by_sonata_policy:
+            console.print(f"  Skipped by sonata policy: {skipped_by_sonata_policy}")
 
         if not compositions:
             console.print(f"[red]No {num_voices}-voice groups extracted.[/red]")
@@ -588,6 +664,8 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
             "mode": mode,
             "num_voices": num_voices,
             "tokenizer_type": tokenizer_type,
+            "max_seq_len": max_seq_len,
+            "sequential_enabled": not no_sequential,
         }, f, indent=2)
 
     # Compute and save corpus statistics
@@ -682,10 +760,13 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
 
     # Set seq_len from mode defaults if not specified
     if seq_len is None:
-        seq_len = FORM_DEFAULTS.get(mode, (2, 768))[1]
-        # Scale-degree sequences are ~50-75% longer; bump seq_len by 1.5x
-        if mode_info.get("tokenizer_type") == "scale-degree":
-            seq_len = int(seq_len * 1.5)
+        if "max_seq_len" in mode_info:
+            seq_len = int(mode_info["max_seq_len"])
+        else:
+            seq_len = FORM_DEFAULTS.get(mode, (2, 768))[1]
+            # Scale-degree sequences are ~50-75% longer; bump seq_len by 1.5x
+            if mode_info.get("tokenizer_type") == "scale-degree":
+                seq_len = int(seq_len * 1.5)
 
     console.print(f"[bold]Loading training data from {train_data_dir}...[/bold]")
     console.print(f"  Mode: {mode}, seq_len: {seq_len}")
@@ -970,8 +1051,13 @@ def generate(
             mode_info = json.load(f)
     if mode is None:
         mode = mode_info.get("mode", "2-part")
+    if mode == "all":
+        # "all" is a data-prep mode, not a concrete generation form.
+        # Default generation to a stable 4-voice form.
+        console.print("[yellow]mode=all in metadata is not directly generative; defaulting to chorale for generation.[/yellow]")
+        mode = "chorale"
 
-    num_voices = voices or FORM_DEFAULTS[mode][0]
+    num_voices = voices or FORM_DEFAULTS.get(mode, (2, 768))[0]
 
     if max_length is None:
         max_length = FORM_DEFAULTS.get(mode, (2, 768))[1]
@@ -1002,6 +1088,7 @@ def generate(
         "2-part": "2-part invention",
         "sinfonia": "sinfonia (3-part)",
         "chorale": "chorale (4-part)",
+        "sonata": "sonata (up to 4 voices)",
         "fugue": f"fugue ({num_voices}-voice)",
     }.get(mode, mode)
 
