@@ -32,6 +32,7 @@ from bach_gen.utils.constants import (
     IMITATION_NAMES,
     HARMONIC_RHYTHM_NAMES,
     HARMONIC_TENSION_NAMES,
+    CHROMATICISM_NAMES,
     ENCODING_MODE_NAMES,
     ticks_per_measure,
     beat_tick_positions,
@@ -81,9 +82,11 @@ class BachTokenizer:
         41-43: TEXTURE_HOMOPHONIC..TEXTURE_MIXED
         44-46: IMITATION_NONE..IMITATION_HIGH
         47-49: HARMONIC_RHYTHM_SLOW..HARMONIC_RHYTHM_FAST
-        50-51: ENCODE_INTERLEAVED, ENCODE_SEQUENTIAL
-        52: VOICE_SEP
-        53..76: KEY tokens (C_major, C_minor, ...)
+        50-52: HARMONIC_TENSION_LOW..HARMONIC_TENSION_HIGH
+        53-55: CHROMATICISM_LOW..CHROMATICISM_HIGH
+        56-57: ENCODE_INTERLEAVED, ENCODE_SEQUENTIAL
+        58: VOICE_SEP
+        59..82: KEY tokens (C_major, C_minor, ...)
         next: PITCH tokens (Pitch_36 .. Pitch_84)
         next: DURATION tokens (Dur_60, Dur_120, ...)
         next: TIME_SHIFT tokens (TimeShift_60, TimeShift_120, ...)
@@ -145,11 +148,14 @@ class BachTokenizer:
     HARMONIC_TENSION_LOW = 50
     HARMONIC_TENSION_MODERATE = 51
     HARMONIC_TENSION_HIGH = 52
+    CHROMATICISM_LOW = 53
+    CHROMATICISM_MODERATE = 54
+    CHROMATICISM_HIGH = 55
 
     # Phase 3 encoding mode tokens
-    ENCODE_INTERLEAVED = 53
-    ENCODE_SEQUENTIAL = 54
-    VOICE_SEP = 55
+    ENCODE_INTERLEAVED = 56
+    ENCODE_SEQUENTIAL = 57
+    VOICE_SEP = 58
 
     # Voice-count tokens (how many voices)
     FORM_TO_MODE_TOKEN: dict[str, int] = {
@@ -219,9 +225,15 @@ class BachTokenizer:
         "high": 52,
     }
 
+    CHROMATICISM_TO_TOKEN: dict[str, int] = {
+        "low": 53,
+        "moderate": 54,
+        "high": 55,
+    }
+
     ENCODING_MODE_TO_TOKEN: dict[str, int] = {
-        "interleaved": 53,
-        "sequential": 54,
+        "interleaved": 56,
+        "sequential": 57,
     }
 
     def __init__(self, config: TokenConfig | None = None):
@@ -290,14 +302,21 @@ class BachTokenizer:
             self.name_to_token[name] = idx
             idx += 1
 
-        # Encoding mode tokens (53-54)
+        # Chromaticism tokens (53-55)
+        for ch_name in CHROMATICISM_NAMES:
+            name = f"CHROMATICISM_{ch_name.upper()}"
+            self.token_to_name[idx] = name
+            self.name_to_token[name] = idx
+            idx += 1
+
+        # Encoding mode tokens (56-57)
         for em_name in ENCODING_MODE_NAMES:
             name = f"ENCODE_{em_name.upper()}"
             self.token_to_name[idx] = name
             self.name_to_token[name] = idx
             idx += 1
 
-        # Voice separator (52)
+        # Voice separator (58)
         self.token_to_name[idx] = "VOICE_SEP"
         self.name_to_token["VOICE_SEP"] = idx
         idx += 1
@@ -343,6 +362,7 @@ class BachTokenizer:
         # Verify hardcoded class-level constants match dynamic vocab
         assert self.name_to_token.get("TEXTURE_HOMOPHONIC") == self.TEXTURE_HOMOPHONIC
         assert self.name_to_token.get("HARMONIC_TENSION_LOW") == self.HARMONIC_TENSION_LOW
+        assert self.name_to_token.get("CHROMATICISM_LOW") == self.CHROMATICISM_LOW
         assert self.name_to_token.get("VOICE_SEP") == self.VOICE_SEP
         assert self.name_to_token.get("ENCODE_SEQUENTIAL") == self.ENCODE_SEQUENTIAL
 
@@ -365,6 +385,7 @@ class BachTokenizer:
         imitation: str | None = None,
         harmonic_rhythm: str | None = None,
         harmonic_tension: str | None = None,
+        chromaticism: str | None = None,
         encoding_mode: str | None = None,
     ) -> tuple[list[int], VoiceComposition]:
         """Build the conditioning prefix up to (but not including) KEY.
@@ -419,6 +440,8 @@ class BachTokenizer:
             tokens.append(self.HARMONIC_RHYTHM_TO_TOKEN[harmonic_rhythm])
         if harmonic_tension is not None and harmonic_tension in self.HARMONIC_TENSION_TO_TOKEN:
             tokens.append(self.HARMONIC_TENSION_TO_TOKEN[harmonic_tension])
+        if chromaticism is not None and chromaticism in self.CHROMATICISM_TO_TOKEN:
+            tokens.append(self.CHROMATICISM_TO_TOKEN[chromaticism])
 
         # Encoding mode token
         if encoding_mode is not None and encoding_mode in self.ENCODING_MODE_TO_TOKEN:
@@ -441,16 +464,18 @@ class BachTokenizer:
         imitation: str | None = None,
         harmonic_rhythm: str | None = None,
         harmonic_tension: str | None = None,
+        chromaticism: str | None = None,
     ) -> list[int]:
         """Encode a VoicePair or VoiceComposition into a token sequence.
 
         Prefix order: BOS STYLE FORM MODE LENGTH METER TEXTURE IMITATION
-                      HARMONIC_RHYTHM TENSION ENCODE_INTERLEAVED KEY <events> EOS
+                      HARMONIC_RHYTHM TENSION CHROMATICISM ENCODE_INTERLEAVED KEY <events> EOS
         """
         tokens, comp = self._build_conditioning_prefix(
             item, form=form, style=style, length_bars=length_bars, meter=meter,
             texture=texture, imitation=imitation, harmonic_rhythm=harmonic_rhythm,
-            harmonic_tension=harmonic_tension, encoding_mode="interleaved",
+            harmonic_tension=harmonic_tension, chromaticism=chromaticism,
+            encoding_mode="interleaved",
         )
 
         # Key token
@@ -482,6 +507,7 @@ class BachTokenizer:
         imitation: str | None = None,
         harmonic_rhythm: str | None = None,
         harmonic_tension: str | None = None,
+        chromaticism: str | None = None,
     ) -> list[int]:
         """Encode using sequential (voice-by-voice) format.
 
@@ -494,7 +520,8 @@ class BachTokenizer:
         tokens, comp = self._build_conditioning_prefix(
             item, form=form, style=style, length_bars=length_bars, meter=meter,
             texture=texture, imitation=imitation, harmonic_rhythm=harmonic_rhythm,
-            harmonic_tension=harmonic_tension, encoding_mode="sequential",
+            harmonic_tension=harmonic_tension, chromaticism=chromaticism,
+            encoding_mode="sequential",
         )
 
         # Key token

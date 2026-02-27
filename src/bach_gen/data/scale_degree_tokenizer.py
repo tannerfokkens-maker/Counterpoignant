@@ -7,7 +7,7 @@ augmentation unnecessary.
 
 Token ordering per note: VOICE_N -> OCT_x -> [SHARP|FLAT] -> DEG_y -> DUR_z
 
-Vocabulary layout (117 tokens):
+Vocabulary layout (120 tokens):
      0-9:   10 special tokens (PAD, BOS, EOS, VOICE_1-4, SUBJECT_*, BAR)
     10-15:   6 beat tokens (BEAT_1..BEAT_6)
     16-19:   4 voice-count tokens (MODE_2PART..MODE_FUGUE)
@@ -19,14 +19,15 @@ Vocabulary layout (117 tokens):
     44-46:   3 imitation tokens (IMITATION_NONE..IMITATION_HIGH)
     47-49:   3 harmonic rhythm tokens (HARMONIC_RHYTHM_SLOW..FAST)
     50-52:   3 harmonic tension tokens (HARMONIC_TENSION_LOW..HIGH)
-    53-54:   2 encoding mode tokens (ENCODE_INTERLEAVED, ENCODE_SEQUENTIAL)
-    55:      1 voice separator (VOICE_SEP)
-    56-79:  24 key tokens (needed at decode time)
-    80-85:   6 octave tokens (OCT_2 .. OCT_7)
-    86-92:   7 degree tokens (DEG_1 .. DEG_7)
-    93-94:   2 accidental tokens (SHARP, FLAT)
-    95-105: 11 duration tokens
-   106-116: 11 time shift tokens
+    53-55:   3 chromaticism tokens (CHROMATICISM_LOW..HIGH)
+    56-57:   2 encoding mode tokens (ENCODE_INTERLEAVED, ENCODE_SEQUENTIAL)
+    58:      1 voice separator (VOICE_SEP)
+    59-82:  24 key tokens (needed at decode time)
+    83-88:   6 octave tokens (OCT_2 .. OCT_7)
+    89-95:   7 degree tokens (DEG_1 .. DEG_7)
+    96-97:   2 accidental tokens (SHARP, FLAT)
+    98-108: 11 duration tokens
+   109-119: 11 time shift tokens
 """
 
 from __future__ import annotations
@@ -43,7 +44,7 @@ from bach_gen.utils.constants import (
     KEY_NAMES, SD_MIN_OCTAVE, SD_MAX_OCTAVE, STYLE_NAMES, FORM_NAMES,
     LENGTH_NAMES, LENGTH_BOUNDARIES, METER_NAMES, METER_MAP,
     TEXTURE_NAMES, IMITATION_NAMES, HARMONIC_RHYTHM_NAMES, HARMONIC_TENSION_NAMES,
-    ENCODING_MODE_NAMES,
+    CHROMATICISM_NAMES, ENCODING_MODE_NAMES,
     TICKS_PER_QUARTER, ticks_per_measure, beat_tick_positions,
     length_bucket,
 )
@@ -129,11 +130,14 @@ class ScaleDegreeTokenizer:
     HARMONIC_TENSION_LOW = 50
     HARMONIC_TENSION_MODERATE = 51
     HARMONIC_TENSION_HIGH = 52
+    CHROMATICISM_LOW = 53
+    CHROMATICISM_MODERATE = 54
+    CHROMATICISM_HIGH = 55
 
     # Phase 3 encoding mode tokens
-    ENCODE_INTERLEAVED = 53
-    ENCODE_SEQUENTIAL = 54
-    VOICE_SEP = 55
+    ENCODE_INTERLEAVED = 56
+    ENCODE_SEQUENTIAL = 57
+    VOICE_SEP = 58
 
     # Voice-count tokens (how many voices)
     FORM_TO_MODE_TOKEN: dict[str, int] = {
@@ -202,9 +206,15 @@ class ScaleDegreeTokenizer:
         "high": 52,
     }
 
+    CHROMATICISM_TO_TOKEN: dict[str, int] = {
+        "low": 53,
+        "moderate": 54,
+        "high": 55,
+    }
+
     ENCODING_MODE_TO_TOKEN: dict[str, int] = {
-        "interleaved": 53,
-        "sequential": 54,
+        "interleaved": 56,
+        "sequential": 57,
     }
 
     def __init__(self, config: ScaleDegreeTokenizerConfig | None = None):
@@ -288,14 +298,21 @@ class ScaleDegreeTokenizer:
             self.name_to_token[name] = idx
             idx += 1
 
-        # Encoding mode tokens (53-54)
+        # Chromaticism tokens (53-55)
+        for ch_name in CHROMATICISM_NAMES:
+            name = f"CHROMATICISM_{ch_name.upper()}"
+            self.token_to_name[idx] = name
+            self.name_to_token[name] = idx
+            idx += 1
+
+        # Encoding mode tokens (56-57)
         for em_name in ENCODING_MODE_NAMES:
             name = f"ENCODE_{em_name.upper()}"
             self.token_to_name[idx] = name
             self.name_to_token[name] = idx
             idx += 1
 
-        # Voice separator (52)
+        # Voice separator (58)
         self.token_to_name[idx] = "VOICE_SEP"
         self.name_to_token["VOICE_SEP"] = idx
         idx += 1
@@ -358,6 +375,7 @@ class ScaleDegreeTokenizer:
         # Verify hardcoded class-level constants match dynamic vocab
         assert self.name_to_token.get("TEXTURE_HOMOPHONIC") == self.TEXTURE_HOMOPHONIC
         assert self.name_to_token.get("HARMONIC_TENSION_LOW") == self.HARMONIC_TENSION_LOW
+        assert self.name_to_token.get("CHROMATICISM_LOW") == self.CHROMATICISM_LOW
         assert self.name_to_token.get("VOICE_SEP") == self.VOICE_SEP
         assert self.name_to_token.get("ENCODE_SEQUENTIAL") == self.ENCODE_SEQUENTIAL
 
@@ -380,6 +398,7 @@ class ScaleDegreeTokenizer:
         imitation: str | None = None,
         harmonic_rhythm: str | None = None,
         harmonic_tension: str | None = None,
+        chromaticism: str | None = None,
         encoding_mode: str | None = None,
     ) -> tuple[list[int], VoiceComposition]:
         """Build the conditioning prefix up to (but not including) KEY.
@@ -433,6 +452,8 @@ class ScaleDegreeTokenizer:
             tokens.append(self.HARMONIC_RHYTHM_TO_TOKEN[harmonic_rhythm])
         if harmonic_tension is not None and harmonic_tension in self.HARMONIC_TENSION_TO_TOKEN:
             tokens.append(self.HARMONIC_TENSION_TO_TOKEN[harmonic_tension])
+        if chromaticism is not None and chromaticism in self.CHROMATICISM_TO_TOKEN:
+            tokens.append(self.CHROMATICISM_TO_TOKEN[chromaticism])
 
         # Encoding mode token
         if encoding_mode is not None and encoding_mode in self.ENCODING_MODE_TO_TOKEN:
@@ -449,16 +470,18 @@ class ScaleDegreeTokenizer:
         style: str = "", length_bars: int | None = None, meter: str | None = None,
         texture: str | None = None, imitation: str | None = None,
         harmonic_rhythm: str | None = None, harmonic_tension: str | None = None,
+        chromaticism: str | None = None,
     ) -> list[int]:
         """Encode a VoicePair or VoiceComposition into a scale-degree token sequence.
 
         Prefix order: BOS STYLE FORM MODE LENGTH METER TEXTURE IMITATION
-                      HARMONIC_RHYTHM TENSION ENCODE_INTERLEAVED KEY <events> EOS
+                      HARMONIC_RHYTHM TENSION CHROMATICISM ENCODE_INTERLEAVED KEY <events> EOS
         """
         tokens, comp = self._build_conditioning_prefix(
             item, form=form, style=style, length_bars=length_bars, meter=meter,
             texture=texture, imitation=imitation, harmonic_rhythm=harmonic_rhythm,
-            harmonic_tension=harmonic_tension, encoding_mode="interleaved",
+            harmonic_tension=harmonic_tension, chromaticism=chromaticism,
+            encoding_mode="interleaved",
         )
 
         # Emit key token (needed for decode)
@@ -486,6 +509,7 @@ class ScaleDegreeTokenizer:
         style: str = "", length_bars: int | None = None, meter: str | None = None,
         texture: str | None = None, imitation: str | None = None,
         harmonic_rhythm: str | None = None, harmonic_tension: str | None = None,
+        chromaticism: str | None = None,
     ) -> list[int]:
         """Encode using sequential (voice-by-voice) format.
 
@@ -498,7 +522,8 @@ class ScaleDegreeTokenizer:
         tokens, comp = self._build_conditioning_prefix(
             item, form=form, style=style, length_bars=length_bars, meter=meter,
             texture=texture, imitation=imitation, harmonic_rhythm=harmonic_rhythm,
-            harmonic_tension=harmonic_tension, encoding_mode="sequential",
+            harmonic_tension=harmonic_tension, chromaticism=chromaticism,
+            encoding_mode="sequential",
         )
 
         # Emit key token
