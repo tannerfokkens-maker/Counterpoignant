@@ -875,8 +875,8 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
                           f"--epochs ({epochs})[/red]")
             sys.exit(1)
 
-        if finetune_style and finetune_data_dir != "data/bach":
-            console.print("[red]Use either --finetune <style> or --finetune-data-dir, not both.[/red]")
+        if finetune_style and "--finetune-data-dir" in sys.argv:
+            console.print("[red]Use either --finetune <target> or --finetune-data-dir, not both.[/red]")
             sys.exit(1)
 
         ft_sequences: list[list[int]]

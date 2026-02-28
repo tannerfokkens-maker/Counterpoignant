@@ -11,7 +11,7 @@ def sample_next_token(
     temperature: float = 0.9,
     top_k: int = 0,
     top_p: float = 1.0,
-    min_p: float = 0.05,
+    min_p: float = 0.03,
 ) -> int:
     """Sample the next token from logits using temperature + min-p.
 

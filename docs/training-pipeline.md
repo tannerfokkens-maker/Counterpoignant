@@ -309,8 +309,9 @@ models/
   latest.pt               # most recent epoch
   best.pt                 # best validation loss
   final.pt                # end of training
-  pretrain_final.pt       # pre-curriculum (if --curriculum)
   pre_drope.pt            # before DroPE (if --drope)
+  drope_latest.pt         # latest DroPE epoch (if --drope)
+  drope_best.pt           # best DroPE val checkpoint (if --drope)
   drope_final.pt          # after DroPE (if --drope)
 
 output/
