@@ -492,6 +492,8 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
               help="Fine-tune subset from same --data-dir (style token or composer substring, e.g. 'bach' or 'beethoven')")
 @click.option("--finetune-lr", default=1e-4, type=float,
               help="Learning rate for fine-tuning phase (default: 1e-4)")
+@click.option("--pretrained-checkpoint", default=None, type=click.Path(exists=True),
+              help="Skip curriculum pre-train phase and start fine-tuning from this checkpoint")
 @click.option("--drope/--no-drope", default=True,
               help="Enable/disable DroPE recalibration after training (default: enabled)")
 @click.option("--drope-epochs", default=10, type=int,
@@ -514,6 +516,8 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
               help="Minimum val loss improvement to reset patience (default: 1e-4)")
 @click.option("--es-min-epochs", default=10, type=int,
               help="Minimum epochs before early stopping can trigger (default: 10)")
+@click.option("--val-interval", default=None, type=int,
+              help="Validation frequency in epochs (default: auto = epochs//20)")
 @click.option("--fp16", is_flag=True, default=False,
               help="Enable mixed precision (fp16) training — CUDA only")
 @click.option("--pos-encoding", type=click.Choice(["rope", "pope"]),
@@ -524,10 +528,12 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
           accumulation_steps: int, resume: str | None, data_dir: str | None,
           curriculum: bool, pretrain_epochs: int, finetune_data_dir: str,
           finetune_style: str | None,
-          finetune_lr: float, drope: bool, drope_epochs: int, drope_lr: float,
+          finetune_lr: float, pretrained_checkpoint: str | None,
+          drope: bool, drope_epochs: int, drope_lr: float,
           drope_early_stop: bool, drope_patience: int, drope_min_delta: float,
           drope_min_epochs: int,
           early_stop: bool, es_patience: int, es_min_delta: float, es_min_epochs: int,
+          val_interval: int | None,
           fp16: bool, pos_encoding: str, num_kv_heads: int | None) -> None:
     """Train the Bach Transformer model."""
     import torch
@@ -561,6 +567,10 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
             seq_len = int(mode_info["max_seq_len"])
         else:
             seq_len = FORM_DEFAULTS.get(mode, (2, 768))[1]
+
+    if val_interval is not None and val_interval < 1:
+        console.print("[red]--val-interval must be >= 1[/red]")
+        sys.exit(1)
 
     console.print(f"[bold]Loading training data from {train_data_dir}...[/bold]")
     console.print(f"  Mode: {mode}, seq_len: {seq_len}")
@@ -645,6 +655,11 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
         fp16=fp16,
     )
 
+    if curriculum:
+        if resume and pretrained_checkpoint:
+            console.print("[red]Use either --resume or --pretrained-checkpoint, not both.[/red]")
+            sys.exit(1)
+
     start_epoch = 1
     if resume:
         start_epoch = trainer.resume_from_checkpoint(resume)
@@ -690,6 +705,7 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
             ft_source_desc = str(ft_data_dir)
 
         finetune_epochs = epochs - pretrain_epochs
+        skip_pretrain = pretrained_checkpoint is not None
 
         console.print(f"\n[bold]Curriculum training:[/bold]")
         console.print(f"  Phase 1 (pre-train): epochs 1–{pretrain_epochs} on {train_data_dir}")
@@ -700,36 +716,43 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
         else:
             console.print(f"  Early stop: disabled")
 
-        # --- Phase 1: Pre-train ---
-        console.print(f"\n[bold]Phase 1: Pre-training for {pretrain_epochs} epochs...[/bold]")
-        with Progress(
-            SpinnerColumn(), TextColumn("{task.description}"),
-            BarColumn(), TaskProgressColumn(), console=console,
-        ) as progress:
-            task = progress.add_task("Pre-training", total=pretrain_epochs - start_epoch + 1)
-
-            def pt_callback(epoch, train_loss, val_loss):
-                desc = f"[pretrain] Epoch {epoch}/{pretrain_epochs} | loss={train_loss:.4f}"
-                if val_loss is not None:
-                    desc += f" | val_loss={val_loss:.4f}"
-                progress.update(task, advance=1, description=desc)
-
-            pt_history = trainer.train(
-                epochs=pretrain_epochs,
-                start_epoch=start_epoch,
-                log_interval=max(1, pretrain_epochs // 20),
-                val_interval=max(1, pretrain_epochs // 20),
-                progress_callback=pt_callback,
-                early_stop=early_stop,
-                patience=es_patience,
-                min_delta=es_min_delta,
-                min_epochs=es_min_epochs,
+        # --- Phase 1: Pre-train (optional) ---
+        if skip_pretrain:
+            console.print(
+                f"\n[bold]Phase 1:[/bold] Skipped pre-training; loading checkpoint {pretrained_checkpoint}"
             )
+            trainer.resume_from_checkpoint(pretrained_checkpoint)
+            pt_history = {"train_loss": [], "val_loss": [], "lr": []}
+        else:
+            console.print(f"\n[bold]Phase 1: Pre-training for {pretrain_epochs} epochs...[/bold]")
+            with Progress(
+                SpinnerColumn(), TextColumn("{task.description}"),
+                BarColumn(), TaskProgressColumn(), console=console,
+            ) as progress:
+                task = progress.add_task("Pre-training", total=pretrain_epochs - start_epoch + 1)
 
-        console.print(f"  Pre-train final loss: {pt_history['train_loss'][-1]:.4f}")
-        if pt_history.get("stop_reason") and pt_history["stop_reason"] != "max_epochs_reached":
-            console.print(f"  Pre-train stopped early: {pt_history['stop_reason']} "
-                          f"(ran {pt_history.get('epochs_ran', '?')} epochs)")
+                def pt_callback(epoch, train_loss, val_loss):
+                    desc = f"[pretrain] Epoch {epoch}/{pretrain_epochs} | loss={train_loss:.4f}"
+                    if val_loss is not None:
+                        desc += f" | val_loss={val_loss:.4f}"
+                    progress.update(task, advance=1, description=desc)
+
+                pt_history = trainer.train(
+                    epochs=pretrain_epochs,
+                    start_epoch=start_epoch,
+                    log_interval=max(1, pretrain_epochs // 20),
+                    val_interval=(val_interval if val_interval is not None else max(1, pretrain_epochs // 20)),
+                    progress_callback=pt_callback,
+                    early_stop=early_stop,
+                    patience=es_patience,
+                    min_delta=es_min_delta,
+                    min_epochs=es_min_epochs,
+                )
+
+            console.print(f"  Pre-train final loss: {pt_history['train_loss'][-1]:.4f}")
+            if pt_history.get("stop_reason") and pt_history["stop_reason"] != "max_epochs_reached":
+                console.print(f"  Pre-train stopped early: {pt_history['stop_reason']} "
+                              f"(ran {pt_history.get('epochs_ran', '?')} epochs)")
 
         # --- Phase 2: Fine-tune ---
         console.print(f"\n[bold]Phase 2: Preparing fine-tune data from {ft_source_desc}...[/bold]")
@@ -756,7 +779,7 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
                 epochs=epochs,
                 start_epoch=pretrain_epochs + 1,
                 log_interval=max(1, finetune_epochs // 20),
-                val_interval=max(1, finetune_epochs // 20),
+                val_interval=(val_interval if val_interval is not None else max(1, finetune_epochs // 20)),
                 progress_callback=ft_callback,
                 early_stop=early_stop,
                 patience=es_patience,
@@ -795,7 +818,7 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
                 epochs=epochs,
                 start_epoch=start_epoch,
                 log_interval=max(1, epochs // 20),
-                val_interval=max(1, epochs // 20),
+                val_interval=(val_interval if val_interval is not None else max(1, epochs // 20)),
                 progress_callback=callback,
                 early_stop=early_stop,
                 patience=es_patience,

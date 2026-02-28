@@ -300,8 +300,43 @@ class TestCLIOptions:
         assert "--curriculum" in result.output
         assert "--pretrain-epochs" in result.output
         assert "--finetune-data-dir" in result.output
+        assert "--pretrained-checkpoint" in result.output
         assert "--finetune-lr" in result.output
+        assert "--val-interval" in result.output
         assert "--data-dir" in result.output
+
+    def test_train_rejects_resume_and_pretrained_checkpoint_together(self, tmp_path):
+        """Passing both --resume and --pretrained-checkpoint should error out."""
+        from click.testing import CliRunner
+        from bach_gen.cli import cli
+
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        seqs = [list(range(20, 50)) for _ in range(10)]
+        (data_dir / "sequences.json").write_text(json.dumps(seqs))
+        (data_dir / "mode.json").write_text('{"mode": "2-part", "num_voices": 2, "tokenizer_type": "absolute"}')
+
+        ckpt = tmp_path / "ckpt.pt"
+        ckpt.write_bytes(b"x")
+
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.vocab_size = 100
+
+        with patch("bach_gen.data.tokenizer.load_tokenizer", return_value=mock_tokenizer), \
+             patch("bach_gen.data.dataset.create_dataset", return_value=(_make_dataset(10), _make_dataset(2))):
+            runner = CliRunner()
+            result = runner.invoke(cli, [
+                "train",
+                "--curriculum",
+                "--epochs", "200",
+                "--pretrain-epochs", "100",
+                "--data-dir", str(data_dir),
+                "--resume", str(ckpt),
+                "--pretrained-checkpoint", str(ckpt),
+            ])
+
+        assert result.exit_code != 0
+        assert "either --resume or --pretrained-checkpoint" in result.output.lower()
 
     def test_train_curriculum_rejects_pretrain_ge_epochs(self, tmp_path):
         """--pretrain-epochs >= --epochs should error out."""
@@ -333,6 +368,32 @@ class TestCLIOptions:
 
         assert result.exit_code != 0
         assert "pretrain-epochs" in result.output.lower()
+
+    def test_train_rejects_invalid_val_interval(self, tmp_path):
+        """--val-interval must be >= 1."""
+        from click.testing import CliRunner
+        from bach_gen.cli import cli
+
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        seqs = [list(range(20, 50)) for _ in range(10)]
+        (data_dir / "sequences.json").write_text(json.dumps(seqs))
+        (data_dir / "mode.json").write_text('{"mode": "2-part", "num_voices": 2, "tokenizer_type": "absolute"}')
+
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.vocab_size = 100
+
+        with patch("bach_gen.data.tokenizer.load_tokenizer", return_value=mock_tokenizer),              patch("bach_gen.data.dataset.create_dataset", return_value=(_make_dataset(10), _make_dataset(2))):
+            runner = CliRunner()
+            result = runner.invoke(cli, [
+                "train",
+                "--epochs", "20",
+                "--data-dir", str(data_dir),
+                "--val-interval", "0",
+            ])
+
+        assert result.exit_code != 0
+        assert "val-interval" in result.output.lower()
 
     def test_prepare_data_composer_filter_parsing(self, tmp_path):
         """Verify composer_filter string is split correctly."""
