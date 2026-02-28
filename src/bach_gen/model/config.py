@@ -28,7 +28,7 @@ class ModelConfig:
     dropout: float = DEFAULT_DROPOUT
     weight_tying: bool = True
     rope_theta: float = 10000.0
-    pos_encoding: str = "rope"  # "rope" | "pope" | "none"
+    pos_encoding: str = "pope"  # "rope" | "pope" | "none"
     swiglu_dim: int | None = None  # Auto-computed from embed_dim if None
     drope_trained: bool = False
     drope_train_seq_len: int | None = None

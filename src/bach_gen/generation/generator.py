@@ -131,6 +131,12 @@ def generate(
     """
     device = next(model.parameters()).device
 
+    # Auto-detect DroPE: if model was recalibrated without positional
+    # embeddings, generation must also skip them.
+    use_rope = not getattr(model.config, "drope_trained", False)
+    if not use_rope:
+        logger.info("DroPE model detected — generating without positional embeddings")
+
     # Resolve num_voices from form
     if num_voices is None:
         num_voices = FORM_DEFAULTS.get(form, (2, 768))[0]
@@ -188,6 +194,7 @@ def generate(
             max_length=max_length,
             device=device,
             length_penalty_alpha=length_penalty_alpha,
+            use_rope=use_rope,
         )
 
         for i, tokens in enumerate(beam_sequences):
@@ -224,6 +231,7 @@ def generate(
                 min_p=min_p,
                 max_length=max_length,
                 device=device,
+                use_rope=use_rope,
             )
 
             # Decode to composition
@@ -414,6 +422,11 @@ def generate_voice_by_voice(
     """
     device = next(model.parameters()).device
 
+    # Auto-detect DroPE
+    use_rope = not getattr(model.config, "drope_trained", False)
+    if not use_rope:
+        logger.info("DroPE model detected — generating without positional embeddings")
+
     if num_voices is None:
         num_voices = FORM_DEFAULTS.get(form, (2, 768))[0]
 
@@ -487,6 +500,7 @@ def generate_voice_by_voice(
             min_p=min_p,
             max_length=max_length,
             device=device,
+            use_rope=use_rope,
         )
 
         comp = tokenizer.decode(tokens)
@@ -537,6 +551,7 @@ def _generate_one(
     min_p: float,
     max_length: int,
     device: torch.device,
+    use_rope: bool = True,
 ) -> list[int]:
     """Generate a single token sequence."""
     model.eval()
@@ -550,7 +565,7 @@ def _generate_one(
         input_tokens = tokens[-model.config.max_seq_len:]
         input_ids = torch.tensor([input_tokens], dtype=torch.long, device=device)
 
-        logits = model(input_ids)
+        logits = model(input_ids, use_rope=use_rope)
         next_logits = logits[0, -1, :]  # (vocab_size,)
 
         # Apply constraints using cached state
@@ -585,6 +600,7 @@ def _beam_search_generate(
     max_length: int,
     device: torch.device,
     length_penalty_alpha: float = 0.7,
+    use_rope: bool = True,
 ) -> list[list[int]]:
     """Generate token sequences using beam search.
 
@@ -646,7 +662,7 @@ def _beam_search_generate(
         # Build attention mask: 1 for real tokens, 0 for padding
         attention_mask = (input_ids != tokenizer.PAD).long()
 
-        logits = model(input_ids, attention_mask=attention_mask)
+        logits = model(input_ids, attention_mask=attention_mask, use_rope=use_rope)
         # logits: (batch, seq_len, vocab_size)
 
         # --- Expand candidates ---

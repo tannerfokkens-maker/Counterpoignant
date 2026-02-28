@@ -680,6 +680,7 @@ class BachTokenizer:
                         "IMITATION_NONE", "IMITATION_LOW", "IMITATION_HIGH",
                         "HARMONIC_RHYTHM_SLOW", "HARMONIC_RHYTHM_MODERATE", "HARMONIC_RHYTHM_FAST",
                         "HARMONIC_TENSION_LOW", "HARMONIC_TENSION_MODERATE", "HARMONIC_TENSION_HIGH",
+                        "CHROMATICISM_LOW", "CHROMATICISM_MODERATE", "CHROMATICISM_HIGH",
                         "ENCODE_INTERLEAVED", "ENCODE_SEQUENTIAL"):
                 continue
             elif name == "VOICE_SEP":

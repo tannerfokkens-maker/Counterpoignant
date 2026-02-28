@@ -163,19 +163,22 @@ def _print_conditioning_histograms(sequences: list[list[int]], tokenizer) -> Non
 @click.option("--sonata-policy", type=click.Choice(["counterpoint-safe", "all"]),
               default="counterpoint-safe",
               help="How to treat sonata data in broad training (default: counterpoint-safe)")
+@click.option("--workers", default=None, type=int,
+              help="Number of parallel workers for file parsing (default: min(cpu_count, 8))")
 def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len: int,
                  no_chunk: bool, data_dir: str | None, composer_filter: str | None,
                  no_sequential: bool, max_source_voices: int,
                  max_groups_per_work: int, pair_strategy: str,
-                 max_pairs_per_work: int, sonata_policy: str) -> None:
+                 max_pairs_per_work: int, sonata_policy: str,
+                 workers: int | None) -> None:
     """Extract Bach corpus, tokenize, and cache statistics."""
-    from bach_gen.data.corpus import get_all_works
+    from collections import Counter, defaultdict
+    from bach_gen.data.corpus import get_all_works, _original_source
     from bach_gen.data.extraction import (
-        extract_voice_pairs, extract_voice_groups, detect_form,
-        is_accompaniment_texture_like_pair, is_accompaniment_texture_like_comp,
-        accompaniment_texture_severity_pair, accompaniment_texture_severity_comp,
+        is_accompaniment_texture_like_comp,
+        accompaniment_texture_severity_comp,
         is_keyboard_like_source,
-        VoicePair, VoiceComposition,
+        VoiceComposition,
     )
     from bach_gen.data.augmentation import augment_to_all_keys
     from bach_gen.data.tokenizer import BachTokenizer
@@ -186,8 +189,10 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
     is_all_mode = mode == "all"
     if is_all_mode:
         num_voices = voices or 4  # placeholder; actual count detected per piece
+        voices_for_extraction = voices  # None → auto-detect
     else:
         num_voices = voices or FORM_DEFAULTS[mode][0]
+        voices_for_extraction = num_voices
 
     # Resolve output directory
     out_dir = Path(data_dir) if data_dir else DATA_DIR
@@ -208,13 +213,13 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
         filter_list = list(DEFAULT_PREPARE_COMPOSER_FILTER)
         filter_origin = "default"
 
-    # Step 1: Load works
+    # Step 1: Load and extract works (parse + extract in workers)
     if filter_list:
         suffix = " [default]" if filter_origin == "default" else ""
         filter_desc = f" (filter: {', '.join(filter_list)}{suffix})"
     else:
         filter_desc = " (filter: disabled)"
-    console.print(f"[bold]Step 1:[/] Loading works from corpus...{filter_desc}")
+    console.print(f"[bold]Step 1:[/] Loading and extracting from corpus...{filter_desc}")
     if is_all_mode:
         console.print(f"  Mode: all (auto-detect form and voice count per piece)")
     else:
@@ -222,394 +227,147 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
     console.print(f"  Tokenizer: {tokenizer_type}")
     console.print(f"  Max source voices: {max_source_voices}")
     console.print(f"  Sonata policy: {sonata_policy}")
+    import os as _os
+    effective_workers = workers if workers is not None else min(_os.cpu_count() or 1, 8)
+    console.print(f"  Workers: {effective_workers}")
     with Progress(SpinnerColumn(), TextColumn("{task.description}"), console=console) as progress:
-        task = progress.add_task("Loading...", total=None)
-        works = get_all_works(composer_filter=filter_list)
-        progress.update(task, description=f"Loaded {len(works)} works")
+        task = progress.add_task("Loading and extracting...", total=None)
+        works_with_forms = get_all_works(
+            composer_filter=filter_list, max_workers=workers,
+            max_source_voices=max_source_voices,
+            max_groups_per_work=max_groups_per_work,
+            voices_override=voices_for_extraction,
+        )
+        progress.update(task, description=f"Extracted {len(works_with_forms)} voice groups")
 
-    if not works:
+    if not works_with_forms:
         console.print("[red]No works found. Check music21 corpus installation.[/red]")
         console.print("Run: python -c \"import music21; music21.configure.run()\"")
         sys.exit(1)
 
-    # Step 2: Extract voice groups
-    if is_all_mode:
-        console.print(f"\n[bold]Step 2:[/] Extracting voice groups (auto-detect per piece)...")
+    # Apply sonata policy filtering (per-work grouping)
+    compositions: list[VoiceComposition] = []
+    form_per_comp: list[str] = []
+    form_counter: Counter = Counter()
+    voice_count_counter: Counter = Counter()
+    skipped_by_sonata_policy = 0
+
+    if sonata_policy == "counterpoint-safe":
+        # Group by original source for per-work filtering
+        work_groups: dict[str, list[tuple[VoiceComposition, str]]] = defaultdict(list)
+        for comp, form in works_with_forms:
+            work_groups[_original_source(comp.source)].append((comp, form))
+
+        for orig_src, items in work_groups.items():
+            representative_form = items[0][1]
+            apply_filter = (
+                representative_form == "sonata"
+                or is_keyboard_like_source(orig_src)
+            )
+            if apply_filter:
+                kept: list[tuple[VoiceComposition, str]] = []
+                accompaniment_like: list[tuple[float, VoiceComposition, str]] = []
+                for comp, form in items:
+                    if is_accompaniment_texture_like_comp(comp):
+                        sev = accompaniment_texture_severity_comp(comp)
+                        accompaniment_like.append((sev, comp, form))
+                        continue
+                    kept.append((comp, form))
+                # Keep at most one accompaniment-like sample per work
+                if accompaniment_like:
+                    accompaniment_like.sort(key=lambda x: x[0])
+                    kept.append((accompaniment_like[0][1], accompaniment_like[0][2]))
+                    skipped_by_sonata_policy += max(0, len(accompaniment_like) - 1)
+                items = kept
+            for comp, form in items:
+                compositions.append(comp)
+                # For all mode, use auto-detected form; otherwise use CLI mode
+                item_form = form if is_all_mode else mode
+                form_per_comp.append(item_form)
+                form_counter[form] += 1
+                voice_count_counter[comp.num_voices] += 1
     else:
-        console.print(f"\n[bold]Step 2:[/] Extracting {num_voices}-voice groups...")
+        for comp, form in works_with_forms:
+            compositions.append(comp)
+            item_form = form if is_all_mode else mode
+            form_per_comp.append(item_form)
+            form_counter[form] += 1
+            voice_count_counter[comp.num_voices] += 1
 
-    if is_all_mode:
-        # --mode all: detect form and voice count per piece
-        from collections import Counter
-        compositions: list[VoiceComposition] = []
-        form_per_comp: list[str] = []
-        form_counter: Counter = Counter()
-        voice_count_counter: Counter = Counter()
+    console.print(f"  Extracted {len(compositions)} voice groups")
+    if skipped_by_sonata_policy:
+        console.print(f"  Skipped by sonata policy: {skipped_by_sonata_policy}")
+    console.print(f"  Form distribution: {dict(form_counter.most_common())}")
+    console.print(f"  Voice count distribution: {dict(voice_count_counter.most_common())}")
 
-        with Progress(
-            SpinnerColumn(), TextColumn("{task.description}"),
-            BarColumn(), TaskProgressColumn(), console=console,
-        ) as progress:
-            task = progress.add_task("Extracting", total=len(works))
-            skipped_by_voice_cap = 0
-            skipped_by_sonata_policy = 0
-            for desc, score, style in works:
-                try:
-                    source_parts = len(list(score.parts))
-                except Exception:
-                    source_parts = 0
-                if source_parts > max_source_voices:
-                    skipped_by_voice_cap += 1
-                    progress.advance(task)
-                    continue
-                detected_form, detected_nv = detect_form(score, desc, style)
-                if voices is not None:
-                    detected_nv = voices  # user override
-                extracted = extract_voice_groups(
-                    score, num_voices=detected_nv, source=desc, form=detected_form,
-                )
-                if max_groups_per_work > 0:
-                    extracted = extracted[:max_groups_per_work]
-                apply_texture_filter = (
-                    sonata_policy == "counterpoint-safe"
-                    and (detected_form == "sonata" or is_keyboard_like_source(desc))
-                )
-                if apply_texture_filter:
-                    kept: list[VoiceComposition] = []
-                    accompaniment_like: list[tuple[float, VoiceComposition]] = []
-                    for comp in extracted:
-                        if is_accompaniment_texture_like_comp(comp):
-                            sev = accompaniment_texture_severity_comp(comp)
-                            accompaniment_like.append((sev, comp))
-                            continue
-                        kept.append(comp)
-                    # Keep at most one accompaniment-like sample per work, choosing
-                    # the least accompaniment-heavy candidate deterministically.
-                    if accompaniment_like:
-                        accompaniment_like.sort(key=lambda x: x[0])
-                        kept.append(accompaniment_like[0][1])
-                        skipped_by_sonata_policy += max(0, len(accompaniment_like) - 1)
-                    extracted = kept
-                for comp in extracted:
-                    comp.style = style
-                    compositions.append(comp)
-                    form_per_comp.append(detected_form)
-                    form_counter[detected_form] += 1
-                    voice_count_counter[detected_nv] += 1
-                progress.advance(task)
+    if not compositions:
+        console.print("[red]No voice groups extracted.[/red]")
+        sys.exit(1)
 
-        console.print(f"  Extracted {len(compositions)} voice groups from {len(works)} works")
-        if skipped_by_voice_cap:
-            console.print(f"  Skipped by source voice cap: {skipped_by_voice_cap}")
-        if skipped_by_sonata_policy:
-            console.print(f"  Skipped by sonata policy: {skipped_by_sonata_policy}")
-        console.print(f"  Form distribution: {dict(form_counter.most_common())}")
-        console.print(f"  Voice count distribution: {dict(voice_count_counter.most_common())}")
+    # Step 2: Augment (skip for scale-degree tokenizer)
+    if use_scale_degree:
+        console.print(f"\n[bold]Step 2:[/] Skipping key augmentation (scale-degree mode)")
+        items_to_tokenize = compositions
+        forms_to_tokenize = form_per_comp
+    else:
+        console.print(f"\n[bold]Step 2:[/] Augmenting to all 12 keys...")
+        items_to_tokenize = augment_to_all_keys(compositions)
+        # Replicate forms for each augmented copy (12 keys per original)
+        augment_factor = len(items_to_tokenize) // len(compositions) if compositions else 1
+        forms_to_tokenize = []
+        for f in form_per_comp:
+            forms_to_tokenize.extend([f] * augment_factor)
+        console.print(f"  Augmented to {len(items_to_tokenize)} compositions")
 
-        if not compositions:
-            console.print("[red]No voice groups extracted.[/red]")
-            sys.exit(1)
+    # Step 3: Tokenize
+    console.print(f"\n[bold]Step 3:[/] Tokenizing...")
+    if use_scale_degree:
+        from bach_gen.data.scale_degree_tokenizer import ScaleDegreeTokenizer
+        tokenizer = ScaleDegreeTokenizer()
+    else:
+        tokenizer = BachTokenizer()
 
-        # Step 3: Augment (skip for scale-degree tokenizer)
-        if use_scale_degree:
-            console.print(f"\n[bold]Step 3:[/] Skipping key augmentation (scale-degree mode)")
-            items_to_tokenize = compositions
-            forms_to_tokenize = form_per_comp
-        else:
-            console.print(f"\n[bold]Step 3:[/] Augmenting to all 12 keys...")
-            items_to_tokenize = augment_to_all_keys(compositions)
-            # Replicate forms for each augmented copy (12 keys per original)
-            augment_factor = len(items_to_tokenize) // len(compositions) if compositions else 1
-            forms_to_tokenize = []
-            for f in form_per_comp:
-                forms_to_tokenize.extend([f] * augment_factor)
-            console.print(f"  Augmented to {len(items_to_tokenize)} compositions")
+    sequences: list[list[int]] = []
+    piece_ids: list[str] = []
+    with Progress(
+        SpinnerColumn(), TextColumn("{task.description}"),
+        BarColumn(), TaskProgressColumn(), console=console,
+    ) as progress:
+        task = progress.add_task("Tokenizing", total=len(items_to_tokenize))
+        for i, item in enumerate(items_to_tokenize):
+            item_form = forms_to_tokenize[i] if i < len(forms_to_tokenize) else "chorale"
+            time_sig = item.time_signature if hasattr(item, "time_signature") else (4, 4)
+            num_bars = compute_measure_count(item.voices, time_sig)
 
-        # Step 4: Tokenize
-        console.print(f"\n[bold]Step 4:[/] Tokenizing...")
-        if use_scale_degree:
-            from bach_gen.data.scale_degree_tokenizer import ScaleDegreeTokenizer
-            tokenizer = ScaleDegreeTokenizer()
-        else:
-            tokenizer = BachTokenizer()
+            # Compute analysis labels for Phase 2 conditioning
+            from bach_gen.data.analysis import analyze_composition
+            labels = analyze_composition(item, time_sig)
 
-        sequences: list[list[int]] = []
-        piece_ids: list[str] = []
-        with Progress(
-            SpinnerColumn(), TextColumn("{task.description}"),
-            BarColumn(), TaskProgressColumn(), console=console,
-        ) as progress:
-            task = progress.add_task("Tokenizing", total=len(items_to_tokenize))
-            for i, item in enumerate(items_to_tokenize):
-                item_form = forms_to_tokenize[i] if i < len(forms_to_tokenize) else "chorale"
-                time_sig = item.time_signature if hasattr(item, "time_signature") else (4, 4)
-                num_bars = compute_measure_count(item.voices, time_sig)
+            tokens = tokenizer.encode(
+                item, form=item_form, length_bars=num_bars,
+                texture=labels["texture"], imitation=labels["imitation"],
+                harmonic_rhythm=labels["harmonic_rhythm"],
+                harmonic_tension=labels["harmonic_tension"],
+                chromaticism=labels["chromaticism"],
+            )
+            if len(tokens) >= 20:
+                sequences.append(tokens)
+                piece_ids.append(item.source)
 
-                # Compute analysis labels for Phase 2 conditioning
-                from bach_gen.data.analysis import analyze_composition
-                labels = analyze_composition(item, time_sig)
-
-                tokens = tokenizer.encode(
+            # Dual encoding: also produce sequential encoding
+            if not no_sequential:
+                tokens_seq = tokenizer.encode_sequential(
                     item, form=item_form, length_bars=num_bars,
                     texture=labels["texture"], imitation=labels["imitation"],
                     harmonic_rhythm=labels["harmonic_rhythm"],
                     harmonic_tension=labels["harmonic_tension"],
                     chromaticism=labels["chromaticism"],
                 )
-                if len(tokens) >= 20:
-                    sequences.append(tokens)
+                if len(tokens_seq) >= 20:
+                    sequences.append(tokens_seq)
                     piece_ids.append(item.source)
 
-                # Dual encoding: also produce sequential encoding
-                if not no_sequential:
-                    tokens_seq = tokenizer.encode_sequential(
-                        item, form=item_form, length_bars=num_bars,
-                        texture=labels["texture"], imitation=labels["imitation"],
-                        harmonic_rhythm=labels["harmonic_rhythm"],
-                        harmonic_tension=labels["harmonic_tension"],
-                        chromaticism=labels["chromaticism"],
-                    )
-                    if len(tokens_seq) >= 20:
-                        sequences.append(tokens_seq)
-                        piece_ids.append(item.source)
-
-                progress.advance(task)
-
-    elif num_voices == 2:
-        pairs: list[VoicePair] = []
-        with Progress(
-            SpinnerColumn(), TextColumn("{task.description}"),
-            BarColumn(), TaskProgressColumn(), console=console,
-        ) as progress:
-            task = progress.add_task("Extracting", total=len(works))
-            skipped_by_voice_cap = 0
-            skipped_by_sonata_policy = 0
-            for desc, score, style in works:
-                try:
-                    source_parts = len(list(score.parts))
-                except Exception:
-                    source_parts = 0
-                if source_parts > max_source_voices:
-                    skipped_by_voice_cap += 1
-                    progress.advance(task)
-                    continue
-                detected_form, _ = detect_form(score, desc, style)
-                extracted = extract_voice_pairs(
-                    score,
-                    source=desc,
-                    pair_strategy=pair_strategy,
-                    max_pairs=max_pairs_per_work,
-                )
-                apply_texture_filter = (
-                    sonata_policy == "counterpoint-safe"
-                    and (detected_form == "sonata" or is_keyboard_like_source(desc))
-                )
-                if apply_texture_filter:
-                    kept_pairs: list[VoicePair] = []
-                    accompaniment_like: list[tuple[float, VoicePair]] = []
-                    for pair in extracted:
-                        if is_accompaniment_texture_like_pair(pair):
-                            sev = accompaniment_texture_severity_pair(pair)
-                            accompaniment_like.append((sev, pair))
-                            continue
-                        kept_pairs.append(pair)
-                    if accompaniment_like:
-                        accompaniment_like.sort(key=lambda x: x[0])
-                        kept_pairs.append(accompaniment_like[0][1])
-                        skipped_by_sonata_policy += max(0, len(accompaniment_like) - 1)
-                    extracted = kept_pairs
-                for pair in extracted:
-                    pair.style = style
-                pairs.extend(extracted)
-                progress.advance(task)
-        console.print(f"  Extracted {len(pairs)} voice pairs from {len(works)} works")
-        if skipped_by_voice_cap:
-            console.print(f"  Skipped by source voice cap: {skipped_by_voice_cap}")
-        if skipped_by_sonata_policy:
-            console.print(f"  Skipped by sonata policy: {skipped_by_sonata_policy}")
-
-        if not pairs:
-            console.print("[red]No voice pairs extracted.[/red]")
-            sys.exit(1)
-
-        # Step 3: Augment (skip for scale-degree tokenizer)
-        if use_scale_degree:
-            console.print(f"\n[bold]Step 3:[/] Skipping key augmentation (scale-degree mode)")
-            items_to_tokenize = pairs
-        else:
-            console.print(f"\n[bold]Step 3:[/] Augmenting to all 12 keys...")
-            items_to_tokenize = augment_to_all_keys(pairs)
-            console.print(f"  Augmented to {len(items_to_tokenize)} pairs")
-
-        # Step 4: Tokenize
-        console.print(f"\n[bold]Step 4:[/] Tokenizing...")
-        if use_scale_degree:
-            from bach_gen.data.scale_degree_tokenizer import ScaleDegreeTokenizer
-            tokenizer = ScaleDegreeTokenizer()
-        else:
-            tokenizer = BachTokenizer()
-
-        sequences: list[list[int]] = []
-        piece_ids: list[str] = []
-        with Progress(
-            SpinnerColumn(), TextColumn("{task.description}"),
-            BarColumn(), TaskProgressColumn(), console=console,
-        ) as progress:
-            task = progress.add_task("Tokenizing", total=len(items_to_tokenize))
-            for item in items_to_tokenize:
-                # Compute measure count for length conditioning
-                time_sig = item.time_signature if hasattr(item, "time_signature") else (4, 4)
-                if isinstance(item, VoicePair):
-                    item_voices = [item.upper, item.lower]
-                else:
-                    item_voices = item.voices
-                num_bars = compute_measure_count(item_voices, time_sig)
-
-                # Compute analysis labels for Phase 2 conditioning
-                from bach_gen.data.analysis import analyze_composition
-                from bach_gen.data.extraction import VoiceComposition as VC
-                if isinstance(item, VoicePair):
-                    analysis_comp = VC.from_voice_pair(item)
-                else:
-                    analysis_comp = item
-                labels = analyze_composition(analysis_comp, time_sig)
-
-                tokens = tokenizer.encode(
-                    item, form=mode, length_bars=num_bars,
-                    texture=labels["texture"], imitation=labels["imitation"],
-                    harmonic_rhythm=labels["harmonic_rhythm"],
-                    harmonic_tension=labels["harmonic_tension"],
-                    chromaticism=labels["chromaticism"],
-                )
-                if len(tokens) >= 20:
-                    sequences.append(tokens)
-                    piece_ids.append(item.source)
-
-                # Dual encoding: also produce sequential encoding
-                if not no_sequential:
-                    tokens_seq = tokenizer.encode_sequential(
-                        item, form=mode, length_bars=num_bars,
-                        texture=labels["texture"], imitation=labels["imitation"],
-                        harmonic_rhythm=labels["harmonic_rhythm"],
-                        harmonic_tension=labels["harmonic_tension"],
-                        chromaticism=labels["chromaticism"],
-                    )
-                    if len(tokens_seq) >= 20:
-                        sequences.append(tokens_seq)
-                        piece_ids.append(item.source)
-
-                progress.advance(task)
-    else:
-        compositions: list[VoiceComposition] = []
-        with Progress(
-            SpinnerColumn(), TextColumn("{task.description}"),
-            BarColumn(), TaskProgressColumn(), console=console,
-        ) as progress:
-            task = progress.add_task("Extracting", total=len(works))
-            skipped_by_voice_cap = 0
-            skipped_by_sonata_policy = 0
-            for desc, score, style in works:
-                try:
-                    source_parts = len(list(score.parts))
-                except Exception:
-                    source_parts = 0
-                if source_parts > max_source_voices:
-                    skipped_by_voice_cap += 1
-                    progress.advance(task)
-                    continue
-                extracted = extract_voice_groups(score, num_voices=num_voices, source=desc, form=mode)
-                if max_groups_per_work > 0:
-                    extracted = extracted[:max_groups_per_work]
-                apply_texture_filter = (
-                    sonata_policy == "counterpoint-safe"
-                    and (mode == "sonata" or is_keyboard_like_source(desc))
-                )
-                if apply_texture_filter:
-                    kept_groups: list[VoiceComposition] = []
-                    accompaniment_like: list[tuple[float, VoiceComposition]] = []
-                    for comp in extracted:
-                        if is_accompaniment_texture_like_comp(comp):
-                            sev = accompaniment_texture_severity_comp(comp)
-                            accompaniment_like.append((sev, comp))
-                            continue
-                        kept_groups.append(comp)
-                    if accompaniment_like:
-                        accompaniment_like.sort(key=lambda x: x[0])
-                        kept_groups.append(accompaniment_like[0][1])
-                        skipped_by_sonata_policy += max(0, len(accompaniment_like) - 1)
-                    extracted = kept_groups
-                for comp in extracted:
-                    comp.style = style
-                compositions.extend(extracted)
-                progress.advance(task)
-        console.print(f"  Extracted {len(compositions)} {num_voices}-voice groups from {len(works)} works")
-        if skipped_by_voice_cap:
-            console.print(f"  Skipped by source voice cap: {skipped_by_voice_cap}")
-        if skipped_by_sonata_policy:
-            console.print(f"  Skipped by sonata policy: {skipped_by_sonata_policy}")
-
-        if not compositions:
-            console.print(f"[red]No {num_voices}-voice groups extracted.[/red]")
-            sys.exit(1)
-
-        # Step 3: Augment (skip for scale-degree tokenizer)
-        if use_scale_degree:
-            console.print(f"\n[bold]Step 3:[/] Skipping key augmentation (scale-degree mode)")
-            items_to_tokenize = compositions
-        else:
-            console.print(f"\n[bold]Step 3:[/] Augmenting to all 12 keys...")
-            items_to_tokenize = augment_to_all_keys(compositions)
-            console.print(f"  Augmented to {len(items_to_tokenize)} compositions")
-
-        # Step 4: Tokenize
-        console.print(f"\n[bold]Step 4:[/] Tokenizing...")
-        if use_scale_degree:
-            from bach_gen.data.scale_degree_tokenizer import ScaleDegreeTokenizer
-            tokenizer = ScaleDegreeTokenizer()
-        else:
-            tokenizer = BachTokenizer()
-
-        sequences: list[list[int]] = []
-        piece_ids: list[str] = []
-        with Progress(
-            SpinnerColumn(), TextColumn("{task.description}"),
-            BarColumn(), TaskProgressColumn(), console=console,
-        ) as progress:
-            task = progress.add_task("Tokenizing", total=len(items_to_tokenize))
-            for item in items_to_tokenize:
-                # Compute measure count for length conditioning
-                time_sig = item.time_signature if hasattr(item, "time_signature") else (4, 4)
-                num_bars = compute_measure_count(item.voices, time_sig)
-
-                # Compute analysis labels for Phase 2 conditioning
-                from bach_gen.data.analysis import analyze_composition
-                labels = analyze_composition(item, time_sig)
-
-                tokens = tokenizer.encode(
-                    item, form=mode, length_bars=num_bars,
-                    texture=labels["texture"], imitation=labels["imitation"],
-                    harmonic_rhythm=labels["harmonic_rhythm"],
-                    harmonic_tension=labels["harmonic_tension"],
-                    chromaticism=labels["chromaticism"],
-                )
-                if len(tokens) >= 20:
-                    sequences.append(tokens)
-                    piece_ids.append(item.source)
-
-                # Dual encoding: also produce sequential encoding
-                if not no_sequential:
-                    tokens_seq = tokenizer.encode_sequential(
-                        item, form=mode, length_bars=num_bars,
-                        texture=labels["texture"], imitation=labels["imitation"],
-                        harmonic_rhythm=labels["harmonic_rhythm"],
-                        harmonic_tension=labels["harmonic_tension"],
-                        chromaticism=labels["chromaticism"],
-                    )
-                    if len(tokens_seq) >= 20:
-                        sequences.append(tokens_seq)
-                        piece_ids.append(item.source)
-
-                progress.advance(task)
+            progress.advance(task)
 
     console.print(f"  Tokenized {len(sequences)} sequences")
     console.print(f"  Vocabulary size: {tokenizer.vocab_size}")
@@ -664,8 +422,8 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
     console.print(f"  Sequence lengths: min={min(lengths)}, max={max(lengths)}, "
                   f"mean={sum(lengths)/len(lengths):.0f}")
 
-    # Step 5: Save
-    console.print(f"\n[bold]Step 5:[/] Saving data...")
+    # Step 4: Save
+    console.print(f"\n[bold]Step 4:[/] Saving data...")
 
     tokenizer.save(out_dir / "tokenizer.json")
     with open(out_dir / "sequences.json", "w") as f:

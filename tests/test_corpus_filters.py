@@ -57,6 +57,8 @@ def test_prepare_data_composer_filter_all_disables_filter(tmp_path: Path):
 
 
 def test_get_midi_files_prefers_curated_kunstderfuge_bucket(tmp_path: Path):
+    from bach_gen.data.extraction import VoiceComposition
+
     midi_root = tmp_path / "midi"
     raw_kdf = midi_root / "kunstderfuge" / "bach" / "raw.mid"
     curated_kdf = (
@@ -68,13 +70,22 @@ def test_get_midi_files_prefers_curated_kunstderfuge_bucket(tmp_path: Path):
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_bytes(b"")
 
-    with patch("music21.converter.parse", side_effect=lambda *_: _two_part_score()):
+    def fake_extract(score, num_voices, source="", form=None):
+        comp = VoiceComposition(
+            voices=[[(0, 480, 60)], [(0, 480, 48)]],
+            key_root=0, key_mode="major", source=source, style="",
+        )
+        return [comp]
+
+    with patch("music21.converter.parse", side_effect=lambda *_: _two_part_score()), \
+         patch("bach_gen.data.extraction.detect_form", return_value=("chorale", 2)), \
+         patch("bach_gen.data.extraction.extract_voice_groups", side_effect=fake_extract):
         works = get_midi_files(midi_root)
 
-    descs = {desc for desc, _, _ in works}
-    assert "kunstderfuge/bach/raw" not in descs
-    assert "kunstderfuge/_voice_buckets/dataset_2to4/bach/curated" in descs
-    assert "kernscores/bach/kernscores" in descs
+    sources = {comp.source for comp, _ in works}
+    assert "kunstderfuge/bach/raw" not in sources
+    assert "kunstderfuge/_voice_buckets/dataset_2to4/bach/curated" in sources
+    assert "kernscores/bach/kernscores" in sources
 
 
 def test_composer_era_mapping_matches_project_policy():

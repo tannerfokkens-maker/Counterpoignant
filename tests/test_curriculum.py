@@ -18,6 +18,7 @@ import torch
 
 from bach_gen.data.corpus import get_all_works, get_all_bach_works
 from bach_gen.data.dataset import BachDataset
+from bach_gen.data.extraction import VoiceComposition
 from bach_gen.model.config import ModelConfig
 from bach_gen.model.architecture import BachTransformer
 from bach_gen.model.trainer import Trainer
@@ -28,10 +29,15 @@ from bach_gen.model.trainer import Trainer
 # ---------------------------------------------------------------------------
 
 def _make_fake_works(styles: list[str]):
-    """Return list of (desc, mock_score, style) tuples."""
+    """Return list of (VoiceComposition, form) tuples."""
     results = []
     for i, style in enumerate(styles):
-        results.append((f"work_{i}", MagicMock(), style))
+        comp = VoiceComposition(
+            voices=[[(0, 480, 60)], [(0, 480, 48)]],
+            key_root=0, key_mode="major",
+            source=f"work_{i}", style=style,
+        )
+        results.append((comp, "chorale"))
     return results
 
 
@@ -88,7 +94,7 @@ class TestGetAllWorks:
         mock_midi.return_value = _make_fake_works(["baroque", "renaissance", "classical"])
 
         works = get_all_works(composer_filter=["bach"])
-        styles = [s for _, _, s in works]
+        styles = [comp.style for comp, _ in works]
         assert all(s == "bach" for s in styles)
         assert len(works) == 3
 
@@ -103,7 +109,7 @@ class TestGetAllWorks:
 
         works = get_all_works(composer_filter=["baroque"])
         assert len(works) == 1
-        assert works[0][2] == "baroque"
+        assert works[0][0].style == "baroque"
 
     @patch("bach_gen.data.corpus.get_midi_files")
     @patch("bach_gen.data.corpus._load_by_bwv")
@@ -115,7 +121,7 @@ class TestGetAllWorks:
         mock_midi.return_value = _make_fake_works(["baroque", "renaissance", "classical"])
 
         works = get_all_works(composer_filter=["bach", "baroque"])
-        styles = {s for _, _, s in works}
+        styles = {comp.style for comp, _ in works}
         assert styles == {"bach", "baroque"}
         assert len(works) == 2
 
@@ -144,7 +150,7 @@ class TestGetAllWorks:
         works = get_all_works(composer_filter=["buxtehude"])
         # buxtehude maps to 'baroque', so both baroque works should match
         assert len(works) == 2
-        assert all(s == "baroque" for _, _, s in works)
+        assert all(comp.style == "baroque" for comp, _ in works)
 
     @patch("bach_gen.data.corpus.get_midi_files")
     @patch("bach_gen.data.corpus._load_by_bwv")

@@ -111,13 +111,13 @@ def score_composition(
 
     # Composite
     composite = (
-        vl_score * w.get("voice_leading", 0.25)
-        + stat_score * w.get("statistical", 0.15)
-        + struct_score * w.get("structural", 0.15)
+        vl_score * w.get("voice_leading", 0.10)
+        + stat_score * w.get("statistical", 0.20)
+        + struct_score * w.get("structural", 0.25)
         + info_score * w.get("information", 0.15)
-        + cp_score * w.get("contrapuntal", 0.10)
-        + comp_score * w.get("completeness", 0.10)
-        + tr_score * w.get("thematic_recall", 0.10)
+        + cp_score * w.get("contrapuntal", 0.08)
+        + comp_score * w.get("completeness", 0.07)
+        + tr_score * w.get("thematic_recall", 0.15)
     )
 
     return ScoreBreakdown(
