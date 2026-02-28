@@ -264,6 +264,34 @@ class TestResetForFinetuning:
         trainer.reset_for_finetuning(_make_dataset(30), None, lr=1e-4)
         assert trainer.val_dataset is None
 
+    def test_train_logs_category_losses_without_changing_objective(self, tmp_path):
+        config = ModelConfig(vocab_size=100, embed_dim=32, num_heads=2,
+                             num_layers=1, max_seq_len=64)
+        model = BachTransformer(config)
+
+        seqs = [[(i % 80) + 1 for i in range(40)] for _ in range(12)]
+        train_ds = BachDataset(seqs[:10], seq_len=64)
+        val_ds = BachDataset(seqs[10:], seq_len=64)
+
+        trainer = Trainer(
+            model=model,
+            train_dataset=train_ds,
+            val_dataset=val_ds,
+            lr=1e-4,
+            batch_size=2,
+            checkpoint_dir=tmp_path / "models",
+            device=torch.device("cpu"),
+            token_category_map=[0] * config.vocab_size,
+            token_category_names=["pitch"],
+        )
+
+        history = trainer.train(epochs=1, log_interval=1, val_interval=1)
+
+        assert "train_category_loss" in history
+        assert "val_category_loss" in history
+        assert history["train_category_loss"][0]["pitch"] is not None
+        assert history["val_category_loss"][0]["pitch"] is not None
+
 
 # ===========================================================================
 # 3. cli.py — CLI option parsing

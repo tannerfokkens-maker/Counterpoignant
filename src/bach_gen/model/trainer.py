@@ -9,6 +9,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from bach_gen.model.config import ModelConfig
@@ -50,6 +51,8 @@ class Trainer:
         device: torch.device | None = None,
         accumulation_steps: int = 1,
         fp16: bool = False,
+        token_category_map: list[int] | None = None,
+        token_category_names: list[str] | None = None,
     ):
         self.device = device or get_device()
         self.model = model.to(self.device)
@@ -83,6 +86,19 @@ class Trainer:
 
         self.best_val_loss = float("inf")
         self.epoch = 0
+
+        # Optional token-category monitoring (pure logging, not used for gradients).
+        self.token_category_names = token_category_names or []
+        self._token_category_map = None
+        if token_category_map is not None and self.token_category_names:
+            if len(token_category_map) != self.model.config.vocab_size:
+                raise ValueError(
+                    "token_category_map length must match vocab size: "
+                    f"{len(token_category_map)} != {self.model.config.vocab_size}"
+                )
+            self._token_category_map = torch.tensor(
+                token_category_map, dtype=torch.long, device=self.device
+            )
 
     def reset_for_finetuning(
         self,
@@ -185,6 +201,9 @@ class Trainer:
             scheduler.step()
 
         history = {"train_loss": [], "val_loss": [], "lr": []}
+        if self._token_category_map is not None:
+            history["train_category_loss"] = []
+            history["val_category_loss"] = []
 
         effective_batch = self.batch_size * self.accumulation_steps
         logger.info(f"Training on {self.device} for {epochs} epochs (starting at epoch {start_epoch})")
@@ -211,16 +230,21 @@ class Trainer:
 
         for epoch in range(start_epoch, epochs + 1):
             self.epoch = epoch
-            train_loss = self._train_epoch(train_loader)
+            train_loss, train_cat_losses = self._train_epoch(train_loader)
             history["train_loss"].append(train_loss)
             history["lr"].append(scheduler.get_last_lr()[0])
+            if "train_category_loss" in history:
+                history["train_category_loss"].append(train_cat_losses)
 
             scheduler.step()
 
             val_loss = None
+            val_cat_losses: dict[str, float | None] = {}
             if val_loader and epoch % val_interval == 0:
-                val_loss = self._validate(val_loader)
+                val_loss, val_cat_losses = self._validate(val_loader)
                 history["val_loss"].append(val_loss)
+                if "val_category_loss" in history:
+                    history["val_category_loss"].append(val_cat_losses)
 
                 if val_loss < (self.best_val_loss - min_delta):
                     self.best_val_loss = val_loss
@@ -236,8 +260,12 @@ class Trainer:
 
             if epoch % log_interval == 0:
                 msg = f"Epoch {epoch}/{epochs} | train_loss={train_loss:.4f}"
+                if train_cat_losses:
+                    msg += self._format_category_losses(train_cat_losses, label="train_cat")
                 if val_loss is not None:
                     msg += f" | val_loss={val_loss:.4f}"
+                    if val_cat_losses:
+                        msg += self._format_category_losses(val_cat_losses, label="val_cat")
                 msg += f" | lr={scheduler.get_last_lr()[0]:.6f}"
                 logger.info(msg)
 
@@ -262,11 +290,12 @@ class Trainer:
 
         return history
 
-    def _train_epoch(self, loader: DataLoader, use_rope: bool = True) -> float:
+    def _train_epoch(self, loader: DataLoader, use_rope: bool = True) -> tuple[float, dict[str, float | None]]:
         """Train for one epoch."""
         self.model.train()
         total_loss = 0.0
         n_batches = 0
+        category_sums, category_counts = self._init_category_accumulators()
 
         self.optimizer.zero_grad()
 
@@ -285,6 +314,8 @@ class Trainer:
                     labels.reshape(-1),
                 )
 
+            self._accumulate_category_losses(logits, labels, category_sums, category_counts)
+
             # Scale loss for accumulation
             scaled_loss = loss / self.accumulation_steps
             self.scaler.scale(scaled_loss).backward()
@@ -302,14 +333,15 @@ class Trainer:
                 self.scaler.update()
                 self.optimizer.zero_grad()
 
-        return total_loss / max(n_batches, 1)
+        return total_loss / max(n_batches, 1), self._finalize_category_losses(category_sums, category_counts)
 
     @torch.no_grad()
-    def _validate(self, loader: DataLoader, use_rope: bool = True) -> float:
+    def _validate(self, loader: DataLoader, use_rope: bool = True) -> tuple[float, dict[str, float | None]]:
         """Validate on held-out data."""
         self.model.eval()
         total_loss = 0.0
         n_batches = 0
+        category_sums, category_counts = self._init_category_accumulators()
 
         for batch in loader:
             input_ids = batch["input_ids"].to(self.device)
@@ -324,10 +356,12 @@ class Trainer:
                     labels.reshape(-1),
                 )
 
+            self._accumulate_category_losses(logits, labels, category_sums, category_counts)
+
             total_loss += loss.item()
             n_batches += 1
 
-        return total_loss / max(n_batches, 1)
+        return total_loss / max(n_batches, 1), self._finalize_category_losses(category_sums, category_counts)
 
     def recalibrate_drope(
         self,
@@ -395,6 +429,9 @@ class Trainer:
         )
 
         history = {"train_loss": [], "val_loss": [], "lr": []}
+        if self._token_category_map is not None:
+            history["train_category_loss"] = []
+            history["val_category_loss"] = []
 
         logger.info(
             f"DroPE recalibration: {epochs} epochs, lr={lr}, "
@@ -408,18 +445,25 @@ class Trainer:
 
         for epoch in range(1, epochs + 1):
             self.epoch = epoch
-            train_loss = self._train_epoch(train_loader, use_rope=False)
+            train_loss, train_cat_losses = self._train_epoch(train_loader, use_rope=False)
             history["train_loss"].append(train_loss)
             history["lr"].append(scheduler.get_last_lr()[0])
+            if "train_category_loss" in history:
+                history["train_category_loss"].append(train_cat_losses)
 
             scheduler.step()
 
             val_loss = None
+            val_cat_losses: dict[str, float | None] = {}
             if val_loader:
-                val_loss = self._validate(val_loader, use_rope=False)
+                val_loss, val_cat_losses = self._validate(val_loader, use_rope=False)
                 history["val_loss"].append(val_loss)
+                if "val_category_loss" in history:
+                    history["val_category_loss"].append(val_cat_losses)
             else:
                 history["val_loss"].append(None)
+                if "val_category_loss" in history:
+                    history["val_category_loss"].append({})
 
             metric = val_loss if val_loss is not None else train_loss
             if metric < (best_metric - min_delta):
@@ -432,8 +476,12 @@ class Trainer:
                 bad_epochs += 1
 
             msg = f"[DroPE] Epoch {epoch}/{epochs} | train_loss={train_loss:.4f}"
+            if train_cat_losses:
+                msg += self._format_category_losses(train_cat_losses, label="train_cat")
             if val_loss is not None:
                 msg += f" | val_loss={val_loss:.4f}"
+                if val_cat_losses:
+                    msg += self._format_category_losses(val_cat_losses, label="val_cat")
             logger.info(msg)
 
             self._save_checkpoint("drope_latest.pt")
@@ -460,6 +508,72 @@ class Trainer:
             f"stop_reason={stop_reason})"
         )
         return history
+
+    def _init_category_accumulators(self):
+        if self._token_category_map is None or not self.token_category_names:
+            return None, None
+        n = len(self.token_category_names)
+        return torch.zeros(n, dtype=torch.float64), torch.zeros(n, dtype=torch.long)
+
+    def _accumulate_category_losses(self, logits, labels, sums, counts) -> None:
+        if sums is None or counts is None or self._token_category_map is None:
+            return
+
+        with torch.no_grad():
+            flat_labels = labels.reshape(-1)
+            valid_mask = flat_labels != self.criterion.ignore_index
+            if not torch.any(valid_mask):
+                return
+
+            flat_logits = logits.detach().reshape(-1, logits.size(-1)).float()
+            per_token_losses = F.cross_entropy(
+                flat_logits,
+                flat_labels,
+                ignore_index=self.criterion.ignore_index,
+                label_smoothing=self.criterion.label_smoothing,
+                reduction="none",
+            )
+
+            valid_labels = flat_labels[valid_mask]
+            valid_losses = per_token_losses[valid_mask]
+            category_idx = self._token_category_map[valid_labels]
+
+            # Use CPU for bincount compatibility across devices (e.g., MPS).
+            category_idx = category_idx.to("cpu")
+            valid_losses = valid_losses.to("cpu", dtype=torch.float64)
+
+            batch_sums = torch.bincount(
+                category_idx,
+                weights=valid_losses,
+                minlength=len(self.token_category_names),
+            )
+            batch_counts = torch.bincount(
+                category_idx,
+                minlength=len(self.token_category_names),
+            ).to(torch.long)
+
+            sums += batch_sums
+            counts += batch_counts
+
+    def _finalize_category_losses(self, sums, counts) -> dict[str, float | None]:
+        if sums is None or counts is None:
+            return {}
+
+        result: dict[str, float | None] = {}
+        for i, name in enumerate(self.token_category_names):
+            count = int(counts[i].item())
+            result[name] = (float(sums[i].item()) / count) if count > 0 else None
+        return result
+
+    def _format_category_losses(self, losses: dict[str, float | None], label: str) -> str:
+        parts = []
+        for name in self.token_category_names:
+            value = losses.get(name)
+            if value is None:
+                parts.append(f"{name}=n/a")
+            else:
+                parts.append(f"{name}={value:.4f}")
+        return f" | {label}[{', '.join(parts)}]"
 
     def _save_checkpoint(self, filename: str) -> None:
         """Save model checkpoint."""

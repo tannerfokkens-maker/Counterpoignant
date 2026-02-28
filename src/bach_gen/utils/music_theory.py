@@ -7,6 +7,8 @@ from typing import Optional
 
 import numpy as np
 
+from bach_gen.utils.constants import KEY_NAMES
+
 # Pitch class names (sharps)
 PC_NAMES_SHARP = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 # Pitch class names (flats)
@@ -137,7 +139,20 @@ def get_key_signature_name(root_pc: int, mode: str) -> str:
     name = pc_to_note_name(root_pc, prefer_flat=True)
     # Normalize for token names
     name = name.replace("#", "s").replace("b", "b")
-    return f"{name}_{mode}"
+    key_name = f"{name}_{mode}"
+
+    # Ensure output always matches tokenizer key vocabulary spellings.
+    enharmonic_aliases = {
+        "Db_minor": "Cs_minor",
+        "Gb_major": "Fs_major",
+        "Gb_minor": "Fs_minor",
+        "Ab_minor": "Gs_minor",
+    }
+    key_name = enharmonic_aliases.get(key_name, key_name)
+
+    if key_name not in KEY_NAMES:
+        raise ValueError(f"Unsupported key token name '{key_name}' for root={root_pc}, mode={mode}")
+    return key_name
 
 
 def midi_to_pc(midi_note: int) -> int:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import click
@@ -20,6 +21,7 @@ from bach_gen.utils.constants import (
 )
 
 console = Console()
+logger = logging.getLogger(__name__)
 
 # Paths
 DATA_DIR = Path("data")
@@ -48,14 +50,17 @@ def chunk_sequences(
     max_seq_len: int,
     stride_fraction: float = 0.75,
     bos_token: int = 1,
+    tokenizer=None,
     piece_ids: list[str] | None = None,
 ) -> tuple[list[list[int]], list[str]]:
     """Split long sequences into overlapping chunks.
 
     - Sequences at or under max_seq_len are kept as-is.
     - Longer sequences are split into windows of max_seq_len with overlap.
-    - Each chunk after the first gets BOS prepended so the model always sees
-      a valid start token.
+    - When a tokenizer is provided, each chunk preserves the full conditioning
+      prefix through the KEY token so continuation windows still carry style/
+      form/mode/analysis metadata.
+    - Fallback behavior (no tokenizer): each continuation chunk is BOS-prefixed.
     - stride = int(max_seq_len * stride_fraction), so 0.75 means 512 tokens
       of overlap on a 2048 window.
 
@@ -72,22 +77,39 @@ def chunk_sequences(
             result.append(seq)
             result_ids.append(pid)
         else:
+            prefix_end = -1
+            if tokenizer is not None and hasattr(tokenizer, "token_to_name"):
+                for i, tok in enumerate(seq):
+                    name = tokenizer.token_to_name.get(tok, "")
+                    if name.startswith("KEY_"):
+                        prefix_end = i
+                        break
+
+            # Preferred path: chunk the event body while preserving conditioning.
+            if 0 <= prefix_end < (max_seq_len - 1):
+                prefix = seq[:prefix_end + 1]
+                body = seq[prefix_end + 1:]
+                body_window = max_seq_len - len(prefix)
+                body_stride = max(1, int(body_window * stride_fraction))
+                start = 0
+                while start < len(body):
+                    chunk = prefix + body[start:start + body_window]
+                    if len(chunk) >= max_seq_len // 4:
+                        result.append(chunk)
+                        result_ids.append(pid)
+                    start += body_stride
+                continue
+
+            # Fallback: legacy BOS-prefixed continuation chunking.
             start = 0
             while start < len(seq):
                 end = start + max_seq_len
                 chunk = seq[start:end]
-
-                # Prepend BOS to continuation chunks so the model
-                # always sees a valid sequence start
                 if start > 0:
                     chunk = [bos_token] + chunk[:max_seq_len - 1]
-
-                # Only keep chunks that are at least 25% of max_seq_len
-                # to avoid tiny tail fragments
                 if len(chunk) >= max_seq_len // 4:
                     result.append(chunk)
                     result_ids.append(pid)
-
                 start += stride
 
     return result, result_ids
@@ -130,6 +152,164 @@ def _print_conditioning_histograms(sequences: list[list[int]], tokenizer) -> Non
             console.print(f"    {cat_name}: {', '.join(parts)}")
         else:
             console.print(f"    {cat_name}: (none)")
+
+
+def _composition_signature(comp) -> tuple:
+    """Canonical representation of decoded musical content."""
+    return (
+        comp.key_root,
+        comp.key_mode,
+        tuple(tuple((start, dur, pitch) for start, dur, pitch in voice) for voice in comp.voices),
+    )
+
+
+def _infer_roundtrip_settings(seq: list[int], tokenizer, default_form: str) -> tuple[str, str]:
+    """Infer form and encoding mode from sequence prefix."""
+    form = default_form
+    encoding_mode = "interleaved"
+    for tok in seq[:64]:
+        name = tokenizer.token_to_name.get(tok, "")
+        if name.startswith("FORM_"):
+            form = name[5:].lower()
+        elif name == "ENCODE_SEQUENTIAL":
+            encoding_mode = "sequential"
+        elif name == "ENCODE_INTERLEAVED":
+            encoding_mode = "interleaved"
+        elif name.startswith("KEY_"):
+            break
+    return form, encoding_mode
+
+
+def _build_token_category_map(tokenizer) -> tuple[list[int], list[str]]:
+    """Build token_id -> category index mapping for monitoring losses."""
+    categories = [
+        "pitch",
+        "octave",
+        "duration",
+        "timing",
+        "structure",
+        "conditioning",
+        "other",
+    ]
+    cat_to_idx = {name: i for i, name in enumerate(categories)}
+    other_idx = cat_to_idx["other"]
+
+    vocab_size = int(getattr(tokenizer, "vocab_size", 0) or 0)
+    if vocab_size <= 0:
+        return [], categories
+
+    token_to_name = getattr(tokenizer, "token_to_name", {})
+    token_map = [other_idx] * vocab_size
+    if not isinstance(token_to_name, dict):
+        return token_map, categories
+
+    conditioning_prefixes = (
+        "STYLE_",
+        "FORM_",
+        "MODE_",
+        "LENGTH_",
+        "METER_",
+        "TEXTURE_",
+        "IMITATION_",
+        "HARMONIC_RHYTHM_",
+        "HARMONIC_TENSION_",
+        "CHROMATICISM_",
+        "ENCODE_",
+        "KEY_",
+    )
+
+    for tok, name in token_to_name.items():
+        try:
+            tok_id = int(tok)
+        except (TypeError, ValueError):
+            continue
+        if tok_id < 0 or tok_id >= vocab_size or not isinstance(name, str):
+            continue
+
+        if name.startswith("DEG_") or name in ("SHARP", "FLAT") or name.startswith("Pitch_"):
+            cat_name = "pitch"
+        elif name.startswith("OCT_"):
+            cat_name = "octave"
+        elif name.startswith("Dur_"):
+            cat_name = "duration"
+        elif name.startswith("TimeShift_"):
+            cat_name = "timing"
+        elif (
+            name == "BAR"
+            or name.startswith("BEAT_")
+            or name.startswith("VOICE_")
+            or name in ("VOICE_SEP", "SUBJECT_START", "SUBJECT_END")
+        ):
+            cat_name = "structure"
+        elif name.startswith(conditioning_prefixes):
+            cat_name = "conditioning"
+        else:
+            cat_name = "other"
+
+        token_map[tok_id] = cat_to_idx[cat_name]
+
+    return token_map, categories
+
+
+def _tokenize_items(
+    items: list,
+    forms: list[str],
+    tokenizer,
+    no_sequential: bool,
+) -> tuple[list[list[int]], list[str]]:
+    """Tokenize a batch of compositions with optional dual encoding."""
+    from bach_gen.data.analysis import analyze_composition
+
+    sequences: list[list[int]] = []
+    piece_ids: list[str] = []
+
+    for i, item in enumerate(items):
+        item_form = forms[i] if i < len(forms) else "chorale"
+        time_sig = item.time_signature if hasattr(item, "time_signature") else (4, 4)
+        num_bars = compute_measure_count(item.voices, time_sig)
+
+        labels = analyze_composition(item, time_sig)
+
+        tokens = tokenizer.encode(
+            item, form=item_form, length_bars=num_bars,
+            texture=labels["texture"], imitation=labels["imitation"],
+            harmonic_rhythm=labels["harmonic_rhythm"],
+            harmonic_tension=labels["harmonic_tension"],
+            chromaticism=labels["chromaticism"],
+        )
+        if len(tokens) >= 20:
+            sequences.append(tokens)
+            piece_ids.append(item.source)
+
+        if not no_sequential:
+            tokens_seq = tokenizer.encode_sequential(
+                item, form=item_form, length_bars=num_bars,
+                texture=labels["texture"], imitation=labels["imitation"],
+                harmonic_rhythm=labels["harmonic_rhythm"],
+                harmonic_tension=labels["harmonic_tension"],
+                chromaticism=labels["chromaticism"],
+            )
+            if len(tokens_seq) >= 20:
+                sequences.append(tokens_seq)
+                piece_ids.append(item.source)
+
+    return sequences, piece_ids
+
+
+def _tokenize_batch_task(task: tuple[int, list, list[str], str, bool]) -> tuple[int, list[list[int]], list[str], int]:
+    """Worker entrypoint for parallel Step-3 tokenization."""
+    batch_idx, items, forms, tokenizer_type, no_sequential = task
+
+    from bach_gen.data.tokenizer import BachTokenizer
+
+    if tokenizer_type == "scale-degree":
+        from bach_gen.data.scale_degree_tokenizer import ScaleDegreeTokenizer
+        tokenizer = ScaleDegreeTokenizer()
+    else:
+        tokenizer = BachTokenizer()
+
+    seqs, pids = _tokenize_items(items, forms, tokenizer, no_sequential)
+    return batch_idx, seqs, pids, len(items)
 
 
 @cli.command()
@@ -329,45 +509,65 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
 
     sequences: list[list[int]] = []
     piece_ids: list[str] = []
-    with Progress(
-        SpinnerColumn(), TextColumn("{task.description}"),
-        BarColumn(), TaskProgressColumn(), console=console,
-    ) as progress:
-        task = progress.add_task("Tokenizing", total=len(items_to_tokenize))
-        for i, item in enumerate(items_to_tokenize):
-            item_form = forms_to_tokenize[i] if i < len(forms_to_tokenize) else "chorale"
-            time_sig = item.time_signature if hasattr(item, "time_signature") else (4, 4)
-            num_bars = compute_measure_count(item.voices, time_sig)
-
-            # Compute analysis labels for Phase 2 conditioning
-            from bach_gen.data.analysis import analyze_composition
-            labels = analyze_composition(item, time_sig)
-
-            tokens = tokenizer.encode(
-                item, form=item_form, length_bars=num_bars,
-                texture=labels["texture"], imitation=labels["imitation"],
-                harmonic_rhythm=labels["harmonic_rhythm"],
-                harmonic_tension=labels["harmonic_tension"],
-                chromaticism=labels["chromaticism"],
+    tokenize_workers = max(1, effective_workers)
+    target_batches = max(1, tokenize_workers * 8)
+    batch_size = max(1, (len(items_to_tokenize) + target_batches - 1) // target_batches)
+    batch_tasks: list[tuple[int, list, list[str], str, bool]] = []
+    for batch_idx, start in enumerate(range(0, len(items_to_tokenize), batch_size)):
+        end = start + batch_size
+        batch_tasks.append(
+            (
+                batch_idx,
+                items_to_tokenize[start:end],
+                forms_to_tokenize[start:end],
+                tokenizer_type,
+                no_sequential,
             )
-            if len(tokens) >= 20:
-                sequences.append(tokens)
-                piece_ids.append(item.source)
+        )
 
-            # Dual encoding: also produce sequential encoding
-            if not no_sequential:
-                tokens_seq = tokenizer.encode_sequential(
-                    item, form=item_form, length_bars=num_bars,
-                    texture=labels["texture"], imitation=labels["imitation"],
-                    harmonic_rhythm=labels["harmonic_rhythm"],
-                    harmonic_tension=labels["harmonic_tension"],
-                    chromaticism=labels["chromaticism"],
-                )
-                if len(tokens_seq) >= 20:
-                    sequences.append(tokens_seq)
-                    piece_ids.append(item.source)
+    used_parallel_tokenization = False
+    if tokenize_workers > 1 and len(batch_tasks) > 1:
+        console.print(f"  Tokenization workers: {tokenize_workers}")
+        try:
+            with Progress(
+                SpinnerColumn(), TextColumn("{task.description}"),
+                BarColumn(), TaskProgressColumn(), console=console,
+            ) as progress:
+                task = progress.add_task("Tokenizing", total=len(items_to_tokenize))
+                batch_results: dict[int, tuple[list[list[int]], list[str]]] = {}
+                with ProcessPoolExecutor(max_workers=tokenize_workers) as executor:
+                    futures = {
+                        executor.submit(_tokenize_batch_task, bt): bt[0]
+                        for bt in batch_tasks
+                    }
+                    for future in as_completed(futures):
+                        batch_idx, batch_seqs, batch_ids, n_items = future.result()
+                        batch_results[batch_idx] = (batch_seqs, batch_ids)
+                        progress.advance(task, n_items)
 
-            progress.advance(task)
+            for batch_idx in range(len(batch_tasks)):
+                batch_seqs, batch_ids = batch_results[batch_idx]
+                sequences.extend(batch_seqs)
+                piece_ids.extend(batch_ids)
+            used_parallel_tokenization = True
+        except Exception as e:
+            logger.warning(
+                f"Step 3 tokenization: parallel processing failed ({e}); falling back to sequential"
+            )
+            sequences = []
+            piece_ids = []
+
+    if not used_parallel_tokenization:
+        with Progress(
+            SpinnerColumn(), TextColumn("{task.description}"),
+            BarColumn(), TaskProgressColumn(), console=console,
+        ) as progress:
+            task = progress.add_task("Tokenizing", total=len(items_to_tokenize))
+            for _, batch_items, batch_forms, _, _ in batch_tasks:
+                batch_seqs, batch_ids = _tokenize_items(batch_items, batch_forms, tokenizer, no_sequential)
+                sequences.extend(batch_seqs)
+                piece_ids.extend(batch_ids)
+                progress.advance(task, len(batch_items))
 
     console.print(f"  Tokenized {len(sequences)} sequences")
     console.print(f"  Vocabulary size: {tokenizer.vocab_size}")
@@ -410,7 +610,7 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
                 long_ids.append(pid)
         chunked, chunked_ids = chunk_sequences(
             long_seqs, max_seq_len, stride_fraction=0.75,
-            bos_token=tokenizer.BOS, piece_ids=long_ids,
+            bos_token=tokenizer.BOS, tokenizer=tokenizer, piece_ids=long_ids,
         )
         console.print(f"  Kept {len(short_seqs)} sequences under {max_seq_len} tokens")
         console.print(f"  Chunked {len(long_seqs)} long sequences into {len(chunked)} windows")
@@ -458,12 +658,21 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
     console.print(f"\n[bold]Verification:[/] Round-trip test...")
     test_seq = sequences[0]
     decoded = tokenizer.decode(test_seq)
-    roundtrip_form = "chorale" if is_all_mode else mode
-    re_encoded = tokenizer.encode(decoded, form=roundtrip_form)
+    default_form = "chorale" if is_all_mode else mode
+    roundtrip_form, encoding_mode = _infer_roundtrip_settings(test_seq, tokenizer, default_form)
+    if encoding_mode == "sequential" and hasattr(tokenizer, "encode_sequential"):
+        re_encoded = tokenizer.encode_sequential(decoded, form=roundtrip_form)
+    else:
+        re_encoded = tokenizer.encode(decoded, form=roundtrip_form)
+    re_decoded = tokenizer.decode(re_encoded)
+    is_equivalent = _composition_signature(decoded) == _composition_signature(re_decoded)
     voice_desc = ", ".join(f"v{i+1}={len(v)} notes" for i, v in enumerate(decoded.voices) if v)
     console.print(f"  Original: {len(test_seq)} tokens → Decoded: {voice_desc} "
                   f"→ Re-encoded: {len(re_encoded)} tokens")
-    console.print(f"  [green]Round-trip OK[/green]")
+    if is_equivalent:
+        console.print(f"  [green]Round-trip OK (musical content preserved)[/green]")
+    else:
+        console.print(f"  [red]Round-trip mismatch (decoded musical content changed)[/red]")
 
 
 @cli.command()
@@ -588,6 +797,7 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
         console.print(f"  [yellow]No piece_ids.json found — using random split (re-run prepare-data to fix)[/yellow]")
 
     tokenizer = load_tokenizer(train_data_dir / "tokenizer.json")
+    token_category_map, token_category_names = _build_token_category_map(tokenizer)
 
     def _filter_for_finetune_target(
         seqs: list[list[int]],
@@ -653,6 +863,8 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
         device=device,
         accumulation_steps=accumulation_steps,
         fp16=fp16,
+        token_category_map=token_category_map,
+        token_category_names=token_category_names,
     )
 
     if curriculum:
