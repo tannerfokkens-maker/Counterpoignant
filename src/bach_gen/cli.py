@@ -708,29 +708,44 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
 @click.option("--data-dir", default=None, type=click.Path(),
               help="Directory with prepared training data (default: data/)")
 @click.option("--curriculum", is_flag=True, default=False,
-              help="Two-phase training: pre-train on --data-dir, fine-tune on --finetune-data-dir")
+              help="Two-phase training: pre-train on --data-dir, fine-tune on --finetune-data-dir or --finetune style subset")
 @click.option("--pretrain-epochs", default=300, type=int,
               help="Epochs for pre-training phase (curriculum mode, default: 300)")
 @click.option("--finetune-data-dir", default="data/bach", type=click.Path(),
               help="Data directory for fine-tuning phase (default: data/bach)")
+@click.option("--finetune", "finetune_style",
+              type=str,
+              default=None,
+              help="Fine-tune subset from same --data-dir (style token or composer substring, e.g. 'bach' or 'beethoven')")
 @click.option("--finetune-lr", default=1e-4, type=float,
               help="Learning rate for fine-tuning phase (default: 1e-4)")
-@click.option("--drope", is_flag=True, default=False,
-              help="Enable DroPE recalibration after training (drop positional embeddings)")
+@click.option("--drope/--no-drope", default=True,
+              help="Enable/disable DroPE recalibration after training (default: enabled)")
 @click.option("--drope-epochs", default=10, type=int,
-              help="Number of DroPE recalibration epochs (default: 10)")
+              help="Maximum DroPE recalibration epochs (default: 10)")
 @click.option("--drope-lr", default=1e-3, type=float,
               help="Learning rate for DroPE recalibration (default: 1e-3)")
+@click.option("--drope-early-stop/--drope-fixed", default=True,
+              help="Enable/disable DroPE early stopping (default: enabled)")
+@click.option("--drope-patience", default=2, type=int,
+              help="DroPE early-stop patience in epochs (default: 2)")
+@click.option("--drope-min-delta", default=1e-4, type=float,
+              help="Minimum DroPE metric improvement to reset patience (default: 1e-4)")
+@click.option("--drope-min-epochs", default=4, type=int,
+              help="Minimum DroPE epochs before early stopping can trigger (default: 4)")
 @click.option("--fp16", is_flag=True, default=False,
               help="Enable mixed precision (fp16) training — CUDA only")
 @click.option("--pos-encoding", type=click.Choice(["rope", "pope"]),
-              default="rope", help="Positional encoding: rope (default) or pope")
+              default="pope", help="Positional encoding for main training stage")
 @click.option("--num-kv-heads", default=None, type=int,
               help="Number of KV heads for GQA (default: same as num_heads = standard MHA)")
 def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: str | None,
           accumulation_steps: int, resume: str | None, data_dir: str | None,
           curriculum: bool, pretrain_epochs: int, finetune_data_dir: str,
+          finetune_style: str | None,
           finetune_lr: float, drope: bool, drope_epochs: int, drope_lr: float,
+          drope_early_stop: bool, drope_patience: int, drope_min_delta: float,
+          drope_min_epochs: int,
           fp16: bool, pos_encoding: str, num_kv_heads: int | None) -> None:
     """Train the Bach Transformer model."""
     import torch
@@ -756,7 +771,7 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
         with open(mode_path) as f:
             mode_info = json.load(f)
     if mode is None:
-        mode = mode_info.get("mode", "2-part")
+        mode = mode_info.get("mode", "all")
 
     # Set seq_len from mode defaults if not specified
     if seq_len is None:
@@ -764,9 +779,6 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
             seq_len = int(mode_info["max_seq_len"])
         else:
             seq_len = FORM_DEFAULTS.get(mode, (2, 768))[1]
-            # Scale-degree sequences are ~50-75% longer; bump seq_len by 1.5x
-            if mode_info.get("tokenizer_type") == "scale-degree":
-                seq_len = int(seq_len * 1.5)
 
     console.print(f"[bold]Loading training data from {train_data_dir}...[/bold]")
     console.print(f"  Mode: {mode}, seq_len: {seq_len}")
@@ -784,6 +796,34 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
         console.print(f"  [yellow]No piece_ids.json found — using random split (re-run prepare-data to fix)[/yellow]")
 
     tokenizer = load_tokenizer(train_data_dir / "tokenizer.json")
+
+    def _filter_for_finetune_target(
+        seqs: list[list[int]],
+        pids: list[str] | None,
+        target: str,
+    ) -> tuple[list[list[int]], list[str] | None]:
+        target_l = target.lower().strip()
+        tok_name = f"STYLE_{target_l.upper()}"
+        tok_id = tokenizer.name_to_token.get(tok_name)
+        # Prefer exact style-token filtering when available.
+        if tok_id is not None:
+            kept_idx = [i for i, s in enumerate(seqs) if tok_id in s]
+            filtered_seqs = [seqs[i] for i in kept_idx]
+            filtered_pids = [pids[i] for i in kept_idx] if pids is not None else None
+            return filtered_seqs, filtered_pids
+
+        # Fallback: filter by piece/source ID substring (composer/work hint).
+        if pids is None:
+            console.print(
+                f"[red]Cannot apply --finetune {target!r}: no piece_ids.json available "
+                f"and no matching style token ({tok_name}).[/red]"
+            )
+            sys.exit(1)
+
+        kept_idx = [i for i, pid in enumerate(pids) if target_l in str(pid).lower()]
+        filtered_seqs = [seqs[i] for i in kept_idx]
+        filtered_pids = [pids[i] for i in kept_idx] if pids is not None else None
+        return filtered_seqs, filtered_pids
 
     # Create datasets
     train_ds, val_ds = create_dataset(sequences, seq_len=seq_len, piece_ids=piece_ids)
@@ -835,18 +875,43 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
                           f"--epochs ({epochs})[/red]")
             sys.exit(1)
 
-        ft_data_dir = Path(finetune_data_dir)
-        ft_seq_path = ft_data_dir / "sequences.json"
-        if not ft_seq_path.exists():
-            console.print(f"[red]Fine-tune data not found at {ft_data_dir}. "
-                          f"Run 'bach-gen prepare-data --data-dir {ft_data_dir}' first.[/red]")
+        if finetune_style and finetune_data_dir != "data/bach":
+            console.print("[red]Use either --finetune <style> or --finetune-data-dir, not both.[/red]")
             sys.exit(1)
+
+        ft_sequences: list[list[int]]
+        ft_piece_ids: list[str] | None = None
+        ft_source_desc: str
+        if finetune_style:
+            ft_sequences, ft_piece_ids = _filter_for_finetune_target(sequences, piece_ids, finetune_style)
+            if not ft_sequences:
+                console.print(
+                    f"[red]No sequences found for --finetune '{finetune_style}' "
+                    f"in {train_data_dir}.[/red]"
+                )
+                sys.exit(1)
+            ft_source_desc = f"{train_data_dir} (finetune={finetune_style})"
+        else:
+            ft_data_dir = Path(finetune_data_dir)
+            ft_seq_path = ft_data_dir / "sequences.json"
+            if not ft_seq_path.exists():
+                console.print(f"[red]Fine-tune data not found at {ft_data_dir}. "
+                              f"Run 'bach-gen prepare-data --data-dir {ft_data_dir}' first.[/red]")
+                sys.exit(1)
+            with open(ft_seq_path) as f:
+                ft_sequences = json.load(f)
+
+            ft_piece_ids_path = ft_data_dir / "piece_ids.json"
+            if ft_piece_ids_path.exists():
+                with open(ft_piece_ids_path) as f:
+                    ft_piece_ids = json.load(f)
+            ft_source_desc = str(ft_data_dir)
 
         finetune_epochs = epochs - pretrain_epochs
 
         console.print(f"\n[bold]Curriculum training:[/bold]")
         console.print(f"  Phase 1 (pre-train): epochs 1–{pretrain_epochs} on {train_data_dir}")
-        console.print(f"  Phase 2 (fine-tune): epochs {pretrain_epochs+1}–{epochs} on {ft_data_dir}")
+        console.print(f"  Phase 2 (fine-tune): epochs {pretrain_epochs+1}–{epochs} on {ft_source_desc}")
         console.print(f"  Fine-tune LR: {finetune_lr}")
 
         # --- Phase 1: Pre-train ---
@@ -874,15 +939,7 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
         console.print(f"  Pre-train final loss: {pt_history['train_loss'][-1]:.4f}")
 
         # --- Phase 2: Fine-tune ---
-        console.print(f"\n[bold]Phase 2: Loading fine-tune data from {ft_data_dir}...[/bold]")
-        with open(ft_seq_path) as f:
-            ft_sequences = json.load(f)
-
-        ft_piece_ids = None
-        ft_piece_ids_path = ft_data_dir / "piece_ids.json"
-        if ft_piece_ids_path.exists():
-            with open(ft_piece_ids_path) as f:
-                ft_piece_ids = json.load(f)
+        console.print(f"\n[bold]Phase 2: Preparing fine-tune data from {ft_source_desc}...[/bold]")
 
         ft_train_ds, ft_val_ds = create_dataset(ft_sequences, seq_len=seq_len, piece_ids=ft_piece_ids)
         console.print(f"  Fine-tune train: {len(ft_train_ds)}, val: {len(ft_val_ds)}")
@@ -948,18 +1005,40 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
 
     # DroPE recalibration phase
     if drope:
-        console.print(f"\n[bold]DroPE recalibration for {drope_epochs} epochs (lr={drope_lr})...[/bold]")
+        console.print(
+            f"\n[bold]DroPE recalibration (max {drope_epochs} epochs, lr={drope_lr})...[/bold]"
+        )
+        if drope_early_stop:
+            console.print(
+                f"  Early stop: enabled (patience={drope_patience}, "
+                f"min_delta={drope_min_delta}, min_epochs={drope_min_epochs})"
+            )
+        else:
+            console.print("  Early stop: disabled (fixed-length DroPE run)")
         with Progress(
             SpinnerColumn(), TextColumn("{task.description}"),
             BarColumn(), TaskProgressColumn(), console=console,
         ) as progress:
             task = progress.add_task("DroPE recalibration", total=drope_epochs)
 
-            drope_history = trainer.recalibrate_drope(epochs=drope_epochs, lr=drope_lr)
+            drope_history = trainer.recalibrate_drope(
+                epochs=drope_epochs,
+                lr=drope_lr,
+                early_stop=drope_early_stop,
+                patience=drope_patience,
+                min_delta=drope_min_delta,
+                min_epochs=drope_min_epochs,
+            )
 
-            progress.update(task, completed=drope_epochs, description="DroPE done!")
+            progress.update(
+                task,
+                completed=drope_history.get("epochs_ran", drope_epochs),
+                description="DroPE done!",
+            )
 
         console.print(f"  DroPE final loss: {drope_history['train_loss'][-1]:.4f}")
+        console.print(f"  DroPE epochs ran: {drope_history.get('epochs_ran', drope_epochs)}")
+        console.print(f"  DroPE stop reason: {drope_history.get('stop_reason', 'unknown')}")
         console.print(f"  Model marked as drope_trained=True")
 
     console.print(f"\n[green]Training complete![/green]")
@@ -970,10 +1049,17 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
 
     # Calibrate information-theoretic metrics
     console.print("\n[bold]Calibrating evaluation metrics...[/bold]")
-    from bach_gen.evaluation.information import calibrate_from_corpus
+    from bach_gen.evaluation.information import (
+        calibrate_from_corpus,
+        save_information_calibration,
+    )
     cal = calibrate_from_corpus(sequences_for_cal[:50], model)
     console.print(f"  Perplexity range: {cal['perplexity_range']}")
     console.print(f"  Entropy range: {cal['entropy_range']}")
+    info_cal_path = MODELS_DIR / "information_calibration.json"
+    save_information_calibration(info_cal_path, cal)
+    save_information_calibration(train_data_dir / "information_calibration.json", cal)
+    console.print(f"  Saved information calibration: {info_cal_path}")
 
 
 @cli.command()
@@ -982,6 +1068,8 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
 @click.option("--candidates", "-n", default=100, help="Number of candidates to generate")
 @click.option("--top", "-t", default=3, help="Number of top results to return")
 @click.option("--temperature", default=0.9, type=float, help="Sampling temperature")
+@click.option("--min-p", default=0.03, type=float,
+              help="Min-p sampling threshold (recommended primary control; 0 disables)")
 @click.option("--max-length", default=None, type=int,
               help="Max generation length (tokens; default: from mode)")
 @click.option("--model-path", default=None, help="Path to model checkpoint")
@@ -1019,6 +1107,7 @@ def generate(
     candidates: int,
     top: int,
     temperature: float,
+    min_p: float,
     max_length: int | None,
     model_path: str | None,
     mode: str | None,
@@ -1042,6 +1131,7 @@ def generate(
     from bach_gen.generation.generator import generate as gen_fn
     from bach_gen.generation.generator import generate_voice_by_voice as gen_vbv_fn
     from bach_gen.evaluation.statistical import load_corpus_stats
+    from bach_gen.evaluation.information import load_information_calibration
 
     # Auto-detect mode
     mode_path = DATA_DIR / "mode.json"
@@ -1050,7 +1140,7 @@ def generate(
         with open(mode_path) as f:
             mode_info = json.load(f)
     if mode is None:
-        mode = mode_info.get("mode", "2-part")
+        mode = mode_info.get("mode", "all")
     if mode == "all":
         # "all" is a data-prep mode, not a concrete generation form.
         # Default generation to a stable 4-voice form.
@@ -1061,8 +1151,6 @@ def generate(
 
     if max_length is None:
         max_length = FORM_DEFAULTS.get(mode, (2, 768))[1]
-        if mode_info.get("tokenizer_type") == "scale-degree":
-            max_length = int(max_length * 1.5)
 
     # Load model
     if model_path is None:
@@ -1083,6 +1171,15 @@ def generate(
 
     # Load corpus stats for evaluation
     load_corpus_stats(DATA_DIR / "corpus_stats.json")
+    info_cal = (
+        load_information_calibration(Path(model_path).parent / "information_calibration.json")
+        or load_information_calibration(DATA_DIR / "information_calibration.json")
+    )
+    if info_cal:
+        console.print(
+            f"  Loaded info calibration: ppl={info_cal['perplexity_range']}, "
+            f"ent={info_cal['entropy_range']}"
+        )
 
     form_label = {
         "2-part": "2-part invention",
@@ -1124,6 +1221,7 @@ def generate(
             num_candidates=candidates,
             top_k_results=top,
             temperature=temperature,
+            min_p=min_p,
             max_length=max_length,
             output_dir=OUTPUT_DIR,
             form=mode,
@@ -1146,6 +1244,7 @@ def generate(
             num_candidates=candidates,
             top_k_results=top,
             temperature=temperature,
+            min_p=min_p,
             max_length=max_length,
             output_dir=OUTPUT_DIR,
             form=mode,
@@ -1211,6 +1310,7 @@ def evaluate(midi_file: str, mode: str | None) -> None:
     from bach_gen.data.tokenizer import BachTokenizer, load_tokenizer
     from bach_gen.evaluation.scorer import score_composition
     from bach_gen.evaluation.statistical import load_corpus_stats
+    from bach_gen.evaluation.information import load_information_calibration
     from bach_gen.utils.music_theory import detect_key
 
     import numpy as np
@@ -1219,6 +1319,8 @@ def evaluate(midi_file: str, mode: str | None) -> None:
     stats_path = DATA_DIR / "corpus_stats.json"
     if stats_path.exists():
         load_corpus_stats(stats_path)
+    load_information_calibration(MODELS_DIR / "information_calibration.json")
+    load_information_calibration(DATA_DIR / "information_calibration.json")
 
     console.print(f"[bold]Evaluating:[/bold] {midi_file}")
 
@@ -1339,6 +1441,7 @@ def calibrate(sample_size: int) -> None:
     from bach_gen.data.tokenizer import load_tokenizer
     from bach_gen.evaluation.scorer import score_composition
     from bach_gen.evaluation.statistical import load_corpus_stats
+    from bach_gen.evaluation.information import load_information_calibration
     from bach_gen.data.extraction import VoiceComposition
     from bach_gen.utils.constants import TICKS_PER_QUARTER, DURATION_BINS
 
@@ -1356,6 +1459,8 @@ def calibrate(sample_size: int) -> None:
     stats_path = DATA_DIR / "corpus_stats.json"
     if stats_path.exists():
         load_corpus_stats(stats_path)
+    load_information_calibration(MODELS_DIR / "information_calibration.json")
+    load_information_calibration(DATA_DIR / "information_calibration.json")
 
     mode_path = DATA_DIR / "mode.json"
     mode_info = {}

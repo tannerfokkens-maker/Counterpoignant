@@ -74,7 +74,7 @@ Current defaults:
 ## 2. Train
 
 ```bash
-uv run bach-gen train --epochs 500 --lr 3e-4 --batch-size 8 --pos-encoding pope --num-kv-heads 2
+uv run bach-gen train --epochs 500 --lr 3e-4 --batch-size 8 --num-kv-heads 2
 ```
 
 **What happens:**
@@ -85,15 +85,21 @@ uv run bach-gen train --epochs 500 --lr 3e-4 --batch-size 8 --pos-encoding pope 
 2. **Split** into train/val at the piece level (90/10) using `piece_ids.json` to prevent chunk leakage. Both encoding variants of the same piece stay together in the same split.
 
 3. **Build model** — BachTransformer (256d, 8 heads, 8 layers, SwiGLU FFN, RMSNorm, weight tying). Key options:
-   - `--pos-encoding rope|pope` — RoPE (standard) or PoPE (polar coordinate, better what-where separation)
+   - `--pos-encoding rope|pope` — choose positional encoding for main training
    - `--num-kv-heads` — grouped query attention (fewer KV heads = smaller KV cache at inference)
 
 4. **Train** with AdamW (betas 0.9/0.98), cosine annealing to 1e-6, label smoothing 0.1, gradient clipping at 1.0. Optional `--fp16` for mixed precision on CUDA.
 
-5. **Save checkpoints** throughout:
+5. **DroPE recalibration (default, same run)** — by default, the command automatically runs DroPE after normal training with early stopping.
+   - `--drope-epochs` is a max-epoch cap (not a fixed run length).
+   - Tune with `--drope-lr`, `--drope-patience`, `--drope-min-delta`, `--drope-min-epochs`.
+   - Use `--drope-fixed` for fixed-length DroPE, or `--no-drope` to disable.
+
+6. **Save checkpoints** throughout:
    - `latest.pt` — after every epoch (safe to resume from)
    - `best.pt` — when validation loss improves
    - `final.pt` — end of training
+   - During DroPE: `pre_drope.pt`, `drope_latest.pt`, `drope_best.pt`, `drope_final.pt`
 
 ### Lambda Setup (GPU)
 
@@ -137,21 +143,27 @@ Pre-train on a broad corpus, then fine-tune on Bach:
 
 ```bash
 uv run bach-gen train --curriculum \
-  --data-dir data/broad --finetune-data-dir data/bach \
-  --pretrain-epochs 300 --epochs 500 --finetune-lr 1e-4
+  --finetune-data-dir data/bach \
+  --pretrain-epochs 350 --epochs 500 --finetune-lr 1e-4
 ```
 
-Phase 1 trains on the broad dataset. Phase 2 swaps to the Bach dataset with a fresh optimizer at a lower learning rate. Saves `pretrain_final.pt` at the transition.
+Phase 1 trains on the broad dataset. Phase 2 swaps to the Bach dataset with a fresh optimizer at a lower learning rate.
 
-### DroPE Recalibration (optional)
-
-After training with positional encoding, drop it and retrain briefly:
+If your prepared dataset already contains mixed styles (including Bach), you can fine-tune from the same `sequences.json` by style token instead of a second directory:
 
 ```bash
-uv run bach-gen train --pos-encoding pope --drope --drope-epochs 10 --drope-lr 1e-3
+uv run bach-gen train --curriculum \
+  --finetune bach \
+  --pretrain-epochs 350 --epochs 500 --finetune-lr 1e-4
 ```
 
-The model learns to recover positional information from causal masking and BEAT tokens. Enables length generalization beyond the training context. Saves `pre_drope.pt` before and `drope_final.pt` after. Sets `drope_trained=True` in the checkpoint config.
+`--finetune` accepts either:
+- a style token (`bach`, `baroque`, `renaissance`, `classical`), or
+- a composer/source substring (for example `beethoven`, `mozart`) matched against `piece_ids.json`.
+
+Use either `--finetune-data-dir` or `--finetune`, not both.
+DroPE is on by default with curriculum too, and runs after both phases complete.
+Recommended default split: 70/30 pre-train/fine-tune (e.g. `350/500` for a 500-epoch run).
 
 ### Resuming
 
@@ -165,12 +177,15 @@ Restores model weights, optimizer state, and epoch counter.
 
 ## 3. Post-Training Calibration
 
-Runs automatically at the end of training. Takes 50 sequences from the training corpus and computes:
+Runs automatically at the end of training. Takes 50 sequences from the most recent training corpus and computes:
 
 - **Perplexity range** (P10–P90) — how predictable real Bach is to the model
 - **Entropy range** (P10–P90) — how uncertain the model is on real Bach
 
 These ranges anchor the information-theoretic evaluation score so it reflects "naturalness relative to the training corpus" rather than absolute values.
+
+In curriculum mode, calibration uses the fine-tune corpus (phase 2 dataset/subset).
+The ranges are saved to `models/information_calibration.json` and auto-loaded by generation/evaluation scoring.
 
 ---
 
@@ -182,7 +197,7 @@ These ranges anchor the information-theoretic evaluation score so it reflects "n
 uv run bach-gen generate --key "C minor" --mode fugue \
   --texture polyphonic --imitation high --harmonic-rhythm fast \
   --tension high --chromaticism moderate \
-  --candidates 100 --top 3 --temperature 0.9
+  --candidates 100 --top 3 --temperature 0.9 --min-p 0.03
 ```
 
 ### Voice-by-voice (sequential) generation
@@ -190,7 +205,7 @@ uv run bach-gen generate --key "C minor" --mode fugue \
 ```bash
 uv run bach-gen generate --key "C minor" --mode fugue \
   --texture polyphonic --imitation high \
-  --voice-by-voice --candidates 50 --top 3
+  --voice-by-voice --candidates 50 --top 3 --temperature 0.9 --min-p 0.03
 ```
 
 Optionally provide a MIDI file for voice 1 — the model generates the remaining voices:
@@ -237,6 +252,7 @@ uv run bach-gen generate --key "C minor" --mode fugue \
 - `--voice-by-voice` — use sequential (voice-by-voice) generation
 - `--provide-voice path.mid` — supply voice 1 as MIDI (requires `--voice-by-voice`)
 - `--beam-width` — beam search with length-normalized scoring (Wu et al.)
+- `--min-p` — primary sampling control (with temperature); lower = more diversity, higher = stricter
 
 ---
 

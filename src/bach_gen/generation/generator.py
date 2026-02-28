@@ -26,6 +26,7 @@ from bach_gen.utils.constants import (
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_K_SAMPLING,
     DEFAULT_TOP_P,
+    DEFAULT_MIN_P,
     DEFAULT_MAX_GEN_LENGTH,
     FORM_DEFAULTS,
 )
@@ -75,6 +76,7 @@ def generate(
     temperature: float = DEFAULT_TEMPERATURE,
     top_k: int = DEFAULT_TOP_K_SAMPLING,
     top_p: float = DEFAULT_TOP_P,
+    min_p: float = DEFAULT_MIN_P,
     max_length: int = DEFAULT_MAX_GEN_LENGTH,
     output_dir: str | Path = "output",
     enforce_key: bool = True,
@@ -105,6 +107,7 @@ def generate(
         temperature: Sampling temperature.
         top_k: Top-k sampling parameter.
         top_p: Top-p (nucleus) sampling parameter.
+        min_p: Min-p sampling parameter.
         max_length: Maximum generation length in tokens.
         output_dir: Directory to save MIDI files.
         enforce_key: Apply key constraints during generation.
@@ -218,6 +221,7 @@ def generate(
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
+                min_p=min_p,
                 max_length=max_length,
                 device=device,
             )
@@ -384,6 +388,7 @@ def generate_voice_by_voice(
     temperature: float = DEFAULT_TEMPERATURE,
     top_k: int = DEFAULT_TOP_K_SAMPLING,
     top_p: float = DEFAULT_TOP_P,
+    min_p: float = DEFAULT_MIN_P,
     max_length: int = DEFAULT_MAX_GEN_LENGTH,
     output_dir: str | Path = "output",
     enforce_range: bool = True,
@@ -479,6 +484,7 @@ def generate_voice_by_voice(
             temperature=temperature,
             top_k=top_k,
             top_p=top_p,
+            min_p=min_p,
             max_length=max_length,
             device=device,
         )
@@ -528,6 +534,7 @@ def _generate_one(
     temperature: float,
     top_k: int,
     top_p: float,
+    min_p: float,
     max_length: int,
     device: torch.device,
 ) -> list[int]:
@@ -555,6 +562,7 @@ def _generate_one(
             temperature=temperature,
             top_k=top_k,
             top_p=top_p,
+            min_p=min_p,
         )
 
         tokens.append(next_token)

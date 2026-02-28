@@ -5,6 +5,7 @@ Uses model perplexity and entropy to assess musical naturalness.
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 from pathlib import Path
@@ -284,3 +285,51 @@ def calibrate_from_corpus(
         "perplexity_range": _BACH_PERPLEXITY_RANGE,
         "entropy_range": _BACH_ENTROPY_RANGE,
     }
+
+
+def get_information_calibration() -> dict:
+    """Get currently active information calibration ranges."""
+    return {
+        "perplexity_range": _BACH_PERPLEXITY_RANGE,
+        "entropy_range": _BACH_ENTROPY_RANGE,
+    }
+
+
+def save_information_calibration(path: str | Path, calibration: dict) -> None:
+    """Persist information calibration to disk."""
+    out_path = Path(path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "perplexity_range": list(calibration.get("perplexity_range", _BACH_PERPLEXITY_RANGE)),
+        "entropy_range": list(calibration.get("entropy_range", _BACH_ENTROPY_RANGE)),
+    }
+    with open(out_path, "w") as f:
+        json.dump(payload, f, indent=2)
+
+
+def load_information_calibration(path: str | Path) -> dict | None:
+    """Load information calibration from disk and apply it globally.
+
+    Returns the loaded calibration dict, or None when unavailable/invalid.
+    """
+    global _BACH_PERPLEXITY_RANGE, _BACH_ENTROPY_RANGE
+
+    in_path = Path(path)
+    if not in_path.exists():
+        return None
+
+    try:
+        with open(in_path) as f:
+            payload = json.load(f)
+        ppl = payload.get("perplexity_range")
+        ent = payload.get("entropy_range")
+        if not (isinstance(ppl, list) and len(ppl) == 2 and isinstance(ent, list) and len(ent) == 2):
+            return None
+        _BACH_PERPLEXITY_RANGE = (float(ppl[0]), float(ppl[1]))
+        _BACH_ENTROPY_RANGE = (float(ent[0]), float(ent[1]))
+        return {
+            "perplexity_range": _BACH_PERPLEXITY_RANGE,
+            "entropy_range": _BACH_ENTROPY_RANGE,
+        }
+    except Exception:
+        return None

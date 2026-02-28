@@ -294,7 +294,15 @@ class Trainer:
 
         return total_loss / max(n_batches, 1)
 
-    def recalibrate_drope(self, epochs: int, lr: float) -> dict:
+    def recalibrate_drope(
+        self,
+        epochs: int,
+        lr: float,
+        early_stop: bool = True,
+        patience: int = 2,
+        min_delta: float = 1e-4,
+        min_epochs: int = 4,
+    ) -> dict:
         """Run DroPE recalibration: continue training without RoPE.
 
         Per Gelberg et al. 2025: after normal RoPE training, drop all
@@ -303,8 +311,12 @@ class Trainer:
         positional information from causal masking and BEAT tokens.
 
         Args:
-            epochs: Number of recalibration epochs.
+            epochs: Maximum number of recalibration epochs.
             lr: Learning rate for recalibration (typically higher, e.g. 1e-3).
+            early_stop: Whether to stop before ``epochs`` on plateau.
+            patience: Allowed consecutive non-improving epochs.
+            min_delta: Minimum metric improvement to reset patience.
+            min_epochs: Minimum epochs before early stop is allowed.
 
         Returns:
             Dict with training history for the recalibration phase.
@@ -351,8 +363,13 @@ class Trainer:
 
         logger.info(
             f"DroPE recalibration: {epochs} epochs, lr={lr}, "
-            f"dropping {self.model.config.pos_encoding} positional encoding"
+            f"dropping {self.model.config.pos_encoding} positional encoding, "
+            f"early_stop={early_stop}, patience={patience}, min_delta={min_delta}, min_epochs={min_epochs}"
         )
+
+        best_metric = float("inf")
+        bad_epochs = 0
+        stop_reason = "max_epochs_reached"
 
         for epoch in range(1, epochs + 1):
             self.epoch = epoch
@@ -363,21 +380,35 @@ class Trainer:
             scheduler.step()
 
             val_loss = None
-            if val_loader and epoch % max(1, epochs // 10) == 0:
+            if val_loader:
                 val_loss = self._validate(val_loader, use_rope=False)
                 history["val_loss"].append(val_loss)
+            else:
+                history["val_loss"].append(None)
 
-                if val_loss < self.best_val_loss:
-                    self.best_val_loss = val_loss
-                    self._save_checkpoint("drope_best.pt")
-
-            if epoch % max(1, epochs // 10) == 0:
-                msg = f"[DroPE] Epoch {epoch}/{epochs} | train_loss={train_loss:.4f}"
+            metric = val_loss if val_loss is not None else train_loss
+            if metric < (best_metric - min_delta):
+                best_metric = metric
+                bad_epochs = 0
                 if val_loss is not None:
-                    msg += f" | val_loss={val_loss:.4f}"
-                logger.info(msg)
+                    self.best_val_loss = val_loss
+                self._save_checkpoint("drope_best.pt")
+            else:
+                bad_epochs += 1
+
+            msg = f"[DroPE] Epoch {epoch}/{epochs} | train_loss={train_loss:.4f}"
+            if val_loss is not None:
+                msg += f" | val_loss={val_loss:.4f}"
+            logger.info(msg)
 
             self._save_checkpoint("drope_latest.pt")
+
+            if early_stop and epoch >= min_epochs and bad_epochs >= patience:
+                stop_reason = (
+                    f"early_stop(patience={patience}, min_delta={min_delta})"
+                )
+                logger.info(f"DroPE early stop at epoch {epoch}: {stop_reason}")
+                break
 
         # Mark model as DroPE-trained
         self.model.config.drope_trained = True
@@ -385,7 +416,14 @@ class Trainer:
         # Save final DroPE checkpoint
         self._save_checkpoint("drope_final.pt")
 
-        logger.info("DroPE recalibration complete")
+        history["epochs_ran"] = len(history["train_loss"])
+        history["stop_reason"] = stop_reason
+        history["best_metric"] = best_metric
+
+        logger.info(
+            f"DroPE recalibration complete (epochs_ran={history['epochs_ran']}, "
+            f"stop_reason={stop_reason})"
+        )
         return history
 
     def _save_checkpoint(self, filename: str) -> None:
