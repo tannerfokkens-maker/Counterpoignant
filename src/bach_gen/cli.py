@@ -16,7 +16,7 @@ from rich.table import Table
 from bach_gen.utils.constants import (
     FORM_DEFAULTS, VALID_FORMS, DEFAULT_SEQ_LEN,
     METER_MAP, LENGTH_NAMES, METER_NAMES,
-    compute_measure_count, length_bucket,
+    compute_measure_count, length_bucket, DEFAULT_PREPARE_COMPOSER_FILTER,
 )
 
 console = Console()
@@ -147,7 +147,8 @@ def _print_conditioning_histograms(sequences: list[list[int]], tokenizer) -> Non
 @click.option("--data-dir", default=None, type=click.Path(),
               help="Output directory for prepared data (default: data/)")
 @click.option("--composer-filter", default=None, type=str,
-              help="Comma-separated composer/style names to include (e.g. 'bach' or 'bach,baroque')")
+              help=("Comma-separated composer/style names to include "
+                    "(default: bach,baroque,renaissance,classical; use 'all' to disable filtering)"))
 @click.option("--no-sequential", is_flag=True, default=False,
               help="Disable dual sequential encoding (skip voice-by-voice training data)")
 @click.option("--max-source-voices", default=4, type=int,
@@ -192,13 +193,27 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
     out_dir = Path(data_dir) if data_dir else DATA_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Parse composer filter
+    # Parse composer/era filter.
+    # Default is a curated era set; pass --composer-filter all to disable.
     filter_list = None
+    filter_origin = "custom"
     if composer_filter:
-        filter_list = [c.strip() for c in composer_filter.split(",") if c.strip()]
+        parsed = [c.strip().lower() for c in composer_filter.split(",") if c.strip()]
+        if "all" in parsed:
+            filter_list = None
+            filter_origin = "disabled"
+        else:
+            filter_list = parsed
+    else:
+        filter_list = list(DEFAULT_PREPARE_COMPOSER_FILTER)
+        filter_origin = "default"
 
     # Step 1: Load works
-    filter_desc = f" (filter: {', '.join(filter_list)})" if filter_list else ""
+    if filter_list:
+        suffix = " [default]" if filter_origin == "default" else ""
+        filter_desc = f" (filter: {', '.join(filter_list)}{suffix})"
+    else:
+        filter_desc = " (filter: disabled)"
     console.print(f"[bold]Step 1:[/] Loading works from corpus...{filter_desc}")
     if is_all_mode:
         console.print(f"  Mode: all (auto-detect form and voice count per piece)")

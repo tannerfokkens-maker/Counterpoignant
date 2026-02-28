@@ -20,7 +20,7 @@ Current defaults:
 
 **What happens:**
 
-1. **Load works** from music21 corpus + `data/midi/`. Deduplicate by source path. Optional `--composer-filter` (e.g. `bach,baroque`).
+1. **Load works** from music21 corpus + `data/midi/`. Deduplicate by source path. By default this uses the curated era filter `bach,baroque,renaissance,classical`. Use `--composer-filter` to override, or `--composer-filter all` to disable filtering.
 
 2. **Extract voices** per mode.
    - `--mode all` auto-detects form/voice target per piece, but extraction is now guarded by source-level caps.
@@ -68,6 +68,7 @@ Current defaults:
 - `--pair-strategy adjacent+outer|adjacent-only|all-combinations` — how 2-part pairs are derived from multi-voice works
 - `--max-pairs-per-work` — cap extracted 2-part pairs per source work (default: 2)
 - `--sonata-policy counterpoint-safe|all` — default keeps non-accompaniment slices plus at most one least-accompaniment slice per sonata/keyboard-like work
+- `--composer-filter` — defaults to `bach,baroque,renaissance,classical`; use `all` to disable
 
 ---
 
