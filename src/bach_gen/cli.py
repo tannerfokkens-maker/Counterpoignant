@@ -506,6 +506,14 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
               help="Minimum DroPE metric improvement to reset patience (default: 1e-4)")
 @click.option("--drope-min-epochs", default=4, type=int,
               help="Minimum DroPE epochs before early stopping can trigger (default: 4)")
+@click.option("--early-stop/--no-early-stop", default=True,
+              help="Enable/disable early stopping on val loss plateau (default: enabled)")
+@click.option("--es-patience", default=20, type=int,
+              help="Early-stop patience: consecutive non-improving val checks (default: 20)")
+@click.option("--es-min-delta", default=1e-4, type=float,
+              help="Minimum val loss improvement to reset patience (default: 1e-4)")
+@click.option("--es-min-epochs", default=10, type=int,
+              help="Minimum epochs before early stopping can trigger (default: 10)")
 @click.option("--fp16", is_flag=True, default=False,
               help="Enable mixed precision (fp16) training — CUDA only")
 @click.option("--pos-encoding", type=click.Choice(["rope", "pope"]),
@@ -519,6 +527,7 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
           finetune_lr: float, drope: bool, drope_epochs: int, drope_lr: float,
           drope_early_stop: bool, drope_patience: int, drope_min_delta: float,
           drope_min_epochs: int,
+          early_stop: bool, es_patience: int, es_min_delta: float, es_min_epochs: int,
           fp16: bool, pos_encoding: str, num_kv_heads: int | None) -> None:
     """Train the Bach Transformer model."""
     import torch
@@ -686,6 +695,10 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
         console.print(f"  Phase 1 (pre-train): epochs 1–{pretrain_epochs} on {train_data_dir}")
         console.print(f"  Phase 2 (fine-tune): epochs {pretrain_epochs+1}–{epochs} on {ft_source_desc}")
         console.print(f"  Fine-tune LR: {finetune_lr}")
+        if early_stop:
+            console.print(f"  Early stop: enabled (patience={es_patience}, min_delta={es_min_delta}, min_epochs={es_min_epochs})")
+        else:
+            console.print(f"  Early stop: disabled")
 
         # --- Phase 1: Pre-train ---
         console.print(f"\n[bold]Phase 1: Pre-training for {pretrain_epochs} epochs...[/bold]")
@@ -707,9 +720,16 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
                 log_interval=max(1, pretrain_epochs // 20),
                 val_interval=max(1, pretrain_epochs // 20),
                 progress_callback=pt_callback,
+                early_stop=early_stop,
+                patience=es_patience,
+                min_delta=es_min_delta,
+                min_epochs=es_min_epochs,
             )
 
         console.print(f"  Pre-train final loss: {pt_history['train_loss'][-1]:.4f}")
+        if pt_history.get("stop_reason") and pt_history["stop_reason"] != "max_epochs_reached":
+            console.print(f"  Pre-train stopped early: {pt_history['stop_reason']} "
+                          f"(ran {pt_history.get('epochs_ran', '?')} epochs)")
 
         # --- Phase 2: Fine-tune ---
         console.print(f"\n[bold]Phase 2: Preparing fine-tune data from {ft_source_desc}...[/bold]")
@@ -738,6 +758,10 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
                 log_interval=max(1, finetune_epochs // 20),
                 val_interval=max(1, finetune_epochs // 20),
                 progress_callback=ft_callback,
+                early_stop=early_stop,
+                patience=es_patience,
+                min_delta=es_min_delta,
+                min_epochs=pretrain_epochs + es_min_epochs,
             )
 
         # Merge histories for reporting
@@ -773,6 +797,10 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
                 log_interval=max(1, epochs // 20),
                 val_interval=max(1, epochs // 20),
                 progress_callback=callback,
+                early_stop=early_stop,
+                patience=es_patience,
+                min_delta=es_min_delta,
+                min_epochs=es_min_epochs,
             )
         sequences_for_cal = sequences
 

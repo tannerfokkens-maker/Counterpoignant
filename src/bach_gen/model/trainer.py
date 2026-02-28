@@ -137,6 +137,10 @@ class Trainer:
         log_interval: int = 10,
         val_interval: int = 5,
         progress_callback=None,
+        early_stop: bool = False,
+        patience: int = 20,
+        min_delta: float = 1e-4,
+        min_epochs: int = 10,
     ) -> dict:
         """Run training loop.
 
@@ -146,6 +150,10 @@ class Trainer:
             log_interval: Log every N epochs.
             val_interval: Validate every N epochs.
             progress_callback: Optional callback(epoch, train_loss, val_loss).
+            early_stop: Whether to stop before ``epochs`` on val loss plateau.
+            patience: Allowed consecutive non-improving validation checks.
+            min_delta: Minimum val loss improvement to reset patience.
+            min_epochs: Minimum epochs before early stop can trigger.
 
         Returns:
             Dict with training history.
@@ -192,6 +200,15 @@ class Trainer:
             )
             return history
 
+        if early_stop:
+            logger.info(
+                f"Early stopping enabled: patience={patience}, "
+                f"min_delta={min_delta}, min_epochs={min_epochs}"
+            )
+
+        bad_epochs = 0
+        stop_reason = "max_epochs_reached"
+
         for epoch in range(start_epoch, epochs + 1):
             self.epoch = epoch
             train_loss = self._train_epoch(train_loader)
@@ -205,9 +222,17 @@ class Trainer:
                 val_loss = self._validate(val_loader)
                 history["val_loss"].append(val_loss)
 
-                if val_loss < self.best_val_loss:
+                if val_loss < (self.best_val_loss - min_delta):
                     self.best_val_loss = val_loss
+                    bad_epochs = 0
                     self._save_checkpoint("best.pt")
+                elif val_loss < self.best_val_loss:
+                    # Improved but below min_delta threshold
+                    self.best_val_loss = val_loss
+                    bad_epochs += 1
+                    self._save_checkpoint("best.pt")
+                else:
+                    bad_epochs += 1
 
             if epoch % log_interval == 0:
                 msg = f"Epoch {epoch}/{epochs} | train_loss={train_loss:.4f}"
@@ -222,8 +247,18 @@ class Trainer:
             # Save after every epoch so training can be stopped at any time
             self._save_checkpoint("latest.pt")
 
+            if early_stop and epoch >= min_epochs and bad_epochs >= patience:
+                stop_reason = (
+                    f"early_stop(patience={patience}, min_delta={min_delta})"
+                )
+                logger.info(f"Early stop at epoch {epoch}: {stop_reason}")
+                break
+
         # Save final checkpoint
         self._save_checkpoint("final.pt")
+
+        history["epochs_ran"] = len(history["train_loss"])
+        history["stop_reason"] = stop_reason
 
         return history
 
