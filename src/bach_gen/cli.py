@@ -690,7 +690,7 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
 @click.option("--data-dir", default=None, type=click.Path(),
               help="Directory with prepared training data (default: data/)")
 @click.option("--curriculum", is_flag=True, default=False,
-              help="Two-phase training: pre-train on --data-dir, fine-tune on --finetune-data-dir or --finetune style subset")
+              help="Three-phase training: pre-train on --data-dir, DroPE recalibrate, then fine-tune on --finetune-data-dir or --finetune style subset")
 @click.option("--pretrain-epochs", default=300, type=int,
               help="Epochs for pre-training phase (curriculum mode, default: 300)")
 @click.option("--finetune-data-dir", default="data/bach", type=click.Path(),
@@ -699,20 +699,22 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
               type=str,
               default=None,
               help="Fine-tune subset from same --data-dir (style token or composer substring, e.g. 'bach' or 'beethoven')")
-@click.option("--finetune-lr", default=1e-4, type=float,
-              help="Learning rate for fine-tuning phase (default: 1e-4)")
+@click.option("--finetune-lr", default=5e-5, type=float,
+              help="Learning rate for fine-tuning phase (default: 5e-5)")
 @click.option("--pretrained-checkpoint", default=None, type=click.Path(exists=True),
-              help="Skip curriculum pre-train phase and start fine-tuning from this checkpoint")
+              help="Skip curriculum pre-train phase and start at DroPE from this checkpoint")
 @click.option("--drope/--no-drope", default=True,
-              help="Enable/disable DroPE recalibration after training (default: enabled)")
+              help="Enable/disable DroPE recalibration phase (default: enabled)")
 @click.option("--drope-epochs", default=10, type=int,
               help="Maximum DroPE recalibration epochs (default: 10)")
-@click.option("--drope-lr", default=1e-3, type=float,
-              help="Learning rate for DroPE recalibration (default: 1e-3)")
+@click.option("--drope-lr", default=1e-4, type=float,
+              help="Learning rate for DroPE recalibration (default: 1e-4)")
+@click.option("--drope-warmup-epochs", default=1, type=int,
+              help="Warmup epochs before DroPE cosine decay (default: 1)")
 @click.option("--drope-early-stop/--drope-fixed", default=True,
               help="Enable/disable DroPE early stopping (default: enabled)")
-@click.option("--drope-patience", default=2, type=int,
-              help="DroPE early-stop patience in epochs (default: 2)")
+@click.option("--drope-patience", default=5, type=int,
+              help="DroPE early-stop patience in epochs (default: 5)")
 @click.option("--drope-min-delta", default=1e-4, type=float,
               help="Minimum DroPE metric improvement to reset patience (default: 1e-4)")
 @click.option("--drope-min-epochs", default=4, type=int,
@@ -720,11 +722,17 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
 @click.option("--early-stop/--no-early-stop", default=True,
               help="Enable/disable early stopping on val loss plateau (default: enabled)")
 @click.option("--es-patience", default=20, type=int,
-              help="Early-stop patience: consecutive non-improving val checks (default: 20)")
+              help="Pre-train early-stop patience: consecutive non-improving val checks (default: 20)")
 @click.option("--es-min-delta", default=1e-4, type=float,
-              help="Minimum val loss improvement to reset patience (default: 1e-4)")
+              help="Pre-train minimum val loss improvement to reset patience (default: 1e-4)")
 @click.option("--es-min-epochs", default=10, type=int,
-              help="Minimum epochs before early stopping can trigger (default: 10)")
+              help="Pre-train minimum epochs before early stopping can trigger (default: 10)")
+@click.option("--finetune-es-patience", default=None, type=int,
+              help="Fine-tune early-stop patience (default: same as --es-patience)")
+@click.option("--finetune-es-min-delta", default=None, type=float,
+              help="Fine-tune minimum improvement to reset patience (default: same as --es-min-delta)")
+@click.option("--finetune-es-min-epochs", default=None, type=int,
+              help="Fine-tune minimum epochs before early stopping (default: same as --es-min-epochs)")
 @click.option("--log-interval", default=5, type=int,
               help="Training log frequency in epochs (default: 5)")
 @click.option("--val-interval", default=None, type=int,
@@ -740,10 +748,12 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
           curriculum: bool, pretrain_epochs: int, finetune_data_dir: str,
           finetune_style: str | None,
           finetune_lr: float, pretrained_checkpoint: str | None,
-          drope: bool, drope_epochs: int, drope_lr: float,
+          drope: bool, drope_epochs: int, drope_lr: float, drope_warmup_epochs: int,
           drope_early_stop: bool, drope_patience: int, drope_min_delta: float,
           drope_min_epochs: int,
           early_stop: bool, es_patience: int, es_min_delta: float, es_min_epochs: int,
+          finetune_es_patience: int | None, finetune_es_min_delta: float | None,
+          finetune_es_min_epochs: int | None,
           log_interval: int,
           val_interval: int | None,
           fp16: bool, pos_encoding: str, num_kv_heads: int | None) -> None:
@@ -785,6 +795,9 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
         sys.exit(1)
     if log_interval < 1:
         console.print("[red]--log-interval must be >= 1[/red]")
+        sys.exit(1)
+    if drope_warmup_epochs < 0:
+        console.print("[red]--drope-warmup-epochs must be >= 0[/red]")
         sys.exit(1)
 
     console.print(f"[bold]Loading training data from {train_data_dir}...[/bold]")
@@ -883,6 +896,16 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
         start_epoch = trainer.resume_from_checkpoint(resume)
         console.print(f"  Resuming from epoch {start_epoch}")
 
+    def _resolve_phase_checkpoint(candidates: list[Path], phase_label: str) -> Path:
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        console.print(
+            f"[red]No checkpoint found for {phase_label}. Checked:[/red] "
+            + ", ".join(str(c) for c in candidates)
+        )
+        sys.exit(1)
+
     if curriculum:
         # Validate curriculum parameters
         if pretrain_epochs >= epochs:
@@ -924,22 +947,42 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
 
         finetune_epochs = epochs - pretrain_epochs
         skip_pretrain = pretrained_checkpoint is not None
+        ft_es_patience = finetune_es_patience if finetune_es_patience is not None else es_patience
+        ft_es_min_delta = finetune_es_min_delta if finetune_es_min_delta is not None else es_min_delta
+        ft_es_min_epochs = finetune_es_min_epochs if finetune_es_min_epochs is not None else es_min_epochs
 
         console.print(f"\n[bold]Curriculum training:[/bold]")
-        console.print(f"  Phase 1 (pre-train): epochs 1–{pretrain_epochs} on {train_data_dir}")
-        console.print(f"  Phase 2 (fine-tune): epochs {pretrain_epochs+1}–{epochs} on {ft_source_desc}")
+        if skip_pretrain:
+            console.print(f"  Phase 1 (pre-train): skipped, loading {pretrained_checkpoint}")
+        else:
+            console.print(f"  Phase 1 (pre-train): up to {pretrain_epochs} epochs on {train_data_dir}")
+        if drope:
+            console.print(f"  Phase 2 (DroPE): up to {drope_epochs} epochs on {train_data_dir}")
+        else:
+            console.print("  Phase 2 (DroPE): disabled")
+        console.print(f"  Phase 3 (fine-tune): up to {finetune_epochs} epochs on {ft_source_desc}")
+        console.print(f"  Pre-train LR: {lr}")
+        if drope:
+            console.print(f"  DroPE LR: {drope_lr}")
         console.print(f"  Fine-tune LR: {finetune_lr}")
         if early_stop:
-            console.print(f"  Early stop: enabled (patience={es_patience}, min_delta={es_min_delta}, min_epochs={es_min_epochs})")
+            console.print(f"  Pre-train early stop: patience={es_patience}, min_delta={es_min_delta}, min_epochs={es_min_epochs}")
+            console.print(f"  Fine-tune early stop: patience={ft_es_patience}, min_delta={ft_es_min_delta}, min_epochs={ft_es_min_epochs}")
+            if drope and drope_early_stop:
+                console.print(f"  DroPE early stop: patience={drope_patience}, min_delta={drope_min_delta}, min_epochs={drope_min_epochs}")
+            elif drope:
+                console.print("  DroPE early stop: disabled")
         else:
-            console.print(f"  Early stop: disabled")
+            console.print("  Early stop: disabled for pre-train/fine-tune")
 
-        # --- Phase 1: Pre-train (optional) ---
+        # --- Phase 1: Pre-train (optional skip via checkpoint) ---
         if skip_pretrain:
             console.print(
                 f"\n[bold]Phase 1:[/bold] Skipped pre-training; loading checkpoint {pretrained_checkpoint}"
             )
             trainer.resume_from_checkpoint(pretrained_checkpoint)
+            trainer.save_checkpoint("pretrain_final.pt")
+            pretrain_ckpt = Path(pretrained_checkpoint)
             pt_history = {"train_loss": [], "val_loss": [], "lr": []}
         else:
             console.print(f"\n[bold]Phase 1: Pre-training for {pretrain_epochs} epochs...[/bold]")
@@ -950,7 +993,7 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
                 task = progress.add_task("Pre-training", total=pretrain_epochs - start_epoch + 1)
 
                 def pt_callback(epoch, train_loss, val_loss):
-                    desc = f"[pretrain] Epoch {epoch}/{pretrain_epochs} | loss={train_loss:.4f}"
+                    desc = f"[PRETRAIN] Epoch {epoch}/{pretrain_epochs} | loss={train_loss:.4f}"
                     if val_loss is not None:
                         desc += f" | val_loss={val_loss:.4f}"
                     progress.update(task, advance=1, description=desc)
@@ -965,20 +1008,85 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
                     patience=es_patience,
                     min_delta=es_min_delta,
                     min_epochs=es_min_epochs,
+                    phase_name="PRETRAIN",
+                    checkpoint_prefix="pretrain_",
+                    use_rope=True,
                 )
 
-            console.print(f"  Pre-train final loss: {pt_history['train_loss'][-1]:.4f}")
+            if pt_history["train_loss"]:
+                console.print(f"  Pre-train final loss: {pt_history['train_loss'][-1]:.4f}")
             if pt_history.get("stop_reason") and pt_history["stop_reason"] != "max_epochs_reached":
                 console.print(f"  Pre-train stopped early: {pt_history['stop_reason']} "
                               f"(ran {pt_history.get('epochs_ran', '?')} epochs)")
+            pretrain_ckpt = _resolve_phase_checkpoint(
+                [MODELS_DIR / "pretrain_best.pt", MODELS_DIR / "pretrain_final.pt"],
+                "pre-training transition",
+            )
 
-        # --- Phase 2: Fine-tune ---
-        console.print(f"\n[bold]Phase 2: Preparing fine-tune data from {ft_source_desc}...[/bold]")
+        # Always load the selected pre-training checkpoint before DroPE/fine-tune.
+        trainer.resume_from_checkpoint(pretrain_ckpt)
+        console.print(f"  Loaded pre-train checkpoint: {pretrain_ckpt}")
+
+        # --- Phase 2: DroPE recalibration on broad (pre-train) corpus ---
+        if drope:
+            console.print(
+                f"\n[bold]Phase 2: DroPE recalibration for up to {drope_epochs} epochs (lr={drope_lr})...[/bold]"
+            )
+            if drope_early_stop:
+                console.print(
+                    f"  Early stop: enabled (patience={drope_patience}, "
+                    f"min_delta={drope_min_delta}, min_epochs={drope_min_epochs})"
+                )
+            else:
+                console.print("  Early stop: disabled (fixed-length DroPE run)")
+            with Progress(
+                SpinnerColumn(), TextColumn("{task.description}"),
+                BarColumn(), TaskProgressColumn(), console=console,
+            ) as progress:
+                task = progress.add_task("DroPE recalibration", total=drope_epochs)
+
+                drope_history = trainer.recalibrate_drope(
+                    epochs=drope_epochs,
+                    lr=drope_lr,
+                    early_stop=drope_early_stop,
+                    patience=drope_patience,
+                    min_delta=drope_min_delta,
+                    min_epochs=drope_min_epochs,
+                    warmup_epochs=drope_warmup_epochs,
+                )
+
+                progress.update(
+                    task,
+                    completed=drope_history.get("epochs_ran", drope_epochs),
+                    description="DroPE done!",
+                )
+
+            console.print(f"  DroPE final loss: {drope_history['train_loss'][-1]:.4f}")
+            console.print(f"  DroPE epochs ran: {drope_history.get('epochs_ran', drope_epochs)}")
+            console.print(f"  DroPE stop reason: {drope_history.get('stop_reason', 'unknown')}")
+            console.print("  Model marked as drope_trained=True")
+
+            drope_ckpt = _resolve_phase_checkpoint(
+                [MODELS_DIR / "drope_best.pt", MODELS_DIR / "drope_final.pt"],
+                "DroPE transition",
+            )
+            trainer.resume_from_checkpoint(drope_ckpt)
+            console.print(f"  Loaded DroPE checkpoint: {drope_ckpt}")
+        else:
+            console.print("\n[bold]Phase 2:[/bold] DroPE disabled; continuing from pre-train checkpoint")
+
+        # --- Phase 3: Fine-tune ---
+        console.print(f"\n[bold]Phase 3: Preparing fine-tune data from {ft_source_desc}...[/bold]")
 
         ft_train_ds, ft_val_ds = create_dataset(ft_sequences, seq_len=seq_len, piece_ids=ft_piece_ids)
         console.print(f"  Fine-tune train: {len(ft_train_ds)}, val: {len(ft_val_ds)}")
 
-        trainer.reset_for_finetuning(ft_train_ds, ft_val_ds, lr=finetune_lr)
+        trainer.reset_for_finetuning(
+            ft_train_ds,
+            ft_val_ds,
+            lr=finetune_lr,
+            save_checkpoint_name=None,
+        )
 
         console.print(f"\n[bold]Fine-tuning for {finetune_epochs} epochs...[/bold]")
         with Progress(
@@ -988,21 +1096,23 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
             task = progress.add_task("Fine-tuning", total=finetune_epochs)
 
             def ft_callback(epoch, train_loss, val_loss):
-                desc = f"[finetune] Epoch {epoch}/{epochs} | loss={train_loss:.4f}"
+                desc = f"[FINETUNE] Epoch {epoch}/{finetune_epochs} | loss={train_loss:.4f}"
                 if val_loss is not None:
                     desc += f" | val_loss={val_loss:.4f}"
                 progress.update(task, advance=1, description=desc)
 
             ft_history = trainer.train(
-                epochs=epochs,
-                start_epoch=pretrain_epochs + 1,
+                epochs=finetune_epochs,
+                start_epoch=1,
                 log_interval=log_interval,
                 val_interval=(val_interval if val_interval is not None else max(1, finetune_epochs // 20)),
                 progress_callback=ft_callback,
                 early_stop=early_stop,
-                patience=es_patience,
-                min_delta=es_min_delta,
-                min_epochs=pretrain_epochs + es_min_epochs,
+                patience=ft_es_patience,
+                min_delta=ft_es_min_delta,
+                min_epochs=ft_es_min_epochs,
+                phase_name="FINETUNE",
+                checkpoint_prefix="finetune_",
             )
 
         # Merge histories for reporting
@@ -1042,11 +1152,12 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
                 patience=es_patience,
                 min_delta=es_min_delta,
                 min_epochs=es_min_epochs,
+                phase_name="TRAIN",
             )
         sequences_for_cal = sequences
 
-    # DroPE recalibration phase
-    if drope:
+    # DroPE recalibration phase for single-phase training
+    if drope and not curriculum:
         console.print(
             f"\n[bold]DroPE recalibration (max {drope_epochs} epochs, lr={drope_lr})...[/bold]"
         )
@@ -1070,6 +1181,7 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
                 patience=drope_patience,
                 min_delta=drope_min_delta,
                 min_epochs=drope_min_epochs,
+                warmup_epochs=drope_warmup_epochs,
             )
 
             progress.update(

@@ -238,6 +238,16 @@ class TestResetForFinetuning:
         assert "optimizer_state_dict" in ckpt
         assert ckpt["epoch"] == 100
 
+    def test_checkpoint_save_can_be_disabled(self, tmp_path):
+        trainer = _make_trainer(tmp_path)
+        trainer.reset_for_finetuning(
+            _make_dataset(30),
+            _make_dataset(5),
+            lr=1e-4,
+            save_checkpoint_name=None,
+        )
+        assert not (tmp_path / "models" / "pretrain_final.pt").exists()
+
     def test_new_optimizer_has_fresh_state(self, tmp_path):
         """The new optimizer should have empty state (no momentum buffers)."""
         trainer = _make_trainer(tmp_path)
@@ -291,6 +301,21 @@ class TestResetForFinetuning:
         assert "val_category_loss" in history
         assert history["train_category_loss"][0]["pitch"] is not None
         assert history["val_category_loss"][0]["pitch"] is not None
+
+    def test_train_defaults_to_no_positional_when_drope_trained(self, tmp_path):
+        trainer = _make_trainer(tmp_path)
+        trainer.model.config.drope_trained = True
+
+        calls = []
+
+        def fake_train_epoch(_loader, use_rope=True):
+            calls.append(use_rope)
+            return 1.0, {}
+
+        with patch.object(trainer, "_train_epoch", side_effect=fake_train_epoch):
+            trainer.train(epochs=1, log_interval=1, val_interval=9999)
+
+        assert calls == [False]
 
 
 # ===========================================================================
@@ -472,3 +497,108 @@ class TestCLIOptions:
             # we need to patch it at the usage site
         # Just verify the option is accepted without Click errors
         assert "--composer-filter" not in (result.output if "no such option" in result.output.lower() else "")
+
+    def test_curriculum_pretrained_checkpoint_runs_drope_before_finetune(self, tmp_path):
+        """Curriculum + --pretrained-checkpoint should run DroPE before fine-tuning."""
+        from click.testing import CliRunner
+        from bach_gen.cli import cli
+
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        (data_dir / "sequences.json").write_text(json.dumps([list(range(20, 60)) for _ in range(10)]))
+        (data_dir / "mode.json").write_text(json.dumps({"mode": "all", "max_seq_len": 64}))
+
+        ft_dir = tmp_path / "data_bach"
+        ft_dir.mkdir()
+        (ft_dir / "sequences.json").write_text(json.dumps([list(range(20, 60)) for _ in range(6)]))
+        (ft_dir / "mode.json").write_text(json.dumps({"mode": "all", "max_seq_len": 64}))
+
+        pretrained_ckpt = tmp_path / "pretrained.pt"
+        pretrained_ckpt.write_bytes(b"x")
+
+        models_dir = tmp_path / "models"
+        models_dir.mkdir()
+
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.vocab_size = 100
+        mock_tokenizer.name_to_token = {}
+        mock_tokenizer.token_to_name = {}
+
+        class FakeModel:
+            def __init__(self, config):
+                self.config = config
+
+            def count_parameters(self):
+                return 123
+
+        trainer = MagicMock()
+        call_order: list[tuple] = []
+        train_kwargs: list[dict] = []
+
+        def _resume_side(path):
+            call_order.append(("resume", Path(path).name))
+            return 1
+
+        def _save_side(filename):
+            call_order.append(("save", filename))
+            (models_dir / filename).touch()
+
+        def _drope_side(**kwargs):
+            call_order.append(("drope", kwargs["lr"], kwargs["warmup_epochs"]))
+            (models_dir / "drope_best.pt").touch()
+            return {
+                "train_loss": [1.0],
+                "val_loss": [0.9],
+                "lr": [kwargs["lr"]],
+                "epochs_ran": 1,
+                "stop_reason": "max_epochs_reached",
+            }
+
+        def _reset_side(*args, **kwargs):
+            call_order.append(("reset", kwargs.get("save_checkpoint_name")))
+
+        def _train_side(*args, **kwargs):
+            call_order.append(("train", kwargs.get("phase_name")))
+            train_kwargs.append(kwargs)
+            return {"train_loss": [0.8], "val_loss": [0.7], "lr": [1e-4]}
+
+        trainer.resume_from_checkpoint.side_effect = _resume_side
+        trainer.save_checkpoint.side_effect = _save_side
+        trainer.recalibrate_drope.side_effect = _drope_side
+        trainer.reset_for_finetuning.side_effect = _reset_side
+        trainer.train.side_effect = _train_side
+
+        with patch("bach_gen.cli.MODELS_DIR", models_dir), \
+             patch("bach_gen.data.tokenizer.load_tokenizer", return_value=mock_tokenizer), \
+             patch("bach_gen.data.dataset.create_dataset", side_effect=[(_make_dataset(10), _make_dataset(2)),
+                                                                         (_make_dataset(6), _make_dataset(2))]), \
+             patch("bach_gen.model.architecture.BachTransformer", FakeModel), \
+             patch("bach_gen.model.trainer.get_device", return_value=torch.device("cpu")), \
+             patch("bach_gen.model.trainer.Trainer", return_value=trainer), \
+             patch("bach_gen.evaluation.information.calibrate_from_corpus",
+                   return_value={"perplexity_range": [0.0, 1.0], "entropy_range": [0.0, 1.0]}), \
+             patch("bach_gen.evaluation.information.save_information_calibration"):
+            runner = CliRunner()
+            result = runner.invoke(cli, [
+                "train",
+                "--curriculum",
+                "--data-dir", str(data_dir),
+                "--finetune-data-dir", str(ft_dir),
+                "--epochs", "12",
+                "--pretrain-epochs", "6",
+                "--pretrained-checkpoint", str(pretrained_ckpt),
+            ])
+
+        assert result.exit_code == 0
+
+        names = [x[0] for x in call_order]
+        assert "drope" in names
+        assert "reset" in names
+        assert "train" in names
+        assert names.index("drope") < names.index("reset")
+        assert names.index("drope") < names.index("train")
+
+        assert any(x == ("resume", "drope_best.pt") for x in call_order)
+        assert any(x == ("reset", None) for x in call_order)
+        assert train_kwargs[-1]["phase_name"] == "FINETUNE"
+        assert train_kwargs[-1]["checkpoint_prefix"] == "finetune_"

@@ -105,14 +105,16 @@ class Trainer:
         train_dataset: BachDataset,
         val_dataset: BachDataset | None,
         lr: float,
+        save_checkpoint_name: str | None = "pretrain_final.pt",
     ) -> None:
         """Swap datasets and reset optimizer for fine-tuning phase.
 
-        Saves the current model as ``pretrain_final.pt``, then replaces
-        the training/validation datasets, creates a fresh optimizer with
-        the given learning rate, and resets ``best_val_loss``.
+        Optionally saves the current model checkpoint, then replaces the
+        training/validation datasets, creates a fresh optimizer with the
+        given learning rate, and resets ``best_val_loss``.
         """
-        self._save_checkpoint("pretrain_final.pt")
+        if save_checkpoint_name:
+            self._save_checkpoint(save_checkpoint_name)
 
         self.train_dataset = train_dataset
         self.val_dataset = val_dataset
@@ -132,6 +134,10 @@ class Trainer:
             f"val={len(val_dataset) if val_dataset else 0}"
         )
 
+    def save_checkpoint(self, filename: str) -> None:
+        """Public checkpoint save helper for phase transitions."""
+        self._save_checkpoint(filename)
+
     def resume_from_checkpoint(self, path: str | Path) -> int:
         """Load model, optimizer, and training state from checkpoint.
 
@@ -142,9 +148,10 @@ class Trainer:
         self.model.load_state_dict(checkpoint["model_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         self.best_val_loss = checkpoint.get("best_val_loss", float("inf"))
-        start_epoch = checkpoint.get("epoch", 0)
-        logger.info(f"Resumed from {path} (epoch {start_epoch}, best_val={self.best_val_loss:.4f})")
-        return start_epoch + 1
+        saved_epoch = checkpoint.get("epoch", 0)
+        self.epoch = saved_epoch
+        logger.info(f"Resumed from {path} (epoch {saved_epoch}, best_val={self.best_val_loss:.4f})")
+        return saved_epoch + 1
 
     def train(
         self,
@@ -157,6 +164,9 @@ class Trainer:
         patience: int = 20,
         min_delta: float = 1e-4,
         min_epochs: int = 10,
+        phase_name: str | None = None,
+        checkpoint_prefix: str = "",
+        use_rope: bool | None = None,
     ) -> dict:
         """Run training loop.
 
@@ -170,6 +180,10 @@ class Trainer:
             patience: Allowed consecutive non-improving validation checks.
             min_delta: Minimum val loss improvement to reset patience.
             min_epochs: Minimum epochs before early stop can trigger.
+            phase_name: Optional phase label for log messages.
+            checkpoint_prefix: Optional checkpoint name prefix per phase.
+            use_rope: Whether to use positional embeddings. Defaults to
+                ``not model.config.drope_trained``.
 
         Returns:
             Dict with training history.
@@ -181,6 +195,11 @@ class Trainer:
             drop_last=True,
             num_workers=0,
         )
+
+        if use_rope is None:
+            use_rope = not getattr(self.model.config, "drope_trained", False)
+        phase_tag = f"[{phase_name}] " if phase_name else ""
+        ckpt_prefix = checkpoint_prefix or ""
 
         val_loader = None
         if self.val_dataset and len(self.val_dataset) > 0:
@@ -206,10 +225,13 @@ class Trainer:
             history["val_category_loss"] = []
 
         effective_batch = self.batch_size * self.accumulation_steps
-        logger.info(f"Training on {self.device} for {epochs} epochs (starting at epoch {start_epoch})")
-        logger.info(f"Model params: {self.model.count_parameters():,}")
         logger.info(
-            f"Batch size: {self.batch_size} x {self.accumulation_steps} accumulation"
+            f"{phase_tag}Training on {self.device} for {epochs} epochs "
+            f"(starting at epoch {start_epoch})"
+        )
+        logger.info(f"{phase_tag}Model params: {self.model.count_parameters():,}")
+        logger.info(
+            f"{phase_tag}Batch size: {self.batch_size} x {self.accumulation_steps} accumulation"
             f" = {effective_batch} effective"
         )
 
@@ -221,7 +243,7 @@ class Trainer:
 
         if early_stop:
             logger.info(
-                f"Early stopping enabled: patience={patience}, "
+                f"{phase_tag}Early stopping enabled: patience={patience}, "
                 f"min_delta={min_delta}, min_epochs={min_epochs}"
             )
 
@@ -230,7 +252,7 @@ class Trainer:
 
         for epoch in range(start_epoch, epochs + 1):
             self.epoch = epoch
-            train_loss, train_cat_losses = self._train_epoch(train_loader)
+            train_loss, train_cat_losses = self._train_epoch(train_loader, use_rope=use_rope)
             history["train_loss"].append(train_loss)
             history["lr"].append(scheduler.get_last_lr()[0])
             if "train_category_loss" in history:
@@ -241,7 +263,7 @@ class Trainer:
             val_loss = None
             val_cat_losses: dict[str, float | None] = {}
             if val_loader and epoch % val_interval == 0:
-                val_loss, val_cat_losses = self._validate(val_loader)
+                val_loss, val_cat_losses = self._validate(val_loader, use_rope=use_rope)
                 history["val_loss"].append(val_loss)
                 if "val_category_loss" in history:
                     history["val_category_loss"].append(val_cat_losses)
@@ -249,17 +271,17 @@ class Trainer:
                 if val_loss < (self.best_val_loss - min_delta):
                     self.best_val_loss = val_loss
                     bad_epochs = 0
-                    self._save_checkpoint("best.pt")
+                    self._save_checkpoint(f"{ckpt_prefix}best.pt")
                 elif val_loss < self.best_val_loss:
                     # Improved but below min_delta threshold
                     self.best_val_loss = val_loss
                     bad_epochs += 1
-                    self._save_checkpoint("best.pt")
+                    self._save_checkpoint(f"{ckpt_prefix}best.pt")
                 else:
                     bad_epochs += 1
 
             if epoch % log_interval == 0:
-                msg = f"Epoch {epoch}/{epochs} | train_loss={train_loss:.4f}"
+                msg = f"{phase_tag}Epoch {epoch}/{epochs} | train_loss={train_loss:.4f}"
                 if train_cat_losses:
                     msg += self._format_category_losses(train_cat_losses, label="train_cat")
                 if val_loss is not None:
@@ -273,17 +295,17 @@ class Trainer:
                 progress_callback(epoch, train_loss, val_loss)
 
             # Save after every epoch so training can be stopped at any time
-            self._save_checkpoint("latest.pt")
+            self._save_checkpoint(f"{ckpt_prefix}latest.pt")
 
             if early_stop and epoch >= min_epochs and bad_epochs >= patience:
                 stop_reason = (
                     f"early_stop(patience={patience}, min_delta={min_delta})"
                 )
-                logger.info(f"Early stop at epoch {epoch}: {stop_reason}")
+                logger.info(f"{phase_tag}Early stop at epoch {epoch}: {stop_reason}")
                 break
 
         # Save final checkpoint
-        self._save_checkpoint("final.pt")
+        self._save_checkpoint(f"{ckpt_prefix}final.pt")
 
         history["epochs_ran"] = len(history["train_loss"])
         history["stop_reason"] = stop_reason
@@ -368,9 +390,10 @@ class Trainer:
         epochs: int,
         lr: float,
         early_stop: bool = True,
-        patience: int = 2,
+        patience: int = 5,
         min_delta: float = 1e-4,
         min_epochs: int = 4,
+        warmup_epochs: int = 1,
     ) -> dict:
         """Run DroPE recalibration: continue training without RoPE.
 
@@ -386,12 +409,17 @@ class Trainer:
             patience: Allowed consecutive non-improving epochs.
             min_delta: Minimum metric improvement to reset patience.
             min_epochs: Minimum epochs before early stop is allowed.
+            warmup_epochs: Warmup epochs before cosine decay.
 
         Returns:
             Dict with training history for the recalibration phase.
         """
         # Save pre-DroPE checkpoint
         self._save_checkpoint("pre_drope.pt")
+
+        # Mark model as DroPE-trained before saving DroPE checkpoints so the
+        # flag persists when loading drope_best.pt for downstream phases.
+        self.model.config.drope_trained = True
 
         # Record the training sequence length before DroPE
         self.model.config.drope_train_seq_len = self.model.config.max_seq_len
@@ -424,9 +452,30 @@ class Trainer:
                 num_workers=0,
             )
 
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=epochs, eta_min=1e-6,
-        )
+        total_epochs = max(1, epochs)
+        warmup_epochs = max(0, min(warmup_epochs, total_epochs - 1))
+        if warmup_epochs > 0:
+            scheduler = torch.optim.lr_scheduler.SequentialLR(
+                self.optimizer,
+                schedulers=[
+                    torch.optim.lr_scheduler.LinearLR(
+                        self.optimizer,
+                        start_factor=0.2,
+                        end_factor=1.0,
+                        total_iters=warmup_epochs,
+                    ),
+                    torch.optim.lr_scheduler.CosineAnnealingLR(
+                        self.optimizer,
+                        T_max=max(1, total_epochs - warmup_epochs),
+                        eta_min=1e-6,
+                    ),
+                ],
+                milestones=[warmup_epochs],
+            )
+        else:
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer, T_max=total_epochs, eta_min=1e-6,
+            )
 
         history = {"train_loss": [], "val_loss": [], "lr": []}
         if self._token_category_map is not None:
@@ -436,6 +485,7 @@ class Trainer:
         logger.info(
             f"DroPE recalibration: {epochs} epochs, lr={lr}, "
             f"dropping {self.model.config.pos_encoding} positional encoding, "
+            f"warmup_epochs={warmup_epochs}, "
             f"early_stop={early_stop}, patience={patience}, min_delta={min_delta}, min_epochs={min_epochs}"
         )
 
@@ -475,13 +525,14 @@ class Trainer:
             else:
                 bad_epochs += 1
 
-            msg = f"[DroPE] Epoch {epoch}/{epochs} | train_loss={train_loss:.4f}"
+            msg = f"[DROPE] Epoch {epoch}/{epochs} | train_loss={train_loss:.4f}"
             if train_cat_losses:
                 msg += self._format_category_losses(train_cat_losses, label="train_cat")
             if val_loss is not None:
                 msg += f" | val_loss={val_loss:.4f}"
                 if val_cat_losses:
                     msg += self._format_category_losses(val_cat_losses, label="val_cat")
+            msg += f" | lr={scheduler.get_last_lr()[0]:.6f}"
             logger.info(msg)
 
             self._save_checkpoint("drope_latest.pt")
@@ -492,9 +543,6 @@ class Trainer:
                 )
                 logger.info(f"DroPE early stop at epoch {epoch}: {stop_reason}")
                 break
-
-        # Mark model as DroPE-trained
-        self.model.config.drope_trained = True
 
         # Save final DroPE checkpoint
         self._save_checkpoint("drope_final.pt")
