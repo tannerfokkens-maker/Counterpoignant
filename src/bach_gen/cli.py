@@ -725,6 +725,8 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
               help="Minimum val loss improvement to reset patience (default: 1e-4)")
 @click.option("--es-min-epochs", default=10, type=int,
               help="Minimum epochs before early stopping can trigger (default: 10)")
+@click.option("--log-interval", default=5, type=int,
+              help="Training log frequency in epochs (default: 5)")
 @click.option("--val-interval", default=None, type=int,
               help="Validation frequency in epochs (default: auto = epochs//20)")
 @click.option("--fp16", is_flag=True, default=False,
@@ -742,6 +744,7 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
           drope_early_stop: bool, drope_patience: int, drope_min_delta: float,
           drope_min_epochs: int,
           early_stop: bool, es_patience: int, es_min_delta: float, es_min_epochs: int,
+          log_interval: int,
           val_interval: int | None,
           fp16: bool, pos_encoding: str, num_kv_heads: int | None) -> None:
     """Train the Bach Transformer model."""
@@ -779,6 +782,9 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
 
     if val_interval is not None and val_interval < 1:
         console.print("[red]--val-interval must be >= 1[/red]")
+        sys.exit(1)
+    if log_interval < 1:
+        console.print("[red]--log-interval must be >= 1[/red]")
         sys.exit(1)
 
     console.print(f"[bold]Loading training data from {train_data_dir}...[/bold]")
@@ -952,7 +958,7 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
                 pt_history = trainer.train(
                     epochs=pretrain_epochs,
                     start_epoch=start_epoch,
-                    log_interval=max(1, pretrain_epochs // 20),
+                    log_interval=log_interval,
                     val_interval=(val_interval if val_interval is not None else max(1, pretrain_epochs // 20)),
                     progress_callback=pt_callback,
                     early_stop=early_stop,
@@ -990,7 +996,7 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
             ft_history = trainer.train(
                 epochs=epochs,
                 start_epoch=pretrain_epochs + 1,
-                log_interval=max(1, finetune_epochs // 20),
+                log_interval=log_interval,
                 val_interval=(val_interval if val_interval is not None else max(1, finetune_epochs // 20)),
                 progress_callback=ft_callback,
                 early_stop=early_stop,
@@ -1029,7 +1035,7 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
             history = trainer.train(
                 epochs=epochs,
                 start_epoch=start_epoch,
-                log_interval=max(1, epochs // 20),
+                log_interval=log_interval,
                 val_interval=(val_interval if val_interval is not None else max(1, epochs // 20)),
                 progress_callback=callback,
                 early_stop=early_stop,

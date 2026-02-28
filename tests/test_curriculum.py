@@ -330,6 +330,7 @@ class TestCLIOptions:
         assert "--finetune-data-dir" in result.output
         assert "--pretrained-checkpoint" in result.output
         assert "--finetune-lr" in result.output
+        assert "--log-interval" in result.output
         assert "--val-interval" in result.output
         assert "--data-dir" in result.output
 
@@ -422,6 +423,33 @@ class TestCLIOptions:
 
         assert result.exit_code != 0
         assert "val-interval" in result.output.lower()
+
+    def test_train_rejects_invalid_log_interval(self, tmp_path):
+        """--log-interval must be >= 1."""
+        from click.testing import CliRunner
+        from bach_gen.cli import cli
+
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        seqs = [list(range(20, 50)) for _ in range(10)]
+        (data_dir / "sequences.json").write_text(json.dumps(seqs))
+        (data_dir / "mode.json").write_text('{"mode": "2-part", "num_voices": 2, "tokenizer_type": "absolute"}')
+
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.vocab_size = 100
+
+        with patch("bach_gen.data.tokenizer.load_tokenizer", return_value=mock_tokenizer), \
+             patch("bach_gen.data.dataset.create_dataset", return_value=(_make_dataset(10), _make_dataset(2))):
+            runner = CliRunner()
+            result = runner.invoke(cli, [
+                "train",
+                "--epochs", "20",
+                "--data-dir", str(data_dir),
+                "--log-interval", "0",
+            ])
+
+        assert result.exit_code != 0
+        assert "log-interval" in result.output.lower()
 
     def test_prepare_data_composer_filter_parsing(self, tmp_path):
         """Verify composer_filter string is split correctly."""
