@@ -165,6 +165,29 @@ Use either `--finetune-data-dir` or `--finetune`, not both.
 DroPE is on by default with curriculum too, and runs after both phases complete.
 Recommended default split: 70/30 pre-train/fine-tune (e.g. `350/500` for a 500-epoch run).
 
+### Quick Test (<1 hour)
+
+Use this to sanity-check the full curriculum + DroPE pipeline after code/data changes:
+
+```bash
+uv run bach-gen train \
+  --curriculum \
+  --finetune bach \
+  --epochs 20 \
+  --pretrain-epochs 14 \
+  --finetune-lr 1e-4 \
+  --batch-size 16 \
+  --accumulation-steps 1 \
+  --lr 5e-4 \
+  --num-kv-heads 2 \
+  --seq-len 1024 \
+  --drope-epochs 4 \
+  --drope-min-epochs 2 \
+  --drope-patience 1 \
+  --drope-min-delta 5e-4 \
+  --fp16
+```
+
 ### Resuming
 
 ```bash
