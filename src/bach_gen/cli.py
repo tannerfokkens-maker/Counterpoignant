@@ -1467,7 +1467,7 @@ def calibrate(sample_size: int) -> None:
     if mode_path.exists():
         with open(mode_path) as f:
             mode_info = json.load(f)
-    mode = mode_info.get("mode", "chorale")
+    mode = mode_info.get("mode", "all")
 
     # Sample corpus sequences
     sample = rng.sample(sequences, min(sample_size, len(sequences)))
