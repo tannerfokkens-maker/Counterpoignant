@@ -545,25 +545,57 @@ def _generate_one(
     device: torch.device,
     use_rope: bool = True,
 ) -> list[int]:
-    """Generate a single token sequence."""
+    """Generate a single token sequence using KV cache for O(N) decoding."""
     model.eval()
     tokens = list(prompt)
+    max_seq_len = model.config.max_seq_len
 
     # Initialise constraint state from prompt
     state = constraints.initial_state(tokens)
 
-    for _ in range(max_length):
-        # Truncate input to max sequence length
-        input_tokens = tokens[-model.config.max_seq_len:]
-        input_ids = torch.tensor([input_tokens], dtype=torch.long, device=device)
+    # --- Prefill phase: process entire prompt with caching ---
+    prompt_ids = torch.tensor([tokens[-max_seq_len:]], dtype=torch.long, device=device)
+    logits, kv_caches = model(prompt_ids, use_rope=use_rope, use_cache=True)
+    raw_next_logits = logits[0, -1, :]
 
-        logits = model(input_ids, use_rope=use_rope)
-        raw_next_logits = logits[0, -1, :]  # (vocab_size,)
+    # Apply constraints and sample first token
+    next_logits = constraints.apply(raw_next_logits, state)
+    next_token = sample_next_token(
+        next_logits,
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
+        min_p=min_p,
+        fallback_logits=raw_next_logits,
+    )
+    tokens.append(next_token)
+    state = constraints.update_state(state, next_token)
 
-        # Apply constraints using cached state
+    if next_token == tokenizer.EOS:
+        return tokens
+
+    # --- Incremental phase: one token at a time ---
+    for _ in range(max_length - 1):
+        # Overflow: if cache has reached max_seq_len, drop oldest entries
+        # but keep pos_offset correct for absolute position encoding
+        if kv_caches[0].seq_len >= max_seq_len:
+            trim = kv_caches[0].seq_len - max_seq_len + 1
+            kv_caches = [
+                type(c)(
+                    k=c.k[:, :, trim:, :],
+                    v=c.v[:, :, trim:, :],
+                    pos_offset=c.pos_offset,
+                )
+                for c in kv_caches
+            ]
+
+        step_ids = torch.tensor([[next_token]], dtype=torch.long, device=device)
+        logits, kv_caches = model(
+            step_ids, use_rope=use_rope, use_cache=True, kv_cache=kv_caches,
+        )
+        raw_next_logits = logits[0, -1, :]
+
         next_logits = constraints.apply(raw_next_logits, state)
-
-        # Sample
         next_token = sample_next_token(
             next_logits,
             temperature=temperature,
@@ -576,7 +608,6 @@ def _generate_one(
         tokens.append(next_token)
         state = constraints.update_state(state, next_token)
 
-        # Stop on EOS
         if next_token == tokenizer.EOS:
             break
 

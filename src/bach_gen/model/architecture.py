@@ -6,12 +6,36 @@ Architecture: RoPE + RMSNorm + SwiGLU + pre-norm + weight tying (mini-LLaMA).
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from bach_gen.model.config import ModelConfig
+
+
+@dataclass
+class KVCache:
+    """Per-layer key/value cache for incremental decoding.
+
+    Stores K and V at the SDPA-ready stage:
+    - K is post-RoPE/PoPE (position info baked in)
+    - K/V are post-GQA expansion (already num_heads, not num_kv_heads)
+    - V is post-PoPE zero-expansion (already 2*head_dim when PoPE active)
+
+    This means cached K/V can be concatenated directly with new K/V
+    without re-expansion.
+    """
+
+    k: torch.Tensor  # (batch, num_heads, cached_len, effective_dim)
+    v: torch.Tensor  # (batch, num_heads, cached_len, effective_dim)
+    pos_offset: int = 0  # absolute position of next token to be generated
+
+    @property
+    def seq_len(self) -> int:
+        """Number of cached positions."""
+        return self.k.shape[2]
 
 
 class RotaryEmbedding(nn.Module):
@@ -232,7 +256,9 @@ class BachTransformer(nn.Module):
         attention_mask: torch.Tensor | None = None,
         use_rope: bool = True,
         attn_temperature: float | None = None,
-    ) -> torch.Tensor:
+        use_cache: bool = False,
+        kv_cache: list[KVCache] | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, list[KVCache]]:
         """Forward pass.
 
         Args:
@@ -241,9 +267,12 @@ class BachTransformer(nn.Module):
             use_rope: If False, skip rotary positional embeddings (for DroPE).
             attn_temperature: If set, scale attention logits by 1/beta* before
                 softmax. Used at inference with DroPE models on extended contexts.
+            use_cache: If True, return (logits, kv_caches) for incremental decoding.
+            kv_cache: Per-layer KV caches from a previous forward pass.
 
         Returns:
-            logits: (batch, seq_len, vocab_size)
+            logits: (batch, seq_len, vocab_size) — or (logits, kv_caches) when
+            use_cache is True.
         """
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
@@ -252,37 +281,55 @@ class BachTransformer(nn.Module):
         x = self.token_embed(input_ids)
         x = self.embed_dropout(x)
 
-        # Causal mask
-        causal_mask = torch.triu(
-            torch.ones(seq_len, seq_len, device=device, dtype=torch.bool),
-            diagonal=1,
-        )
+        # Absolute position offset for incremental decoding
+        pos_offset = kv_cache[0].pos_offset if kv_cache is not None else 0
+
+        # Causal mask — not needed in incremental mode (new tokens attend to all)
+        if kv_cache is not None:
+            causal_mask = None
+        else:
+            causal_mask = torch.triu(
+                torch.ones(seq_len, seq_len, device=device, dtype=torch.bool),
+                diagonal=1,
+            )
 
         # Apply padding mask if provided
-        if attention_mask is not None:
+        if attention_mask is not None and kv_cache is None:
             # attention_mask: (batch, seq_len), 1=attend, 0=pad
-            # We need to expand it for the attention mechanism
             pad_mask = attention_mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, S)
             pad_mask = pad_mask.expand(-1, -1, seq_len, -1)  # (B, 1, S, S)
         else:
             pad_mask = None
 
-        # Compute positional cos/sin for this sequence length (or skip for DroPE)
+        # Compute positional cos/sin — slice to absolute positions for new tokens
         if use_rope and self.pos_emb is not None:
-            cos, sin = self.pos_emb(seq_len)
-            cos = cos.to(device)
-            sin = sin.to(device)
+            total_len = pos_offset + seq_len
+            cos, sin = self.pos_emb(total_len)
+            cos = cos[pos_offset:pos_offset + seq_len].to(device)
+            sin = sin[pos_offset:pos_offset + seq_len].to(device)
         else:
             cos, sin = None, None
 
-        for layer in self.layers:
-            x = layer(x, causal_mask=causal_mask, pad_mask=pad_mask,
-                      cos=cos, sin=sin, use_pos=use_rope,
-                      attn_temperature=attn_temperature)
+        new_caches: list[KVCache] = []
+        for i, layer in enumerate(self.layers):
+            layer_cache = kv_cache[i] if kv_cache is not None else None
+            layer_out = layer(
+                x, causal_mask=causal_mask, pad_mask=pad_mask,
+                cos=cos, sin=sin, use_pos=use_rope,
+                attn_temperature=attn_temperature,
+                kv_cache=layer_cache, use_cache=use_cache,
+            )
+            if use_cache:
+                x, layer_new_cache = layer_out
+                new_caches.append(layer_new_cache)
+            else:
+                x = layer_out
 
         x = self.ln_final(x)
         logits = self.head(x)
 
+        if use_cache:
+            return logits, new_caches
         return logits
 
     def count_parameters(self) -> int:
@@ -304,19 +351,29 @@ class TransformerBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        causal_mask: torch.Tensor,
+        causal_mask: torch.Tensor | None,
         pad_mask: torch.Tensor | None = None,
         cos: torch.Tensor | None = None,
         sin: torch.Tensor | None = None,
         use_pos: bool = True,
         attn_temperature: float | None = None,
-    ) -> torch.Tensor:
+        kv_cache: KVCache | None = None,
+        use_cache: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, KVCache]:
         # Pre-norm attention
-        x = x + self.dropout(self.attn(self.ln1(x), causal_mask, pad_mask,
-                                       cos=cos, sin=sin, use_pos=use_pos,
-                                       attn_temperature=attn_temperature))
+        attn_out = self.attn(
+            self.ln1(x), causal_mask, pad_mask,
+            cos=cos, sin=sin, use_pos=use_pos,
+            attn_temperature=attn_temperature,
+            kv_cache=kv_cache, use_cache=use_cache,
+        )
+        if use_cache:
+            attn_out, new_cache = attn_out
+        x = x + self.dropout(attn_out)
         # Pre-norm FFN
         x = x + self.dropout(self.ffn(self.ln2(x)))
+        if use_cache:
+            return x, new_cache
         return x
 
 
@@ -344,13 +401,15 @@ class CausalSelfAttention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        causal_mask: torch.Tensor,
+        causal_mask: torch.Tensor | None,
         pad_mask: torch.Tensor | None = None,
         cos: torch.Tensor | None = None,
         sin: torch.Tensor | None = None,
         use_pos: bool = True,
         attn_temperature: float | None = None,
-    ) -> torch.Tensor:
+        kv_cache: KVCache | None = None,
+        use_cache: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, KVCache]:
         B, T, C = x.shape
 
         # Separate Q, K, V projections (supports GQA when num_kv_heads < num_heads)
@@ -392,6 +451,16 @@ class CausalSelfAttention(nn.Module):
             v_expanded = torch.stack([v, torch.zeros_like(v)], dim=-1)
             v = v_expanded.reshape(*v.shape[:-1], 2 * v.shape[-1])
 
+        # --- KV cache: concatenate cached K/V with new K/V ---
+        if kv_cache is not None:
+            k = torch.cat([kv_cache.k, k], dim=2)
+            v = torch.cat([kv_cache.v, v], dim=2)
+
+        new_cache: KVCache | None = None
+        if use_cache:
+            pos_offset = (kv_cache.pos_offset if kv_cache is not None else 0) + T
+            new_cache = KVCache(k=k, v=v, pos_offset=pos_offset)
+
         # DroPE attention temperature scaling (Gelberg et al. 2025)
         # Scale Q before SDPA (equivalent to dividing attn logits by temperature)
         if attn_temperature is not None and attn_temperature != 1.0:
@@ -399,13 +468,19 @@ class CausalSelfAttention(nn.Module):
 
         # Build attention mask combining causal + padding
         attn_mask = None
-        if pad_mask is not None:
+        use_is_causal = False
+        if kv_cache is not None:
+            # Incremental mode: new Q tokens can attend to all K/V positions
+            pass
+        elif pad_mask is not None:
             # pad_mask: (B, 1, T, T) where 0 = ignore
             # Combine with causal mask: both must allow attention
             combined = causal_mask.unsqueeze(0).unsqueeze(0) | (pad_mask == 0)
             # Convert bool mask to float: True (blocked) -> -inf, False (attend) -> 0
             attn_mask = torch.zeros_like(combined, dtype=q.dtype)
             attn_mask.masked_fill_(combined, float("-inf"))
+        else:
+            use_is_causal = True
 
         # Use PyTorch's scaled_dot_product_attention (Flash Attention when available)
         dropout_p = self.attn_dropout.p if self.training else 0.0
@@ -413,7 +488,7 @@ class CausalSelfAttention(nn.Module):
             q, k, v,
             attn_mask=attn_mask,
             dropout_p=dropout_p,
-            is_causal=(attn_mask is None),  # use built-in causal mask when no padding
+            is_causal=use_is_causal,
         )
 
         # Collapse interleaved PoPE output: [real, 0, real, 0, ...] -> [real, real, ...]
@@ -423,6 +498,8 @@ class CausalSelfAttention(nn.Module):
         out = out.transpose(1, 2).reshape(B, T, C)
         out = self.proj_dropout(self.proj(out))
 
+        if use_cache:
+            return out, new_cache
         return out
 
 
