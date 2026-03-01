@@ -359,14 +359,17 @@ class CausalSelfAttention(nn.Module):
         v = self.v_proj(x).reshape(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
         # Apply positional encoding to Q and K (leave V unchanged)
+        pope_doubled = False
         if self.pos_encoding == "pope":
             if use_pos and cos is not None:
                 q = apply_pope_emb(q, cos, sin)
                 k = apply_pope_emb(k, cos, sin)
+                pope_doubled = True
             elif not use_pos:
                 # DroPE phase: preserve dimensions, remove position
                 q = apply_pope_no_pos(q)
                 k = apply_pope_no_pos(k)
+                pope_doubled = True
         elif self.pos_encoding == "rope":
             if cos is not None:
                 q = apply_rotary_emb(q, cos, sin)
@@ -377,6 +380,17 @@ class CausalSelfAttention(nn.Module):
         if self.num_kv_groups > 1:
             k = k.repeat_interleave(self.num_kv_groups, dim=1)
             v = v.repeat_interleave(self.num_kv_groups, dim=1)
+
+        # PoPE doubles Q/K dimensions (head_dim -> 2*head_dim). Explicitly
+        # expand V to match by interleaving with zeros:
+        #   [v0, 0, v1, 0, ...] so that SDPA output can be collapsed with
+        #   out[..., 0::2] on every backend (CPU, MPS, CUDA).
+        # The zeros contribute nothing to dot-product attention, so this is
+        # mathematically equivalent to the implicit broadcast that CUDA SDPA
+        # performs when Q/K and V have different last dimensions.
+        if pope_doubled:
+            v_expanded = torch.stack([v, torch.zeros_like(v)], dim=-1)
+            v = v_expanded.reshape(*v.shape[:-1], 2 * v.shape[-1])
 
         # DroPE attention temperature scaling (Gelberg et al. 2025)
         # Scale Q before SDPA (equivalent to dividing attn logits by temperature)
@@ -402,22 +416,9 @@ class CausalSelfAttention(nn.Module):
             is_causal=(attn_mask is None),  # use built-in causal mask when no padding
         )
 
-        # PoPE doubles per-head components in Q/K. Some SDPA backends/checkpoints can
-        # return doubled per-head outputs; collapse interleaved [real, imag] pairs back
-        # to the model head dimension before flattening to (B, T, C).
-        if out.size(-1) == 2 * self.head_dim:
-            if self.pos_encoding != "pope":
-                raise RuntimeError(
-                    "Attention output has unexpected doubled head dimension "
-                    f"({out.size(-1)} vs expected {self.head_dim}) for "
-                    f"pos_encoding={self.pos_encoding!r}"
-                )
+        # Collapse interleaved PoPE output: [real, 0, real, 0, ...] -> [real, real, ...]
+        if pope_doubled:
             out = out[..., 0::2]
-        elif out.size(-1) != self.head_dim:
-            raise RuntimeError(
-                "Attention output head dimension mismatch: "
-                f"got {out.size(-1)}, expected {self.head_dim}"
-            )
 
         out = out.transpose(1, 2).reshape(B, T, C)
         out = self.proj_dropout(self.proj(out))

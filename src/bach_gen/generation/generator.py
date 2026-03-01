@@ -363,28 +363,19 @@ def _build_prompt(
     key_token_name = f"KEY_{key_name}"
     if key_token_name in tokenizer.name_to_token:
         tokens.append(tokenizer.name_to_token[key_token_name])
-    return tokens #temporary fix... to skip subject. we need to fix this for real eventually.
 
-    # Subject — dispatch based on tokenizer type
-    # Skip subject in sequential mode (subjects are interleaved-mode only)
-    if encoding_mode == "sequential":
-        return tokens
+    # Seed first bar to avoid empty measures eating token budget
+    tokens.append(tokenizer.BAR)
+    beat_1_tok = tokenizer.name_to_token.get("BEAT_1")
+    if beat_1_tok is not None:
+        tokens.append(beat_1_tok)
 
-    from bach_gen.data.scale_degree_tokenizer import ScaleDegreeTokenizer
-    if isinstance(tokenizer, ScaleDegreeTokenizer):
-        if subject_str:
-            subject_tokens = parse_subject_string_sd(
-                subject_str, tokenizer, key_root, key_mode,
-            )
-        else:
-            subject_tokens = generate_subject_sd(key_root, key_mode, tokenizer)
-    else:
-        if subject_str:
-            subject_tokens = parse_subject_string(subject_str, tokenizer)
-        else:
-            subject_tokens = generate_subject(key_root, key_mode, tokenizer)
+    # NOTE: Subject injection is disabled because SUBJECT_START/END tokens
+    # were never present in the training data. The model generates its own
+    # opening material from the conditioning prefix + KEY + BAR + BEAT_1.
+    # TODO: Fix subject injection to emit tokens in training-data format
+    # (BAR/BEAT/VOICE markers, no SUBJECT_START/END) to enable melody-in mode.
 
-    tokens.extend(subject_tokens)
     return tokens
 
 
@@ -588,8 +579,7 @@ def _generate_one(
         # Stop on EOS
         if next_token == tokenizer.EOS:
             break
-    names = [tokenizer.token_to_name.get(t, f"UNK_{t}") for t in tokens[:50]]
-    print("FIRST 50 TOKENS:", " ".join(names))
+
     return tokens
 
 
