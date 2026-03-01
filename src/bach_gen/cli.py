@@ -705,10 +705,10 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
               help="Skip curriculum pre-train phase and start at DroPE from this checkpoint")
 @click.option("--drope/--no-drope", default=True,
               help="Enable/disable DroPE recalibration phase (default: enabled)")
-@click.option("--drope-epochs", default=10, type=int,
-              help="Maximum DroPE recalibration epochs (default: 10)")
-@click.option("--drope-lr", default=1e-4, type=float,
-              help="Learning rate for DroPE recalibration (default: 1e-4)")
+@click.option("--drope-epochs", default=20, type=int,
+              help="Maximum DroPE recalibration epochs (default: 20)")
+@click.option("--drope-lr", default=1e-3, type=float,
+              help="Learning rate for DroPE recalibration (default: 1e-3)")
 @click.option("--drope-warmup-epochs", default=1, type=int,
               help="Warmup epochs before DroPE cosine decay (default: 1)")
 @click.option("--drope-early-stop/--drope-fixed", default=True,

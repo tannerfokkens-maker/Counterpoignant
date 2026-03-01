@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import torch
+import torch.nn as nn
 
 from bach_gen.model.architecture import (
     CausalSelfAttention,
@@ -90,3 +91,41 @@ def test_causal_self_attention_with_pope_runs_and_is_finite() -> None:
 
     assert out.shape == x.shape
     assert torch.isfinite(out).all()
+
+
+def test_causal_self_attention_pope_drope_collapses_doubled_sdpa_output(monkeypatch) -> None:
+    torch.manual_seed(4)
+    config = ModelConfig(
+        vocab_size=100,
+        embed_dim=32,
+        num_heads=4,
+        num_layers=1,
+        max_seq_len=64,
+        pos_encoding="pope",
+    )
+    attn = CausalSelfAttention(config)
+    attn.proj = nn.Identity()
+    attn.proj_dropout = nn.Identity()
+
+    batch, seq_len = 1, 7
+    x = torch.randn(batch, seq_len, config.embed_dim)
+    causal_mask = torch.triu(torch.ones(seq_len, seq_len, dtype=torch.bool), diagonal=1)
+
+    real_out = torch.randn(batch, config.num_heads, seq_len, config.embed_dim // config.num_heads)
+    doubled_out = torch.stack([real_out, torch.zeros_like(real_out)], dim=-1).reshape(
+        batch, config.num_heads, seq_len, 2 * (config.embed_dim // config.num_heads)
+    )
+
+    def fake_sdpa(*args, **kwargs):
+        return doubled_out
+
+    monkeypatch.setattr(
+        "bach_gen.model.architecture.F.scaled_dot_product_attention",
+        fake_sdpa,
+    )
+
+    out = attn(x, causal_mask=causal_mask, cos=None, sin=None, use_pos=False)
+    expected = real_out.transpose(1, 2).reshape(batch, seq_len, config.embed_dim)
+
+    assert out.shape == x.shape
+    assert torch.allclose(out, expected)

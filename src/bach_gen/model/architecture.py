@@ -402,6 +402,23 @@ class CausalSelfAttention(nn.Module):
             is_causal=(attn_mask is None),  # use built-in causal mask when no padding
         )
 
+        # PoPE doubles per-head components in Q/K. Some SDPA backends/checkpoints can
+        # return doubled per-head outputs; collapse interleaved [real, imag] pairs back
+        # to the model head dimension before flattening to (B, T, C).
+        if out.size(-1) == 2 * self.head_dim:
+            if self.pos_encoding != "pope":
+                raise RuntimeError(
+                    "Attention output has unexpected doubled head dimension "
+                    f"({out.size(-1)} vs expected {self.head_dim}) for "
+                    f"pos_encoding={self.pos_encoding!r}"
+                )
+            out = out[..., 0::2]
+        elif out.size(-1) != self.head_dim:
+            raise RuntimeError(
+                "Attention output head dimension mismatch: "
+                f"got {out.size(-1)}, expected {self.head_dim}"
+            )
+
         out = out.transpose(1, 2).reshape(B, T, C)
         out = self.proj_dropout(self.proj(out))
 

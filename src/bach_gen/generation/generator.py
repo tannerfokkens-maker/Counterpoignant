@@ -363,6 +363,7 @@ def _build_prompt(
     key_token_name = f"KEY_{key_name}"
     if key_token_name in tokenizer.name_to_token:
         tokens.append(tokenizer.name_to_token[key_token_name])
+    return tokens #temporary fix... to skip subject. we need to fix this for real eventually.
 
     # Subject — dispatch based on tokenizer type
     # Skip subject in sequential mode (subjects are interleaved-mode only)
@@ -566,10 +567,10 @@ def _generate_one(
         input_ids = torch.tensor([input_tokens], dtype=torch.long, device=device)
 
         logits = model(input_ids, use_rope=use_rope)
-        next_logits = logits[0, -1, :]  # (vocab_size,)
+        raw_next_logits = logits[0, -1, :]  # (vocab_size,)
 
         # Apply constraints using cached state
-        next_logits = constraints.apply(next_logits, state)
+        next_logits = constraints.apply(raw_next_logits, state)
 
         # Sample
         next_token = sample_next_token(
@@ -578,6 +579,7 @@ def _generate_one(
             top_k=top_k,
             top_p=top_p,
             min_p=min_p,
+            fallback_logits=raw_next_logits,
         )
 
         tokens.append(next_token)
@@ -586,7 +588,8 @@ def _generate_one(
         # Stop on EOS
         if next_token == tokenizer.EOS:
             break
-
+    names = [tokenizer.token_to_name.get(t, f"UNK_{t}") for t in tokens[:50]]
+    print("FIRST 50 TOKENS:", " ".join(names))
     return tokens
 
 

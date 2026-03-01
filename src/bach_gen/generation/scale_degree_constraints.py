@@ -140,35 +140,116 @@ class ScaleDegreeDecodingConstraints:
         logits: torch.Tensor,
         generated_tokens: list[int] | ScaleDegreeConstraintState,
     ) -> torch.Tensor:
-        logits = logits.clone()
+        base_logits = logits.clone()
 
         if isinstance(generated_tokens, ScaleDegreeConstraintState):
             state = generated_tokens
             current_voice = state.current_voice
-
-            if self.enforce_range:
-                logits = self._apply_range_constraint_from_state(
-                    logits, current_voice, state,
-                )
-
-            logits = self._apply_chromatic_penalty(logits)
-            logits = self._prevent_degenerate_from_state(logits, state)
+            range_fn = lambda x: self._apply_range_constraint_from_state(
+                x, current_voice, state,
+            )
+            degenerate_fn = lambda x: self._prevent_degenerate_from_state(x, state)
         else:
             current_voice = self._get_current_voice(generated_tokens)
+            range_fn = lambda x: self._apply_range_constraint(
+                x, current_voice, generated_tokens,
+            )
+            degenerate_fn = lambda x: self._prevent_degenerate(x, generated_tokens)
 
-            if self.enforce_range:
-                logits = self._apply_range_constraint(
-                    logits, current_voice, generated_tokens,
-                )
+        # Full constraints.
+        constrained = self._apply_constraint_pass(
+            base_logits,
+            apply_range=self.enforce_range,
+            apply_chromatic=True,
+            apply_degenerate=True,
+            range_fn=range_fn,
+            degenerate_fn=degenerate_fn,
+        )
+        if self._has_valid_token(constrained):
+            return constrained
 
-            logits = self._apply_chromatic_penalty(logits)
-            logits = self._prevent_degenerate(logits, generated_tokens)
+        # Relax 1: drop degenerate penalties/masks.
+        constrained = self._apply_constraint_pass(
+            base_logits,
+            apply_range=self.enforce_range,
+            apply_chromatic=True,
+            apply_degenerate=False,
+            range_fn=range_fn,
+            degenerate_fn=degenerate_fn,
+        )
+        if self._has_valid_token(constrained):
+            return constrained
 
-        return logits
+        # Relax 2: also drop chromatic penalty.
+        constrained = self._apply_constraint_pass(
+            base_logits,
+            apply_range=self.enforce_range,
+            apply_chromatic=False,
+            apply_degenerate=False,
+            range_fn=range_fn,
+            degenerate_fn=degenerate_fn,
+        )
+        if self._has_valid_token(constrained):
+            return constrained
+
+        # Relax 3: also drop range constraints (raw logits).
+        constrained = self._apply_constraint_pass(
+            base_logits,
+            apply_range=False,
+            apply_chromatic=False,
+            apply_degenerate=False,
+            range_fn=range_fn,
+            degenerate_fn=degenerate_fn,
+        )
+        return self._ensure_valid_logits(constrained, base_logits)
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _has_valid_token(self, logits: torch.Tensor) -> bool:
+        """True iff at least one token has a finite logit."""
+        return bool(torch.any(torch.isfinite(logits)).item())
+
+    def _ensure_valid_logits(
+        self,
+        constrained_logits: torch.Tensor,
+        raw_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        """Guarantee at least one finite token for downstream sampling."""
+        if self._has_valid_token(constrained_logits):
+            return constrained_logits
+
+        if self._has_valid_token(raw_logits):
+            return raw_logits.clone()
+
+        # Last-resort guard when upstream logits are all invalid.
+        fallback = torch.full_like(raw_logits, float("-inf"))
+        eos_tok = getattr(self.tokenizer, "EOS", None)
+        if eos_tok is not None and eos_tok < fallback.size(0):
+            fallback[eos_tok] = 0.0
+        else:
+            fallback[0] = 0.0
+        return fallback
+
+    def _apply_constraint_pass(
+        self,
+        logits: torch.Tensor,
+        apply_range: bool,
+        apply_chromatic: bool,
+        apply_degenerate: bool,
+        range_fn,
+        degenerate_fn,
+    ) -> torch.Tensor:
+        """Run one constraint pass with configurable stages."""
+        out = logits.clone()
+        if apply_range:
+            out = range_fn(out)
+        if apply_chromatic:
+            out = self._apply_chromatic_penalty(out)
+        if apply_degenerate:
+            out = degenerate_fn(out)
+        return out
 
     def _get_current_voice(self, tokens: list[int]) -> int:
         for tok in reversed(tokens):
