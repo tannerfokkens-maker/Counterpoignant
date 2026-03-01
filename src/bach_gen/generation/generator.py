@@ -207,7 +207,7 @@ def generate(
             if non_empty < 2:
                 continue
 
-            score = score_composition(comp, token_sequence=tokens, model=model, tokenizer=tokenizer, form=form)
+            score = score_composition(comp, token_sequence=tokens, tokenizer=tokenizer, form=form)
             candidates.append(GenerationResult(
                 composition=comp,
                 tokens=tokens,
@@ -233,6 +233,8 @@ def generate(
                 device=device,
                 use_rope=use_rope,
             )
+            if device.type == "mps":
+                torch.mps.empty_cache()
 
             # Decode to composition
             comp = tokenizer.decode(tokens)
@@ -246,7 +248,7 @@ def generate(
                 continue
 
             # Score
-            score = score_composition(comp, token_sequence=tokens, model=model, tokenizer=tokenizer, form=form)
+            score = score_composition(comp, token_sequence=tokens, tokenizer=tokenizer, form=form)
 
             candidates.append(GenerationResult(
                 composition=comp,
@@ -494,6 +496,8 @@ def generate_voice_by_voice(
             device=device,
             use_rope=use_rope,
         )
+        if device.type == "mps":
+            torch.mps.empty_cache()
 
         comp = tokenizer.decode(tokens)
         comp.key_root = key_root
@@ -504,7 +508,7 @@ def generate_voice_by_voice(
         if non_empty < 2:
             continue
 
-        score = score_composition(comp, token_sequence=tokens, model=model, tokenizer=tokenizer, form=form)
+        score = score_composition(comp, token_sequence=tokens, tokenizer=tokenizer, form=form)
         candidates.append(GenerationResult(
             composition=comp,
             tokens=tokens,
@@ -572,6 +576,7 @@ def _generate_one(
     state = constraints.update_state(state, next_token)
 
     if next_token == tokenizer.EOS:
+        del kv_caches
         return tokens
 
     # --- Incremental phase: one token at a time ---
@@ -611,6 +616,7 @@ def _generate_one(
         if next_token == tokenizer.EOS:
             break
 
+    del kv_caches
     return tokens
 
 

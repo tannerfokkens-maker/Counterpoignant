@@ -448,8 +448,11 @@ class CausalSelfAttention(nn.Module):
         # mathematically equivalent to the implicit broadcast that CUDA SDPA
         # performs when Q/K and V have different last dimensions.
         if pope_doubled:
-            v_expanded = torch.stack([v, torch.zeros_like(v)], dim=-1)
-            v = v_expanded.reshape(*v.shape[:-1], 2 * v.shape[-1])
+            v_out = torch.zeros(
+                *v.shape[:-1], 2 * v.shape[-1], dtype=v.dtype, device=v.device,
+            )
+            v_out[..., 0::2] = v
+            v = v_out
 
         # --- KV cache: concatenate cached K/V with new K/V ---
         if kv_cache is not None:

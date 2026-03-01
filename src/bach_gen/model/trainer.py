@@ -681,5 +681,7 @@ class Trainer:
         model.load_state_dict(state)
         model = model.to(device)
         model.eval()
+        if device.type == "mps":
+            model = model.half()
         logger.info(f"Loaded checkpoint from {path} (epoch {checkpoint['epoch']})")
         return model, config
