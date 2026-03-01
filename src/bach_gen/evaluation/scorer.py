@@ -1,12 +1,30 @@
 """Composite score orchestrator.
 
 Combines all evaluation dimensions into a single score.
+
+When per-form calibration weights have been computed (via ``bach-gen
+calibrate-forms``), they are loaded automatically and used whenever a
+``form`` is supplied to :func:`score_composition`.
+
+Dimensions:
+  - voice_leading: Local note-to-note rule violations
+  - statistical: Distribution similarity to Bach corpus
+  - structural: Key consistency, cadences, phrase structure, modulation
+  - contrapuntal: Texture & technique (sequences, register, stretto, etc.)
+  - completeness: Voice count, length, proper endings
+  - thematic_recall: Subject recurrence across voices and time
+
+Information-theoretic scoring has been removed — calibration showed it
+has zero discrimination power (identical scores on real Bach, shuffled
+notes, and random pitches when no model is passed during generation).
 """
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 
@@ -15,7 +33,6 @@ from bach_gen.evaluation.voice_leading import score_voice_leading
 from bach_gen.evaluation.statistical import score_statistical
 from bach_gen.evaluation.structural import score_structural, score_thematic_recall
 from bach_gen.evaluation.contrapuntal import score_contrapuntal
-from bach_gen.evaluation.information import score_information
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +44,7 @@ class ScoreBreakdown:
     voice_leading: float = 0.0
     statistical: float = 0.0
     structural: float = 0.0
-    information: float = 0.0
+    information: float = 0.0  # kept for backward compat, always 0.0
     contrapuntal: float = 0.0
     completeness: float = 0.0
     thematic_recall: float = 0.0
@@ -35,34 +52,68 @@ class ScoreBreakdown:
     details: dict | None = None
 
 
-# Default weights by form.
-# Chorale/default preset downweights thematic recall because it saturates there.
+# Default weights (used when no calibration data is available)
 DEFAULT_WEIGHTS = {
-    "structural": 0.35,
-    "statistical": 0.12,
-    "thematic_recall": 0.05,
-    "information": 0.20,
-    "voice_leading": 0.04,
-    "contrapuntal": 0.20,
-    "completeness": 0.04,
+    "thematic_recall": 0.30,
+    "voice_leading": 0.22,
+    "contrapuntal": 0.18,
+    "structural": 0.15,
+    "statistical": 0.10,
+    "completeness": 0.05,
 }
 
-FUGUE_WEIGHTS = {
-    "structural": 0.25,
-    "statistical": 0.12,
-    "thematic_recall": 0.15,
-    "information": 0.20,
-    "voice_leading": 0.04,
-    "contrapuntal": 0.20,
-    "completeness": 0.04,
-}
+# Calibrated per-form weights (populated by load_form_weights)
+_form_weights: dict[str, dict[str, float]] | None = None
 
 
-def get_default_weights(form: str | None = None) -> dict[str, float]:
-    """Return default scorer weights for a musical form."""
-    if form and form.lower() == "fugue":
-        return FUGUE_WEIGHTS.copy()
-    return DEFAULT_WEIGHTS.copy()
+def load_form_weights(path: str | Path | None = None) -> dict[str, dict[str, float]]:
+    """Load per-form calibrated weights from calibration_forms.json.
+
+    Called automatically on first use if the file exists. Can also be
+    called explicitly to reload after re-calibration.
+    """
+    global _form_weights
+    if path is None:
+        path = Path("data/calibration_forms.json")
+    p = Path(path)
+    if p.exists():
+        with open(p) as f:
+            data = json.load(f)
+        _form_weights = data.get("weights_by_form", {})
+        logger.info(f"Loaded calibrated weights for forms: {list(_form_weights.keys())}")
+    else:
+        _form_weights = {}
+    return _form_weights
+
+
+def get_weights_for_form(form: str | None = None) -> dict[str, float]:
+    """Return the best available weights for the given form.
+
+    Priority:
+      1. Calibrated per-form weights (if calibrate-forms has been run)
+      2. DEFAULT_WEIGHTS fallback
+    """
+    global _form_weights
+
+    # Auto-load on first call
+    if _form_weights is None:
+        load_form_weights()
+
+    if form and _form_weights and form in _form_weights:
+        return _form_weights[form]
+
+    # Try normalised form names
+    form_aliases = {
+        "2-part": "invention",
+        "3-part": "sinfonia",
+        "4-part": "chorale",
+    }
+    if form and _form_weights:
+        alias = form_aliases.get(form)
+        if alias and alias in _form_weights:
+            return _form_weights[alias]
+
+    return DEFAULT_WEIGHTS
 
 
 def score_composition(
@@ -70,31 +121,30 @@ def score_composition(
     token_sequence: list[int] | None = None,
     model: torch.nn.Module | None = None,
     weights: dict[str, float] | None = None,
-    form: str | None = None,
     vocab_size: int | None = None,
     tokenizer=None,
+    form: str | None = None,
 ) -> ScoreBreakdown:
     """Score a VoiceComposition on all evaluation dimensions.
 
     Args:
         comp: The composition to evaluate.
-        token_sequence: Tokenized version (for information scoring).
-        model: Trained model (for information scoring).
-        weights: Optional weight overrides layered on form defaults.
-        form: Composition form used for default weight selection.
-        vocab_size: Vocabulary size for information scoring.
-                    Falls back to BachTokenizer().vocab_size when None.
+        token_sequence: Tokenized version (unused, kept for API compat).
+        model: Trained model (unused, kept for API compat).
+        weights: Custom weights override. If None, uses calibrated per-form
+                 weights when available, else DEFAULT_WEIGHTS.
+        vocab_size: Unused, kept for API compat.
         tokenizer: Tokenizer instance (for thematic recall subject extraction).
+        form: Composition form (e.g. "fugue", "chorale", "invention").
+              Used to select calibrated weights when ``weights`` is None.
 
     Returns:
         ScoreBreakdown with individual and composite scores.
     """
-    w = get_default_weights(form=form)
-    if weights:
-        w.update(weights)
+    w = weights or get_weights_for_form(form)
     all_details: dict = {}
 
-    # Voice leading — evaluates all voice pairs
+    # Voice leading — local rule violations
     vl_score, vl_details = score_voice_leading(comp)
     all_details["voice_leading"] = vl_details
 
@@ -106,22 +156,9 @@ def score_composition(
     struct_score, struct_details = score_structural(comp)
     all_details["structural"] = struct_details
 
-    # Contrapuntal quality — evaluates all voice pairs
+    # Contrapuntal quality — texture and technique
     cp_score, cp_details = score_contrapuntal(comp)
     all_details["contrapuntal"] = cp_details
-
-    # Information-theoretic
-    if token_sequence is not None:
-        if vocab_size is None:
-            from bach_gen.data.tokenizer import BachTokenizer
-            vocab_size = BachTokenizer().vocab_size
-        info_score, info_details = score_information(
-            token_sequence, model=model, vocab_size=vocab_size
-        )
-    else:
-        info_score = 0.5  # neutral if no tokens
-        info_details = {"note": "no token sequence provided"}
-    all_details["information"] = info_details
 
     # Completeness
     comp_score = _score_completeness(comp)
@@ -131,22 +168,21 @@ def score_composition(
     tr_score = score_thematic_recall(comp, token_sequence=token_sequence, tokenizer=tokenizer)
     all_details["thematic_recall"] = {"score": tr_score}
 
-    # Composite
+    # Composite (information dimension removed — zero discrimination power)
     composite = (
-        vl_score * w["voice_leading"]
-        + stat_score * w["statistical"]
-        + struct_score * w["structural"]
-        + info_score * w["information"]
-        + cp_score * w["contrapuntal"]
-        + comp_score * w["completeness"]
-        + tr_score * w["thematic_recall"]
+        vl_score * w.get("voice_leading", 0.22)
+        + stat_score * w.get("statistical", 0.10)
+        + struct_score * w.get("structural", 0.15)
+        + cp_score * w.get("contrapuntal", 0.18)
+        + comp_score * w.get("completeness", 0.05)
+        + tr_score * w.get("thematic_recall", 0.30)
     )
 
     return ScoreBreakdown(
         voice_leading=vl_score,
         statistical=stat_score,
         structural=struct_score,
-        information=info_score,
+        information=0.0,  # removed — kept for backward compat
         contrapuntal=cp_score,
         completeness=comp_score,
         thematic_recall=tr_score,
@@ -160,20 +196,10 @@ def score_voice_pair(
     token_sequence: list[int] | None = None,
     model: torch.nn.Module | None = None,
     weights: dict[str, float] | None = None,
-    form: str | None = None,
 ) -> ScoreBreakdown:
-    """Score a voice pair (backward-compatible wrapper).
-
-    Converts to VoiceComposition and delegates to score_composition.
-    """
+    """Score a voice pair (backward-compatible wrapper)."""
     comp = VoiceComposition.from_voice_pair(pair)
-    return score_composition(
-        comp,
-        token_sequence=token_sequence,
-        model=model,
-        weights=weights,
-        form=form,
-    )
+    return score_composition(comp, token_sequence=token_sequence, model=model, weights=weights)
 
 
 def _score_completeness(comp: VoiceComposition) -> float:
@@ -186,18 +212,18 @@ def _score_completeness(comp: VoiceComposition) -> float:
 
     score = 0.0
 
-    # 1. Has content in all voices
+    # 1. Has content in multiple voices
     non_empty = sum(1 for v in comp.voices if v)
     if non_empty >= 2:
-        score += 0.3
+        score += 0.25
 
     # 2. Sufficient length (at least 8 bars)
     total_ticks = max(n[0] + n[1] for n in all_notes) - min(n[0] for n in all_notes)
     bars = total_ticks / (TICKS_PER_QUARTER * 4)
     if bars >= 8:
-        score += 0.2
+        score += 0.15
     elif bars >= 4:
-        score += 0.1
+        score += 0.08
 
     # 3. All voices present at beginning and end
     min_time = min(n[0] for n in all_notes)
@@ -209,11 +235,11 @@ def _score_completeness(comp: VoiceComposition) -> float:
     voices_at_end = sum(1 for v in comp.voices if v and any(n[0] + n[1] > last_quarter for n in v))
 
     if voices_at_start >= non_empty:
-        score += 0.1
+        score += 0.10
     if voices_at_end >= non_empty:
-        score += 0.1
+        score += 0.10
 
-    # 4. Ends on a long note (final cadence feel) — check lowest voice
+    # 4. Ends on a long note (final cadence feel)
     lowest_voice = comp.voices[-1] if comp.voices else []
     highest_voice = comp.voices[0] if comp.voices else []
     if lowest_voice and highest_voice:
@@ -222,11 +248,21 @@ def _score_completeness(comp: VoiceComposition) -> float:
         if last_low_dur >= TICKS_PER_QUARTER and last_high_dur >= TICKS_PER_QUARTER:
             score += 0.15
 
-    # 5. Tonic ending — check lowest voice
+    # 5. Tonic ending
     tonic = comp.key_root
     if lowest_voice:
         last_lower_pc = lowest_voice[-1][2] % 12
         if last_lower_pc == tonic:
             score += 0.15
+
+    # 6. Piece reached natural end (EOS) vs truncated at max_length
+    # This is checked in the token_sequence but since we may not have it,
+    # approximate: if last notes are very short or cut off, likely truncated
+    if lowest_voice and highest_voice:
+        last_bass_end = lowest_voice[-1][0] + lowest_voice[-1][1]
+        last_sop_end = highest_voice[-1][0] + highest_voice[-1][1]
+        # Voices end near each other = proper ending
+        if abs(last_bass_end - last_sop_end) < TICKS_PER_QUARTER * 2:
+            score += 0.10
 
     return min(1.0, score)

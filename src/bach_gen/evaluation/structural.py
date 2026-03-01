@@ -1,7 +1,10 @@
 """Structural coherence evaluation.
 
-Measures subject recurrence, key regions, cadence quality, and length.
-Voice-count-agnostic: works with any number of voices.
+Measures key consistency, cadence quality, phrase structure, modulation
+quality, and length. Voice-count-agnostic: works with any number of voices.
+
+Thematic recurrence is handled by the standalone ``score_thematic_recall``
+function (also in this module) — no duplication in the structural composite.
 """
 
 from __future__ import annotations
@@ -42,31 +45,28 @@ def score_structural(item: VoicePair | VoiceComposition) -> tuple[float, dict]:
     key_score = _score_key_consistency(voices, key_root, key_mode)
     details["key_consistency"] = key_score
 
-    # 3. Cadence quality
+    # 3. Cadence quality (improved: checks full cadential patterns)
     cadence_score = _score_cadence(voices, key_root, key_mode)
     details["cadence"] = cadence_score
 
-    # 4. Thematic recurrence
-    recurrence_score = _score_thematic_recurrence(voices)
-    details["thematic_recurrence"] = recurrence_score
+    # 4. Phrase structure (NEW)
+    phrase_score = _score_phrase_structure(voices)
+    details["phrase_structure"] = phrase_score
 
-    # 5. Key modulation
+    # 5. Key modulation quality
     modulation_score = _score_modulation(voices, key_root, key_mode)
     details["modulation"] = modulation_score
 
     # Weighted composite
     score = (
-        length_score * 0.15
-        + key_score * 0.25
+        key_score * 0.25
         + cadence_score * 0.25
-        + recurrence_score * 0.20
+        + phrase_score * 0.20
         + modulation_score * 0.15
+        + length_score * 0.15
     )
 
-    # Penalize degenerate melodic content — monotone or near-monotone pieces
-    # should not score well on structure regardless of other metrics.
-    # Use absolute unique pitch count: 1-2 unique pitches is degenerate,
-    # regardless of total note count.
+    # Penalize degenerate melodic content
     all_notes = [n for v in voices for n in v]
     if len(all_notes) > 8:
         unique_pitches = len(set(n[2] for n in all_notes))
@@ -120,87 +120,242 @@ def _score_cadence(
     key_root: int,
     key_mode: str,
 ) -> float:
-    """Score the ending cadence quality."""
+    """Score cadence quality with full cadential pattern detection.
+
+    Checks:
+    - Final cadence: V→I in bass, soprano resolving to tonic/third
+    - Internal cadences: phrase-ending patterns throughout the piece
+    - Cadential preparation: ii→V→I or IV→V→I patterns
+    """
     if not voices:
         return 0.0
 
     scale = get_scale(key_root, key_mode)
     tonic = key_root
     dominant = (key_root + 7) % 12
+    subdominant = (key_root + 5) % 12
+    supertonic = scale[1] if len(scale) > 1 else (key_root + 2) % 12
 
-    # Lowest voice = last in list; highest = first
     lowest_voice = voices[-1] if voices else []
     highest_voice = voices[0] if voices else []
 
-    last_upper = highest_voice[-1][2] % 12 if highest_voice else None
-    last_lower = lowest_voice[-1][2] % 12 if lowest_voice else None
-
     score = 0.0
 
-    # Ends on tonic in bass?
-    if last_lower == tonic:
-        score += 0.4
-    elif last_lower is not None and last_lower in scale:
-        score += 0.1
+    # --- Final cadence (0.5 max) ---
+    if lowest_voice and highest_voice:
+        last_lower = lowest_voice[-1][2] % 12
+        last_upper = highest_voice[-1][2] % 12
 
-    # Ends on tonic or third in soprano?
-    if last_upper == tonic:
-        score += 0.3
-    elif last_upper is not None and last_upper == (tonic + 4) % 12:
-        score += 0.2
-    elif last_upper is not None and last_upper == (tonic + 3) % 12:
-        score += 0.2
+        # Bass ends on tonic
+        if last_lower == tonic:
+            score += 0.15
 
-    # Penultimate note: dominant in bass? (V-I cadence)
-    if len(lowest_voice) >= 2:
-        penult_lower = lowest_voice[-2][2] % 12
-        if penult_lower == dominant:
-            score += 0.3
+        # Soprano ends on tonic or third
+        if last_upper == tonic:
+            score += 0.10
+        elif last_upper == scale[2] if len(scale) > 2 else -1:
+            score += 0.08
+
+        # V→I in bass (authentic cadence)
+        if len(lowest_voice) >= 2:
+            penult_lower = lowest_voice[-2][2] % 12
+            if penult_lower == dominant and last_lower == tonic:
+                score += 0.15
+
+        # Full ii→V→I or IV→V→I in bass
+        if len(lowest_voice) >= 3:
+            antepenult = lowest_voice[-3][2] % 12
+            penult = lowest_voice[-2][2] % 12
+            final = lowest_voice[-1][2] % 12
+            if final == tonic and penult == dominant:
+                if antepenult == supertonic or antepenult == subdominant:
+                    score += 0.10
+
+    # --- Internal cadences (0.3 max) ---
+    # Find phrase boundaries by looking for long notes or rests in all voices
+    internal_cadence_score = _score_internal_cadences(
+        voices, key_root, key_mode, scale,
+    )
+    score += internal_cadence_score * 0.30
+
+    # --- Cadence on long notes (0.2 max) ---
+    # Final notes should be long (half note or longer)
+    if lowest_voice and highest_voice:
+        final_bass_dur = lowest_voice[-1][1]
+        final_sop_dur = highest_voice[-1][1]
+        if final_bass_dur >= TICKS_PER_QUARTER * 2:  # half note
+            score += 0.10
+        if final_sop_dur >= TICKS_PER_QUARTER * 2:
+            score += 0.10
 
     return min(1.0, score)
 
 
-def _score_thematic_recurrence(voices: list[list[tuple[int, int, int]]]) -> float:
-    """Score how much melodic material recurs (transposed or exact)."""
-    if len(voices) < 2:
+def _score_internal_cadences(
+    voices: list[list[tuple[int, int, int]]],
+    key_root: int,
+    key_mode: str,
+    scale: list[int],
+) -> float:
+    """Detect and score internal cadences at phrase boundaries."""
+    if not voices or not voices[-1]:
         return 0.3
 
-    # Extract interval sequences for all voices
-    interval_seqs = [_get_interval_sequence(v) for v in voices if len(v) > 1]
-    if not interval_seqs or all(len(s) < 4 for s in interval_seqs):
+    tonic = key_root
+    dominant = (key_root + 7) % 12
+    bass = sorted(voices[-1], key=lambda n: n[0])
+
+    if len(bass) < 4:
         return 0.3
 
-    matches = 0
-    total_checks = 0
+    # Find internal phrase boundaries: notes followed by a gap or long note
+    cadence_points = []
+    for i in range(len(bass) - 1):
+        note_end = bass[i][0] + bass[i][1]
+        next_start = bass[i + 1][0]
+        gap = next_start - note_end
 
-    for frag_len in [4, 5, 6, 7, 8]:
-        all_frags = [_extract_fragments(s, frag_len) for s in interval_seqs]
-        all_frags = [f for f in all_frags if f]
+        is_long = bass[i][1] >= TICKS_PER_QUARTER * 2
+        has_gap = gap >= TICKS_PER_QUARTER
 
-        if len(all_frags) < 2:
-            continue
+        if is_long or has_gap:
+            cadence_points.append(i)
 
-        # Check for cross-voice imitation
-        for i in range(len(all_frags)):
-            for j in range(i + 1, len(all_frags)):
-                for frag in all_frags[i]:
-                    total_checks += 1
-                    if frag in all_frags[j]:
-                        matches += 1
-                        break
-
-        # Check for within-voice repetition
-        for frags in all_frags:
-            unique = set(frags)
-            if len(frags) > 0:
-                repetition_ratio = 1 - len(unique) / len(frags)
-                matches += repetition_ratio
-                total_checks += 1
-
-    if total_checks == 0:
+    if not cadence_points:
         return 0.3
 
-    return min(1.0, matches / total_checks * 2)
+    good_cadences = 0
+    for cp_idx in cadence_points:
+        # Check for V→I or I (tonic arrival) at this point
+        cp_pc = bass[cp_idx][2] % 12
+        if cp_pc == tonic:
+            if cp_idx > 0 and bass[cp_idx - 1][2] % 12 == dominant:
+                good_cadences += 2  # authentic cadence
+            else:
+                good_cadences += 1  # tonic arrival
+        elif cp_pc == dominant:
+            good_cadences += 1  # half cadence
+
+    ratio = good_cadences / (len(cadence_points) * 2)
+    return min(1.0, ratio * 2)
+
+
+def _score_phrase_structure(voices: list[list[tuple[int, int, int]]]) -> float:
+    """Score whether the music has clear phrase structure.
+
+    Measures:
+    - Presence of detectable phrases (gaps or long notes separating sections)
+    - Phrase length regularity (Bach phrases are typically 2, 4, or 8 bars)
+    - Variety (not all phrases the same length, but not random either)
+    """
+    all_notes = [n for v in voices for n in v]
+    if len(all_notes) < 16:
+        return 0.3
+
+    # Detect phrases by finding time gaps where no voice is active
+    sorted_notes = sorted(all_notes, key=lambda n: n[0])
+    min_tick = sorted_notes[0][0]
+    max_tick = max(n[0] + n[1] for n in sorted_notes)
+
+    # Build activity map
+    step = TICKS_PER_QUARTER
+    activity = []
+    for t in range(int(min_tick), int(max_tick), step):
+        active = any(
+            n[0] <= t < n[0] + n[1]
+            for n in sorted_notes
+            if abs(n[0] - t) < TICKS_PER_QUARTER * 8  # only check nearby notes
+        )
+        activity.append((t, active))
+
+    # Find phrase boundaries (transitions from active to inactive)
+    phrase_lengths_ticks = []
+    phrase_start = min_tick
+    for i in range(1, len(activity)):
+        t, active = activity[i]
+        prev_active = activity[i - 1][1]
+        if prev_active and not active:
+            # End of phrase
+            phrase_len = t - phrase_start
+            if phrase_len > TICKS_PER_QUARTER * 2:  # at least half a bar
+                phrase_lengths_ticks.append(phrase_len)
+            phrase_start = t
+        elif not prev_active and active:
+            phrase_start = t
+
+    # Also count the final phrase
+    final_len = max_tick - phrase_start
+    if final_len > TICKS_PER_QUARTER * 2:
+        phrase_lengths_ticks.append(final_len)
+
+    # Alternative: detect phrases from the first voice (melody)
+    # using long notes as phrase endings
+    if len(phrase_lengths_ticks) < 2 and voices:
+        phrase_lengths_ticks = _detect_phrases_from_melody(voices[0])
+
+    if len(phrase_lengths_ticks) < 2:
+        return 0.3  # can't detect phrases
+
+    # Convert to bars
+    bar_ticks = TICKS_PER_QUARTER * 4
+    phrase_bars = [pl / bar_ticks for pl in phrase_lengths_ticks]
+
+    score = 0.0
+
+    # 1. Has detectable phrases (0.3)
+    score += 0.3
+
+    # 2. Phrase length regularity (0.4)
+    # Check how close phrases are to standard lengths (2, 4, 8 bars)
+    standard_lengths = [2, 4, 8]
+    regularities = []
+    for pb in phrase_bars:
+        closest = min(standard_lengths, key=lambda s: abs(pb - s))
+        deviation = abs(pb - closest) / closest
+        regularities.append(max(0.0, 1.0 - deviation))
+
+    avg_regularity = sum(regularities) / len(regularities) if regularities else 0
+    score += avg_regularity * 0.4
+
+    # 3. Phrase variety (0.3) — not all identical, but not all different
+    if len(phrase_bars) >= 3:
+        bar_rounded = [round(pb) for pb in phrase_bars]
+        unique_ratio = len(set(bar_rounded)) / len(bar_rounded)
+        # Ideal: ~0.3-0.6 unique ratio
+        if unique_ratio < 0.2:
+            variety_score = 0.5  # too uniform
+        elif unique_ratio <= 0.7:
+            variety_score = 1.0
+        else:
+            variety_score = max(0.3, 1.0 - (unique_ratio - 0.7) * 2)
+        score += variety_score * 0.3
+    else:
+        score += 0.15
+
+    return min(1.0, score)
+
+
+def _detect_phrases_from_melody(
+    voice: list[tuple[int, int, int]],
+) -> list[int]:
+    """Detect phrase boundaries from a single voice using long notes."""
+    if len(voice) < 4:
+        return []
+
+    sorted_v = sorted(voice, key=lambda n: n[0])
+    long_threshold = TICKS_PER_QUARTER * 1.5  # dotted quarter or longer
+
+    phrase_lengths = []
+    phrase_start = sorted_v[0][0]
+
+    for i, (start, dur, _) in enumerate(sorted_v):
+        if dur >= long_threshold and i > 0:
+            phrase_len = start + dur - phrase_start
+            if phrase_len > TICKS_PER_QUARTER * 2:
+                phrase_lengths.append(int(phrase_len))
+            phrase_start = start + dur
+
+    return phrase_lengths
 
 
 def _score_modulation(
@@ -208,20 +363,25 @@ def _score_modulation(
     key_root: int,
     key_mode: str,
 ) -> float:
-    """Score key modulation (should visit related keys, not stay static)."""
+    """Score key modulation quality.
+
+    Rewards visits to closely related keys (dominant, relative minor/major,
+    subdominant) and penalizes random key wandering. Bach modulates
+    purposefully through the circle of fifths.
+    """
     all_notes = sorted([n for v in voices for n in v], key=lambda n: n[0])
     if len(all_notes) < 16:
         return 0.3
 
-    window_size = TICKS_PER_QUARTER * 8
+    window_size = TICKS_PER_QUARTER * 8  # 2 bars
     total_time = max(n[0] + n[1] for n in all_notes) - min(n[0] for n in all_notes)
     start_time = min(n[0] for n in all_notes)
 
-    keys_found = set()
+    keys_found: list[tuple[int, str]] = []
 
     for window_start in range(int(start_time), int(start_time + total_time), window_size):
         window_notes = [n for n in all_notes
-                       if window_start <= n[0] < window_start + window_size]
+                        if window_start <= n[0] < window_start + window_size]
         if len(window_notes) < 4:
             continue
 
@@ -231,25 +391,73 @@ def _score_modulation(
 
         detected_root, detected_mode, corr = detect_key(pc_counts)
         if corr > 0.5:
-            keys_found.add((detected_root, detected_mode))
+            keys_found.append((detected_root, detected_mode))
 
-    n_keys = len(keys_found)
-    if n_keys == 1:
-        return 0.4
-    elif n_keys == 2:
-        return 0.7
-    elif n_keys <= 4:
-        return 1.0
+    unique_keys = set(keys_found)
+    n_keys = len(unique_keys)
+
+    if n_keys <= 1:
+        return 0.4  # static
+
+    # Score based on whether modulations are to related keys
+    # Related keys: dominant, subdominant, relative major/minor,
+    # parallel major/minor
+    related_keys = _get_related_keys(key_root, key_mode)
+    related_count = sum(1 for k in unique_keys if k in related_keys or k == (key_root, key_mode))
+    unrelated_count = len(unique_keys) - related_count
+
+    if related_count >= 2 and unrelated_count <= 1:
+        key_quality = 1.0
+    elif related_count >= 2:
+        key_quality = max(0.5, 1.0 - unrelated_count * 0.15)
     else:
-        return max(0.5, 1.0 - (n_keys - 4) * 0.1)
+        key_quality = 0.4
 
+    # Score based on number of key areas (2-4 ideal)
+    if n_keys == 2:
+        count_score = 0.7
+    elif n_keys <= 4:
+        count_score = 1.0
+    elif n_keys <= 6:
+        count_score = 0.8
+    else:
+        count_score = max(0.4, 1.0 - (n_keys - 6) * 0.1)
+
+    return key_quality * 0.6 + count_score * 0.4
+
+
+def _get_related_keys(root: int, mode: str) -> set[tuple[int, str]]:
+    """Get the set of closely related keys."""
+    related = set()
+
+    dominant = (root + 7) % 12
+    subdominant = (root + 5) % 12
+
+    if mode == "major":
+        relative_minor = (root + 9) % 12
+        related.add((dominant, "major"))
+        related.add((subdominant, "major"))
+        related.add((relative_minor, "minor"))
+        related.add((dominant, "minor"))  # v
+        related.add((root, "minor"))  # parallel minor
+    else:
+        relative_major = (root + 3) % 12
+        related.add((dominant, "minor"))
+        related.add((subdominant, "minor"))
+        related.add((relative_major, "major"))
+        related.add((dominant, "major"))  # V (raised leading tone)
+        related.add((root, "major"))  # parallel major
+
+    return related
+
+
+# ======================================================================
+# Thematic recall (standalone scorer)
+# ======================================================================
 
 def _get_interval_sequence(notes: list[tuple[int, int, int]]) -> list[int]:
     """Get sequence of melodic intervals."""
-    intervals = []
-    for i in range(1, len(notes)):
-        intervals.append(notes[i][2] - notes[i - 1][2])
-    return intervals
+    return [notes[i][2] - notes[i - 1][2] for i in range(1, len(notes))]
 
 
 def _extract_fragments(intervals: list[int], length: int) -> list[tuple[int, ...]]:
@@ -263,45 +471,49 @@ def _extract_subject_notes(
     tokenizer=None,
     default_bars: int = 2,
 ) -> list[tuple[int, int, int]]:
-    """Extract subject from first ~2 bars of voice 1 (or from SUBJECT markers).
+    """Extract the subject: the first melodic phrase of the first entering voice.
 
-    If a token_sequence and tokenizer are provided and SUBJECT_START/END markers
-    exist, extract notes between them. Otherwise, fall back to the first
-    ``default_bars`` bars of voice 1.
+    Strategy:
+    1. Find the first voice that actually has notes (not necessarily voice 1)
+    2. Take notes up to the first significant gap or rest, or first N bars
     """
     voices, _, _ = _get_voices_and_key(comp)
-    if not voices or not voices[0]:
+    if not voices:
         return []
 
-    # Try to use SUBJECT markers from token stream
-    if token_sequence is not None and tokenizer is not None:
-        subj_start_id = getattr(tokenizer, "SUBJECT_START", None)
-        subj_end_id = getattr(tokenizer, "SUBJECT_END", None)
-        if subj_start_id is not None and subj_end_id is not None:
-            try:
-                si = token_sequence.index(subj_start_id)
-                ei = token_sequence.index(subj_end_id, si)
-                # Decode just the subject portion — extract notes from voice 1
-                # that fall within the tick range implied by the subject markers.
-                # For simplicity, use first voice notes up to the subject length.
-                # Count notes between markers by looking for pitch/degree tokens.
-                n_notes = 0
-                for tok in token_sequence[si:ei]:
-                    name = tokenizer.token_to_name.get(tok, "")
-                    if name.startswith("Dur_"):
-                        n_notes += 1
-                if n_notes >= 3:
-                    return voices[0][:n_notes]
-            except (ValueError, AttributeError):
-                pass
+    # Find the voice with the earliest note onset
+    earliest_voice = None
+    earliest_time = float("inf")
+    for voice in voices:
+        if voice:
+            first_onset = min(n[0] for n in voice)
+            if first_onset < earliest_time:
+                earliest_time = first_onset
+                earliest_voice = voice
 
-    # Fallback: first default_bars bars of voice 1
-    voice1 = voices[0]
-    if not voice1:
+    if earliest_voice is None:
         return []
-    min_tick = min(n[0] for n in voice1)
-    cutoff = min_tick + default_bars * TICKS_PER_QUARTER * 4
-    return [n for n in voice1 if n[0] < cutoff]
+
+    sorted_voice = sorted(earliest_voice, key=lambda n: n[0])
+
+    # Take notes until first significant gap or up to default_bars bars
+    cutoff_tick = earliest_time + default_bars * TICKS_PER_QUARTER * 4
+    gap_threshold = TICKS_PER_QUARTER  # quarter note gap = phrase break
+
+    subject = []
+    for i, (start, dur, pitch) in enumerate(sorted_voice):
+        if start > cutoff_tick:
+            break
+        subject.append((start, dur, pitch))
+
+        # Check for gap to next note
+        if i + 1 < len(sorted_voice):
+            note_end = start + dur
+            next_start = sorted_voice[i + 1][0]
+            if next_start - note_end >= gap_threshold and len(subject) >= 3:
+                break  # phrase boundary
+
+    return subject
 
 
 def score_thematic_recall(
@@ -311,9 +523,13 @@ def score_thematic_recall(
 ) -> float:
     """Score long-range thematic recall: does the subject recur after the opening?
 
-    Extracts the subject (first ~2 bars of voice 1 or SUBJECT markers), converts
-    to an interval sequence, then searches all voices from bar 5+ for matching
-    interval fragments (exact transposition or inversion).
+    Extracts the subject (first melodic phrase), converts to an interval
+    sequence, then searches all voices from the second half of the piece
+    for matching fragments with:
+    - Exact transposition
+    - Inversion (negated intervals)
+    - Retrograde (reversed intervals)
+    - Approximate matching (±1 semitone tolerance)
 
     Returns:
         Score 0.0-1.0.
@@ -322,7 +538,7 @@ def score_thematic_recall(
     subject_notes = _extract_subject_notes(comp, token_sequence, tokenizer)
 
     if len(subject_notes) < 4:
-        return 0.3  # too short to meaningfully score
+        return 0.3
 
     subj_intervals = _get_interval_sequence(subject_notes)
     if len(subj_intervals) < 3:
@@ -332,27 +548,34 @@ def score_thematic_recall(
     if all(i == 0 for i in subj_intervals):
         return 0.0
 
-    # Extract fragments of length 4-6 from the subject
+    # Build fragment sets for matching
     subj_frags: set[tuple[int, ...]] = set()
     inv_frags: set[tuple[int, ...]] = set()
+    retro_frags: set[tuple[int, ...]] = set()
+
     for frag_len in range(min(4, len(subj_intervals)), min(7, len(subj_intervals) + 1)):
         for frag in _extract_fragments(subj_intervals, frag_len):
             subj_frags.add(frag)
-            # Inversion: negate all intervals
-            inv_frags.add(tuple(-i for i in frag))
+            inv_frags.add(tuple(-i for i in frag))  # inversion
+            retro_frags.add(tuple(reversed(frag)))  # retrograde
 
     if not subj_frags:
         return 0.3
 
-    # Determine the cutoff tick (bar 5+)
+    # Search cutoff: use proportional cutoff (after first 25% of the piece)
     all_notes = [n for v in voices for n in v]
     if not all_notes:
         return 0.0
     min_tick = min(n[0] for n in all_notes)
-    late_cutoff = min_tick + 4 * TICKS_PER_QUARTER * 4  # after bar 4
+    max_tick = max(n[0] + n[1] for n in all_notes)
+    total_duration = max_tick - min_tick
+    late_cutoff = min_tick + total_duration * 0.25
 
-    # Search all voices from bar 5+ for matching fragments
-    entries = 0
+    # Search all voices past the cutoff
+    exact_entries = 0
+    approx_entries = 0
+    inv_entries = 0
+    retro_entries = 0
     voices_with_entries: set[int] = set()
 
     for voice_idx, voice in enumerate(voices):
@@ -363,24 +586,55 @@ def score_thematic_recall(
 
         for frag_len in range(min(4, len(subj_intervals)), min(7, len(subj_intervals) + 1)):
             voice_frags = _extract_fragments(voice_intervals, frag_len)
-            for vf in voice_frags:
-                if vf in subj_frags or vf in inv_frags:
-                    entries += 1
-                    voices_with_entries.add(voice_idx)
-                    break  # count one entry per fragment length per voice
 
-    # Score based on entries found
-    if entries == 0:
-        return 0.0
-    elif entries == 1:
-        score = 0.3
-    elif entries == 2:
-        score = 0.6
+            for vf in voice_frags:
+                if vf in subj_frags:
+                    exact_entries += 1
+                    voices_with_entries.add(voice_idx)
+                    break
+                elif vf in inv_frags:
+                    inv_entries += 1
+                    voices_with_entries.add(voice_idx)
+                    break
+                elif vf in retro_frags:
+                    retro_entries += 1
+                    voices_with_entries.add(voice_idx)
+                    break
+                else:
+                    # Approximate matching: check ±1 semitone tolerance
+                    for sf in subj_frags:
+                        if len(sf) == len(vf):
+                            if all(abs(a - b) <= 1 for a, b in zip(sf, vf)):
+                                approx_entries += 1
+                                voices_with_entries.add(voice_idx)
+                                break
+                    else:
+                        continue
+                    break  # found approx match
+
+    # Score based on entries found (weighted by match quality)
+    weighted_entries = (
+        exact_entries * 1.0
+        + inv_entries * 0.8
+        + retro_entries * 0.6
+        + approx_entries * 0.4
+    )
+
+    if weighted_entries < 0.1:
+        score = 0.0
+    elif weighted_entries < 1.0:
+        score = 0.2 + weighted_entries * 0.2
+    elif weighted_entries < 2.0:
+        score = 0.4 + (weighted_entries - 1.0) * 0.2
+    elif weighted_entries < 4.0:
+        score = 0.6 + (weighted_entries - 2.0) * 0.1
     else:
         score = 0.8
 
     # Bonus if entries span multiple voices
     if len(voices_with_entries) >= 2:
-        score += 0.2
+        score += 0.15
+    if len(voices_with_entries) >= 3:
+        score += 0.05
 
     return min(1.0, score)

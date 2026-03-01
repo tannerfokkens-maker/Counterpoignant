@@ -207,13 +207,7 @@ def generate(
             if non_empty < 2:
                 continue
 
-            score = score_composition(
-                comp,
-                token_sequence=tokens,
-                model=model,
-                tokenizer=tokenizer,
-                form=form,
-            )
+            score = score_composition(comp, token_sequence=tokens, model=model, tokenizer=tokenizer, form=form)
             candidates.append(GenerationResult(
                 composition=comp,
                 tokens=tokens,
@@ -252,13 +246,7 @@ def generate(
                 continue
 
             # Score
-            score = score_composition(
-                comp,
-                token_sequence=tokens,
-                model=model,
-                tokenizer=tokenizer,
-                form=form,
-            )
+            score = score_composition(comp, token_sequence=tokens, model=model, tokenizer=tokenizer, form=form)
 
             candidates.append(GenerationResult(
                 composition=comp,
@@ -516,13 +504,7 @@ def generate_voice_by_voice(
         if non_empty < 2:
             continue
 
-        score = score_composition(
-            comp,
-            token_sequence=tokens,
-            model=model,
-            tokenizer=tokenizer,
-            form=form,
-        )
+        score = score_composition(comp, token_sequence=tokens, model=model, tokenizer=tokenizer, form=form)
         candidates.append(GenerationResult(
             composition=comp,
             tokens=tokens,

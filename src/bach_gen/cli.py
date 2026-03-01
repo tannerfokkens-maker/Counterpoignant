@@ -1427,7 +1427,6 @@ def generate(
     table.add_column("Voice Lead.", justify="right")
     table.add_column("Statistical", justify="right")
     table.add_column("Structural", justify="right")
-    table.add_column("Info", justify="right")
     table.add_column("Contrap.", justify="right")
     table.add_column("Complete", justify="right")
     table.add_column("Thematic", justify="right")
@@ -1441,7 +1440,6 @@ def generate(
             f"{s.voice_leading:.3f}",
             f"{s.statistical:.3f}",
             f"{s.structural:.3f}",
-            f"{s.information:.3f}",
             f"{s.contrapuntal:.3f}",
             f"{s.completeness:.3f}",
             f"{s.thematic_recall:.3f}",
@@ -1462,7 +1460,7 @@ def evaluate(midi_file: str, mode: str | None) -> None:
     from bach_gen.utils.midi_io import load_midi, midi_to_note_events
     from bach_gen.data.extraction import VoiceComposition
     from bach_gen.data.tokenizer import BachTokenizer, load_tokenizer
-    from bach_gen.evaluation.scorer import get_default_weights, score_composition
+    from bach_gen.evaluation.scorer import score_composition
     from bach_gen.evaluation.statistical import load_corpus_stats
     from bach_gen.evaluation.information import load_information_calibration
     from bach_gen.utils.music_theory import detect_key
@@ -1535,33 +1533,29 @@ def evaluate(midi_file: str, mode: str | None) -> None:
     else:
         tokenizer = BachTokenizer()
     tokens = tokenizer.encode(comp, form=mode)
-    score = score_composition(
-        comp,
-        token_sequence=tokens,
-        form=mode,
-        vocab_size=tokenizer.vocab_size,
-    )
+    score = score_composition(comp, token_sequence=tokens, vocab_size=tokenizer.vocab_size, form=mode)
 
     # Display
+    from bach_gen.evaluation.scorer import get_weights_for_form
+    w = get_weights_for_form(mode)
+
     table = Table(title=f"Evaluation Scores ({mode})")
     table.add_column("Metric", style="bold")
     table.add_column("Score", justify="right")
     table.add_column("Weight", justify="right")
     table.add_column("Weighted", justify="right")
 
-    active_weights = get_default_weights(mode)
-    weights = {
-        "Voice Leading": (score.voice_leading, active_weights["voice_leading"]),
-        "Statistical Sim.": (score.statistical, active_weights["statistical"]),
-        "Structural": (score.structural, active_weights["structural"]),
-        "Information": (score.information, active_weights["information"]),
-        "Contrapuntal": (score.contrapuntal, active_weights["contrapuntal"]),
-        "Completeness": (score.completeness, active_weights["completeness"]),
-        "Thematic Recall": (score.thematic_recall, active_weights["thematic_recall"]),
+    display_metrics = {
+        "Voice Leading": (score.voice_leading, w.get("voice_leading", 0.22)),
+        "Statistical Sim.": (score.statistical, w.get("statistical", 0.10)),
+        "Structural": (score.structural, w.get("structural", 0.15)),
+        "Contrapuntal": (score.contrapuntal, w.get("contrapuntal", 0.18)),
+        "Completeness": (score.completeness, w.get("completeness", 0.05)),
+        "Thematic Recall": (score.thematic_recall, w.get("thematic_recall", 0.30)),
     }
 
-    for name, (val, w) in weights.items():
-        table.add_row(name, f"{val:.3f}", f"{w:.2f}", f"{val * w:.3f}")
+    for name, (val, wt) in display_metrics.items():
+        table.add_row(name, f"{val:.3f}", f"{wt:.2f}", f"{val * wt:.3f}")
 
     table.add_section()
     table.add_row("[bold]COMPOSITE[/bold]", f"[bold]{score.composite:.3f}[/bold]", "", "")
@@ -1628,7 +1622,6 @@ def calibrate(sample_size: int) -> None:
         with open(mode_path) as f:
             mode_info = json.load(f)
     mode = mode_info.get("mode", "all")
-    score_form = None if mode == "all" else mode
 
     # Sample corpus sequences
     sample = rng.sample(sequences, min(sample_size, len(sequences)))
@@ -1645,12 +1638,7 @@ def calibrate(sample_size: int) -> None:
                 else:
                     comp = seq  # already a VoiceComposition
                 tokens = tokenizer.encode(comp, form=mode) if decode else tokenizer.encode(comp, form=mode)
-                sb = score_composition(
-                    comp,
-                    token_sequence=tokens,
-                    form=score_form,
-                    vocab_size=tokenizer.vocab_size,
-                )
+                sb = score_composition(comp, token_sequence=tokens, vocab_size=tokenizer.vocab_size)
                 scores.append(sb.composite)
                 breakdowns.append(sb)
             except Exception:
@@ -1669,12 +1657,7 @@ def calibrate(sample_size: int) -> None:
             try:
                 comp = tokenizer.decode(seq)
                 tokens = tokenizer.encode(comp, form=mode)
-                sb = score_composition(
-                    comp,
-                    token_sequence=tokens,
-                    form=score_form,
-                    vocab_size=tokenizer.vocab_size,
-                )
+                sb = score_composition(comp, token_sequence=tokens, vocab_size=tokenizer.vocab_size)
                 corpus_scores.append(sb.composite)
                 corpus_breakdowns.append(sb)
             except Exception:
@@ -1709,12 +1692,8 @@ def calibrate(sample_size: int) -> None:
                     source="shuffled",
                 )
                 tokens = tokenizer.encode(shuffled_comp, form=mode)
-                sb = score_composition(
-                    shuffled_comp,
-                    token_sequence=tokens,
-                    form=score_form,
-                    vocab_size=tokenizer.vocab_size,
-                )
+                sb = score_composition(shuffled_comp, token_sequence=tokens,
+                                       vocab_size=tokenizer.vocab_size)
                 shuffled_scores.append(sb.composite)
                 shuffled_breakdowns.append(sb)
             except Exception:
@@ -1752,12 +1731,8 @@ def calibrate(sample_size: int) -> None:
                     source="random",
                 )
                 tokens = tokenizer.encode(rand_comp, form=mode)
-                sb = score_composition(
-                    rand_comp,
-                    token_sequence=tokens,
-                    form=score_form,
-                    vocab_size=tokenizer.vocab_size,
-                )
+                sb = score_composition(rand_comp, token_sequence=tokens,
+                                       vocab_size=tokenizer.vocab_size)
                 random_scores.append(sb.composite)
                 random_breakdowns.append(sb)
             except Exception:
@@ -1791,12 +1766,8 @@ def calibrate(sample_size: int) -> None:
                     source="repetitive",
                 )
                 tokens = tokenizer.encode(rep_comp, form=mode)
-                sb = score_composition(
-                    rep_comp,
-                    token_sequence=tokens,
-                    form=score_form,
-                    vocab_size=tokenizer.vocab_size,
-                )
+                sb = score_composition(rep_comp, token_sequence=tokens,
+                                       vocab_size=tokenizer.vocab_size)
                 repetitive_scores.append(sb.composite)
                 repetitive_breakdowns.append(sb)
             except Exception:
@@ -1864,7 +1835,7 @@ def calibrate(sample_size: int) -> None:
 
     # Per-dimension breakdown
     dims = ["voice_leading", "statistical", "structural", "contrapuntal",
-            "information", "completeness", "thematic_recall"]
+            "completeness", "thematic_recall"]
     dim_table = Table(title="Per-Dimension Mean ± Std")
     dim_table.add_column("Dimension", style="bold")
     dim_table.add_column("Bach Corpus", justify="right")
@@ -1933,6 +1904,238 @@ def calibrate(sample_size: int) -> None:
     with open(cal_path, "w") as f:
         json.dump(cal_results, f, indent=2)
     console.print(f"\n[green]Calibration results saved to {cal_path}[/green]")
+
+
+@cli.command()
+@click.option("--sample-size", "-n", default=200, type=int,
+              help="Max sequences per form to sample for calibration")
+def calibrate_forms(sample_size: int) -> None:
+    """Calibrate scorer weights per form (chorale, fugue, invention, etc.).
+
+    Groups training sequences by their FORM conditioning token, runs
+    Bach-vs-shuffled calibration per form, then derives optimal weights
+    proportional to each dimension's discrimination power within that form.
+    """
+    import random as rng
+    import numpy as np
+    from bach_gen.data.tokenizer import load_tokenizer
+    from bach_gen.evaluation.scorer import score_composition, DEFAULT_WEIGHTS
+    from bach_gen.evaluation.statistical import load_corpus_stats
+    from bach_gen.evaluation.information import load_information_calibration
+    from bach_gen.data.extraction import VoiceComposition
+
+    # Load data
+    seq_path = DATA_DIR / "sequences.json"
+    if not seq_path.exists():
+        console.print("[red]No training data found. Run 'bach-gen prepare-data' first.[/red]")
+        sys.exit(1)
+
+    console.print("[bold]Loading data...[/bold]")
+    with open(seq_path) as f:
+        sequences = json.load(f)
+
+    tokenizer = load_tokenizer(DATA_DIR / "tokenizer.json")
+    stats_path = DATA_DIR / "corpus_stats.json"
+    if stats_path.exists():
+        load_corpus_stats(stats_path)
+    load_information_calibration(MODELS_DIR / "information_calibration.json")
+    load_information_calibration(DATA_DIR / "information_calibration.json")
+
+    # Map form token IDs to form names
+    form_token_to_name = {}
+    for name, tok_id in tokenizer.FORM_TO_FORM_TOKEN.items():
+        form_token_to_name[tok_id] = name
+
+    # Group sequences by form token (scan first ~15 tokens of each sequence)
+    form_groups: dict[str, list[list[int]]] = {}
+    unclassified = []
+    for seq in sequences:
+        found_form = None
+        for tok in seq[:15]:
+            if tok in form_token_to_name:
+                found_form = form_token_to_name[tok]
+                break
+        if found_form:
+            form_groups.setdefault(found_form, []).append(seq)
+        else:
+            unclassified.append(seq)
+
+    console.print(f"\n[bold]Sequence counts by form:[/bold]")
+    for form_name, seqs in sorted(form_groups.items(), key=lambda x: -len(x[1])):
+        console.print(f"  {form_name}: {len(seqs)}")
+    if unclassified:
+        console.print(f"  (unclassified): {len(unclassified)}")
+
+    dims = ["voice_leading", "statistical", "structural", "contrapuntal",
+            "completeness", "thematic_recall"]
+
+    mode_path = DATA_DIR / "mode.json"
+    mode_info = {}
+    if mode_path.exists():
+        with open(mode_path) as f:
+            mode_info = json.load(f)
+    mode = mode_info.get("mode", "all")
+
+    all_form_weights: dict[str, dict[str, float]] = {}
+    all_form_results: dict[str, dict] = {}
+
+    for form_name, form_seqs in sorted(form_groups.items(), key=lambda x: -len(x[1])):
+        n = min(sample_size, len(form_seqs))
+        if n < 10:
+            console.print(f"\n[yellow]Skipping {form_name} (only {n} sequences)[/yellow]")
+            continue
+
+        sample = rng.sample(form_seqs, n)
+        console.print(f"\n{'=' * 60}")
+        console.print(f"[bold]{form_name.upper()} ({n} sequences)[/bold]")
+        console.print('=' * 60)
+
+        # Score real Bach
+        corpus_breakdowns = []
+        for seq in sample:
+            try:
+                comp = tokenizer.decode(seq)
+                tokens = tokenizer.encode(comp, form=mode)
+                sb = score_composition(comp, token_sequence=tokens,
+                                       vocab_size=tokenizer.vocab_size)
+                corpus_breakdowns.append(sb)
+            except Exception:
+                pass
+
+        # Score shuffled
+        shuffled_breakdowns = []
+        for seq in sample:
+            try:
+                comp = tokenizer.decode(seq)
+                shuffled_voices = []
+                for voice in comp.voices:
+                    if not voice:
+                        shuffled_voices.append(voice)
+                        continue
+                    pitches = [n_[2] for n_ in voice]
+                    rng.shuffle(pitches)
+                    shuffled_voices.append([(n_[0], n_[1], p) for n_, p in zip(voice, pitches)])
+                shuffled_comp = VoiceComposition(
+                    voices=shuffled_voices,
+                    key_root=comp.key_root,
+                    key_mode=comp.key_mode,
+                    source="shuffled",
+                )
+                tokens = tokenizer.encode(shuffled_comp, form=mode)
+                sb = score_composition(shuffled_comp, token_sequence=tokens,
+                                       vocab_size=tokenizer.vocab_size)
+                shuffled_breakdowns.append(sb)
+            except Exception:
+                pass
+
+        if not corpus_breakdowns or not shuffled_breakdowns:
+            console.print(f"  [red]Scoring failed for {form_name}[/red]")
+            continue
+
+        # Compute discrimination gaps per dimension
+        gaps = {}
+        form_result = {}
+        dim_table = Table(title=f"{form_name} — Per-Dimension Discrimination")
+        dim_table.add_column("Dimension", style="bold")
+        dim_table.add_column("Bach Mean", justify="right")
+        dim_table.add_column("Shuffled Mean", justify="right")
+        dim_table.add_column("Gap", justify="right")
+        dim_table.add_column("Discriminates?", justify="center")
+
+        for dim in dims:
+            bach_vals = [getattr(b, dim) for b in corpus_breakdowns]
+            shuf_vals = [getattr(b, dim) for b in shuffled_breakdowns]
+            bach_mean = float(np.mean(bach_vals))
+            shuf_mean = float(np.mean(shuf_vals))
+            gap = bach_mean - shuf_mean
+            gaps[dim] = max(gap, 0.001)  # floor at tiny positive to avoid zero weights
+
+            form_result[dim] = {
+                "bach_mean": bach_mean,
+                "shuffled_mean": shuf_mean,
+                "gap": gap,
+            }
+
+            if gap > 0.15:
+                quality = "[bold green]Excellent[/bold green]"
+            elif gap > 0.08:
+                quality = "[green]Good[/green]"
+            elif gap > 0.03:
+                quality = "[yellow]Weak[/yellow]"
+            else:
+                quality = "[red]Dead weight[/red]"
+
+            dim_table.add_row(dim, f"{bach_mean:.3f}", f"{shuf_mean:.3f}",
+                              f"{gap:.3f}", quality)
+
+        console.print(dim_table)
+
+        # Derive weights proportional to discrimination gap
+        total_gap = sum(gaps.values())
+        weights = {dim: gaps[dim] / total_gap for dim in dims}
+
+        # Display suggested weights
+        weight_table = Table(title=f"{form_name} — Suggested Weights")
+        weight_table.add_column("Dimension", style="bold")
+        weight_table.add_column("Current", justify="right")
+        weight_table.add_column("Suggested", justify="right")
+        weight_table.add_column("Change", justify="right")
+
+        for dim in sorted(dims, key=lambda d: -weights[d]):
+            current = DEFAULT_WEIGHTS.get(dim, 0.0)
+            suggested = weights[dim]
+            delta = suggested - current
+            sign = "+" if delta > 0 else ""
+            weight_table.add_row(
+                dim,
+                f"{current:.3f}",
+                f"[bold]{suggested:.3f}[/bold]",
+                f"{sign}{delta:.3f}",
+            )
+
+        console.print(weight_table)
+
+        all_form_weights[form_name] = weights
+        all_form_results[form_name] = form_result
+
+    # Summary: all forms side by side
+    if len(all_form_weights) > 1:
+        console.print(f"\n{'=' * 72}")
+        console.print("[bold]SUGGESTED WEIGHTS BY FORM[/bold]")
+        console.print('=' * 72)
+
+        summary = Table(title="Optimal Weights Per Form")
+        summary.add_column("Dimension", style="bold")
+        for form_name in sorted(all_form_weights.keys()):
+            summary.add_column(form_name.capitalize(), justify="right")
+
+        for dim in dims:
+            row = [dim]
+            for form_name in sorted(all_form_weights.keys()):
+                w = all_form_weights[form_name].get(dim, 0.0)
+                row.append(f"{w:.3f}")
+            summary.add_row(*row)
+
+        console.print(summary)
+
+    # Save results
+    cal_path = DATA_DIR / "calibration_forms.json"
+    output = {
+        "weights_by_form": all_form_weights,
+        "discrimination_by_form": all_form_results,
+    }
+    with open(cal_path, "w") as f:
+        json.dump(output, f, indent=2)
+    console.print(f"\n[green]Form calibration saved to {cal_path}[/green]")
+
+    # Print copy-paste ready Python dict
+    console.print("\n[bold]Copy-paste ready weights:[/bold]")
+    console.print("FORM_WEIGHTS = {")
+    for form_name in sorted(all_form_weights.keys()):
+        w = all_form_weights[form_name]
+        items = ", ".join(f'"{d}": {w[d]:.3f}' for d in sorted(w, key=lambda d: -w[d]))
+        console.print(f'    "{form_name}": {{{items}}},')
+    console.print("}")
 
 
 @cli.command()
