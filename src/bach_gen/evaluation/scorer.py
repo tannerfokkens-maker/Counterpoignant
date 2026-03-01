@@ -35,16 +35,34 @@ class ScoreBreakdown:
     details: dict | None = None
 
 
-# Default weights
+# Default weights by form.
+# Chorale/default preset downweights thematic recall because it saturates there.
 DEFAULT_WEIGHTS = {
-    "structural": 0.25,
-    "statistical": 0.20,
-    "thematic_recall": 0.15,
-    "information": 0.15,
-    "voice_leading": 0.10,
-    "contrapuntal": 0.08,
-    "completeness": 0.07,
+    "structural": 0.35,
+    "statistical": 0.12,
+    "thematic_recall": 0.05,
+    "information": 0.20,
+    "voice_leading": 0.04,
+    "contrapuntal": 0.20,
+    "completeness": 0.04,
 }
+
+FUGUE_WEIGHTS = {
+    "structural": 0.25,
+    "statistical": 0.12,
+    "thematic_recall": 0.15,
+    "information": 0.20,
+    "voice_leading": 0.04,
+    "contrapuntal": 0.20,
+    "completeness": 0.04,
+}
+
+
+def get_default_weights(form: str | None = None) -> dict[str, float]:
+    """Return default scorer weights for a musical form."""
+    if form and form.lower() == "fugue":
+        return FUGUE_WEIGHTS.copy()
+    return DEFAULT_WEIGHTS.copy()
 
 
 def score_composition(
@@ -52,6 +70,7 @@ def score_composition(
     token_sequence: list[int] | None = None,
     model: torch.nn.Module | None = None,
     weights: dict[str, float] | None = None,
+    form: str | None = None,
     vocab_size: int | None = None,
     tokenizer=None,
 ) -> ScoreBreakdown:
@@ -61,7 +80,8 @@ def score_composition(
         comp: The composition to evaluate.
         token_sequence: Tokenized version (for information scoring).
         model: Trained model (for information scoring).
-        weights: Custom weights (default: DEFAULT_WEIGHTS).
+        weights: Optional weight overrides layered on form defaults.
+        form: Composition form used for default weight selection.
         vocab_size: Vocabulary size for information scoring.
                     Falls back to BachTokenizer().vocab_size when None.
         tokenizer: Tokenizer instance (for thematic recall subject extraction).
@@ -69,7 +89,9 @@ def score_composition(
     Returns:
         ScoreBreakdown with individual and composite scores.
     """
-    w = weights or DEFAULT_WEIGHTS
+    w = get_default_weights(form=form)
+    if weights:
+        w.update(weights)
     all_details: dict = {}
 
     # Voice leading — evaluates all voice pairs
@@ -111,13 +133,13 @@ def score_composition(
 
     # Composite
     composite = (
-        vl_score * w.get("voice_leading", 0.10)
-        + stat_score * w.get("statistical", 0.20)
-        + struct_score * w.get("structural", 0.25)
-        + info_score * w.get("information", 0.15)
-        + cp_score * w.get("contrapuntal", 0.08)
-        + comp_score * w.get("completeness", 0.07)
-        + tr_score * w.get("thematic_recall", 0.15)
+        vl_score * w["voice_leading"]
+        + stat_score * w["statistical"]
+        + struct_score * w["structural"]
+        + info_score * w["information"]
+        + cp_score * w["contrapuntal"]
+        + comp_score * w["completeness"]
+        + tr_score * w["thematic_recall"]
     )
 
     return ScoreBreakdown(
@@ -138,13 +160,20 @@ def score_voice_pair(
     token_sequence: list[int] | None = None,
     model: torch.nn.Module | None = None,
     weights: dict[str, float] | None = None,
+    form: str | None = None,
 ) -> ScoreBreakdown:
     """Score a voice pair (backward-compatible wrapper).
 
     Converts to VoiceComposition and delegates to score_composition.
     """
     comp = VoiceComposition.from_voice_pair(pair)
-    return score_composition(comp, token_sequence=token_sequence, model=model, weights=weights)
+    return score_composition(
+        comp,
+        token_sequence=token_sequence,
+        model=model,
+        weights=weights,
+        form=form,
+    )
 
 
 def _score_completeness(comp: VoiceComposition) -> float:

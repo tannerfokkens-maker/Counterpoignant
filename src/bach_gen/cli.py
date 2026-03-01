@@ -1462,7 +1462,7 @@ def evaluate(midi_file: str, mode: str | None) -> None:
     from bach_gen.utils.midi_io import load_midi, midi_to_note_events
     from bach_gen.data.extraction import VoiceComposition
     from bach_gen.data.tokenizer import BachTokenizer, load_tokenizer
-    from bach_gen.evaluation.scorer import score_composition
+    from bach_gen.evaluation.scorer import get_default_weights, score_composition
     from bach_gen.evaluation.statistical import load_corpus_stats
     from bach_gen.evaluation.information import load_information_calibration
     from bach_gen.utils.music_theory import detect_key
@@ -1535,7 +1535,12 @@ def evaluate(midi_file: str, mode: str | None) -> None:
     else:
         tokenizer = BachTokenizer()
     tokens = tokenizer.encode(comp, form=mode)
-    score = score_composition(comp, token_sequence=tokens, vocab_size=tokenizer.vocab_size)
+    score = score_composition(
+        comp,
+        token_sequence=tokens,
+        form=mode,
+        vocab_size=tokenizer.vocab_size,
+    )
 
     # Display
     table = Table(title=f"Evaluation Scores ({mode})")
@@ -1544,14 +1549,15 @@ def evaluate(midi_file: str, mode: str | None) -> None:
     table.add_column("Weight", justify="right")
     table.add_column("Weighted", justify="right")
 
+    active_weights = get_default_weights(mode)
     weights = {
-        "Voice Leading": (score.voice_leading, 0.25),
-        "Statistical Sim.": (score.statistical, 0.15),
-        "Structural": (score.structural, 0.15),
-        "Information": (score.information, 0.15),
-        "Contrapuntal": (score.contrapuntal, 0.10),
-        "Completeness": (score.completeness, 0.10),
-        "Thematic Recall": (score.thematic_recall, 0.10),
+        "Voice Leading": (score.voice_leading, active_weights["voice_leading"]),
+        "Statistical Sim.": (score.statistical, active_weights["statistical"]),
+        "Structural": (score.structural, active_weights["structural"]),
+        "Information": (score.information, active_weights["information"]),
+        "Contrapuntal": (score.contrapuntal, active_weights["contrapuntal"]),
+        "Completeness": (score.completeness, active_weights["completeness"]),
+        "Thematic Recall": (score.thematic_recall, active_weights["thematic_recall"]),
     }
 
     for name, (val, w) in weights.items():
@@ -1622,6 +1628,7 @@ def calibrate(sample_size: int) -> None:
         with open(mode_path) as f:
             mode_info = json.load(f)
     mode = mode_info.get("mode", "all")
+    score_form = None if mode == "all" else mode
 
     # Sample corpus sequences
     sample = rng.sample(sequences, min(sample_size, len(sequences)))
@@ -1638,7 +1645,12 @@ def calibrate(sample_size: int) -> None:
                 else:
                     comp = seq  # already a VoiceComposition
                 tokens = tokenizer.encode(comp, form=mode) if decode else tokenizer.encode(comp, form=mode)
-                sb = score_composition(comp, token_sequence=tokens, vocab_size=tokenizer.vocab_size)
+                sb = score_composition(
+                    comp,
+                    token_sequence=tokens,
+                    form=score_form,
+                    vocab_size=tokenizer.vocab_size,
+                )
                 scores.append(sb.composite)
                 breakdowns.append(sb)
             except Exception:
@@ -1657,7 +1669,12 @@ def calibrate(sample_size: int) -> None:
             try:
                 comp = tokenizer.decode(seq)
                 tokens = tokenizer.encode(comp, form=mode)
-                sb = score_composition(comp, token_sequence=tokens, vocab_size=tokenizer.vocab_size)
+                sb = score_composition(
+                    comp,
+                    token_sequence=tokens,
+                    form=score_form,
+                    vocab_size=tokenizer.vocab_size,
+                )
                 corpus_scores.append(sb.composite)
                 corpus_breakdowns.append(sb)
             except Exception:
@@ -1692,8 +1709,12 @@ def calibrate(sample_size: int) -> None:
                     source="shuffled",
                 )
                 tokens = tokenizer.encode(shuffled_comp, form=mode)
-                sb = score_composition(shuffled_comp, token_sequence=tokens,
-                                       vocab_size=tokenizer.vocab_size)
+                sb = score_composition(
+                    shuffled_comp,
+                    token_sequence=tokens,
+                    form=score_form,
+                    vocab_size=tokenizer.vocab_size,
+                )
                 shuffled_scores.append(sb.composite)
                 shuffled_breakdowns.append(sb)
             except Exception:
@@ -1731,8 +1752,12 @@ def calibrate(sample_size: int) -> None:
                     source="random",
                 )
                 tokens = tokenizer.encode(rand_comp, form=mode)
-                sb = score_composition(rand_comp, token_sequence=tokens,
-                                       vocab_size=tokenizer.vocab_size)
+                sb = score_composition(
+                    rand_comp,
+                    token_sequence=tokens,
+                    form=score_form,
+                    vocab_size=tokenizer.vocab_size,
+                )
                 random_scores.append(sb.composite)
                 random_breakdowns.append(sb)
             except Exception:
@@ -1766,8 +1791,12 @@ def calibrate(sample_size: int) -> None:
                     source="repetitive",
                 )
                 tokens = tokenizer.encode(rep_comp, form=mode)
-                sb = score_composition(rep_comp, token_sequence=tokens,
-                                       vocab_size=tokenizer.vocab_size)
+                sb = score_composition(
+                    rep_comp,
+                    token_sequence=tokens,
+                    form=score_form,
+                    vocab_size=tokenizer.vocab_size,
+                )
                 repetitive_scores.append(sb.composite)
                 repetitive_breakdowns.append(sb)
             except Exception:
