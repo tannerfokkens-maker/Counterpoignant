@@ -23,6 +23,7 @@ class ConstraintState:
     last_token: int | None = None
     recent_tokens: list[int] = field(default_factory=list)
     notes_in_current_voice: int = 0
+    notes_per_voice: tuple[int, int, int, int] = (0, 0, 0, 0)
 
 
 class DecodingConstraints:
@@ -69,6 +70,12 @@ class DecodingConstraints:
             else:
                 self._voice_ranges[v] = LOWER_VOICE_RANGE
 
+        # Temporal tokens used for anti-lockstep soft bias.
+        self._temporal_tokens: list[int] = []
+        for name, tok in self.tokenizer.name_to_token.items():
+            if name == "BAR" or name.startswith("BEAT_") or name.startswith("TimeShift_"):
+                self._temporal_tokens.append(tok)
+
     def initial_state(self, prompt_tokens: list[int]) -> ConstraintState:
         """Build a ConstraintState by scanning the prompt once."""
         state = ConstraintState()
@@ -80,6 +87,7 @@ class DecodingConstraints:
         """Return a new ConstraintState reflecting *token* appended (O(1))."""
         current_voice = state.current_voice
         notes_in_voice = state.notes_in_current_voice
+        notes_per_voice = state.notes_per_voice
         if token in self._voice_token_ids:
             current_voice = self._voice_token_ids[token]
             notes_in_voice = 0
@@ -89,14 +97,19 @@ class DecodingConstraints:
                 notes_in_voice = 0
             elif name.startswith("Dur_"):
                 notes_in_voice += 1
+                idx = max(0, min(3, current_voice - 1))
+                mutable = list(notes_per_voice)
+                mutable[idx] += 1
+                notes_per_voice = tuple(mutable)
 
-        recent = state.recent_tokens[-5:] + [token]  # keep last 6
+        recent = state.recent_tokens[-31:] + [token]  # keep last 32
 
         return ConstraintState(
             current_voice=current_voice,
             last_token=token,
             recent_tokens=recent,
             notes_in_current_voice=notes_in_voice,
+            notes_per_voice=notes_per_voice,
         )
 
     def apply(
@@ -125,6 +138,7 @@ class DecodingConstraints:
                 logits = self._apply_key_bias(logits)
 
             logits = self._prevent_degenerate_from_state(logits, state)
+            logits = self._enforce_min_voice_coverage_from_state(logits, state)
         else:
             current_voice = self._get_current_voice(generated_tokens)
 
@@ -134,6 +148,7 @@ class DecodingConstraints:
                 logits = self._apply_key_bias(logits)
 
             logits = self._prevent_degenerate(logits, generated_tokens)
+            logits = self._enforce_min_voice_coverage(logits, generated_tokens)
 
         return logits
 
@@ -210,6 +225,7 @@ class DecodingConstraints:
             if self._notes_in_current_voice(tokens) < min_notes_before_sep:
                 logits[voice_sep_tok] = float("-inf")
 
+        logits = self._apply_soft_anti_lockstep(logits, tokens[-32:])
         return logits
 
     def _prevent_degenerate_from_state(
@@ -244,6 +260,49 @@ class DecodingConstraints:
             if state.notes_in_current_voice < min_notes_before_sep:
                 logits[voice_sep_tok] = float("-inf")
 
+        logits = self._apply_soft_anti_lockstep(logits, state.recent_tokens)
+        return logits
+
+    def _apply_soft_anti_lockstep(
+        self,
+        logits: torch.Tensor,
+        recent_tokens: list[int],
+    ) -> torch.Tensor:
+        """Softly discourage excessive same-time multi-voice attacks in fugues."""
+        if self.form != "fugue":
+            return logits
+        if not recent_tokens:
+            return logits
+
+        voices_in_slot: list[int] = []
+        for tok in reversed(recent_tokens):
+            name = self.tokenizer.token_to_name.get(tok, "")
+            if name == "BAR" or name.startswith("BEAT_") or name.startswith("TimeShift_"):
+                break
+            if name == "VOICE_SEP":
+                break
+            if tok in self._voice_token_ids:
+                voices_in_slot.append(self._voice_token_ids[tok])
+
+        distinct = len(set(voices_in_slot))
+        if distinct <= 1:
+            return logits
+
+        voice_tokens = getattr(self.tokenizer, "VOICE_TOKENS", [])
+        if distinct >= 3:
+            # Heavy same-time stacking: nudge toward temporal advance.
+            for tok in voice_tokens:
+                if tok < logits.size(0) and torch.isfinite(logits[tok]):
+                    logits[tok] -= 1.1
+            for tok in self._temporal_tokens:
+                if tok < logits.size(0) and torch.isfinite(logits[tok]):
+                    logits[tok] += 0.35
+        elif distinct == 2:
+            # Mild pressure away from triadic/tetradic block onset.
+            for tok in voice_tokens:
+                if tok < logits.size(0) and torch.isfinite(logits[tok]):
+                    logits[tok] -= 0.25
+
         return logits
 
     def _notes_in_current_voice(self, tokens: list[int]) -> int:
@@ -256,3 +315,56 @@ class DecodingConstraints:
             if name.startswith("Dur_"):
                 count += 1
         return count
+
+    def _required_voice_count(self) -> int:
+        """Required non-empty voices for this generation request."""
+        return max(2, min(self.num_voices, 4))
+
+    def _enforce_min_voice_coverage_from_state(
+        self, logits: torch.Tensor, state: ConstraintState,
+    ) -> torch.Tensor:
+        return self._apply_voice_coverage_floor(logits, state.notes_per_voice)
+
+    def _enforce_min_voice_coverage(
+        self, logits: torch.Tensor, tokens: list[int],
+    ) -> torch.Tensor:
+        return self._apply_voice_coverage_floor(logits, self._notes_per_voice_from_tokens(tokens))
+
+    def _apply_voice_coverage_floor(
+        self, logits: torch.Tensor, notes_per_voice: tuple[int, int, int, int],
+    ) -> torch.Tensor:
+        required = self._required_voice_count()
+        covered = sum(1 for i in range(required) if notes_per_voice[i] > 0)
+        if covered >= required:
+            return logits
+
+        # Prevent early stop until all required voices have contributed notes.
+        if self.tokenizer.EOS < logits.size(0):
+            logits[self.tokenizer.EOS] = float("-inf")
+
+        # Nudge sampling toward voices that have not entered yet.
+        voice_tokens = getattr(self.tokenizer, "VOICE_TOKENS", [])
+        for i in range(required):
+            if notes_per_voice[i] > 0:
+                continue
+            if i >= len(voice_tokens):
+                continue
+            voice_tok = voice_tokens[i]
+            if voice_tok < logits.size(0) and torch.isfinite(logits[voice_tok]):
+                logits[voice_tok] += 1.5
+        return logits
+
+    def _notes_per_voice_from_tokens(
+        self, tokens: list[int],
+    ) -> tuple[int, int, int, int]:
+        counts = [0, 0, 0, 0]
+        current_voice = 1
+        for tok in tokens:
+            if tok in self._voice_token_ids:
+                current_voice = self._voice_token_ids[tok]
+                continue
+            name = self.tokenizer.token_to_name.get(tok, "")
+            if name.startswith("Dur_"):
+                idx = max(0, min(3, current_voice - 1))
+                counts[idx] += 1
+        return tuple(counts)

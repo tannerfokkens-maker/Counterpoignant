@@ -66,6 +66,77 @@ class GenerationResult:
         return self.composition.to_voice_pair()
 
 
+def _push_top_result(
+    candidates: list[GenerationResult],
+    result: GenerationResult,
+    top_k_results: int,
+) -> None:
+    """Keep only the top-k scoring candidates in memory."""
+    if top_k_results <= 0:
+        return
+    if len(candidates) < top_k_results:
+        candidates.append(result)
+        return
+
+    worst_idx = min(range(len(candidates)), key=lambda i: candidates[i].score.composite)
+    if result.score.composite > candidates[worst_idx].score.composite:
+        candidates[worst_idx] = result
+
+
+def _passes_candidate_guardrails(score: ScoreBreakdown, form: str) -> bool:
+    """Apply form-specific hard floors before candidate ranking."""
+    if form != "fugue":
+        return True
+
+    if score.voice_leading < 0.68:
+        return False
+    if score.completeness < 0.60:
+        return False
+
+    details = score.details if isinstance(score.details, dict) else {}
+    cp = details.get("contrapuntal", {}) if isinstance(details, dict) else {}
+    st = details.get("structural", {}) if isinstance(details, dict) else {}
+
+    onset = float(cp.get("onset_staggering", 0.0))
+    voice_balance = float(cp.get("voice_balance", 1.0))
+    voice_indep = float(cp.get("voice_independence", 0.0))
+    cadence = float(st.get("cadence", 1.0))
+
+    # Overly blocky.
+    if onset < 0.05:
+        return False
+    # Over-fragmented.
+    if onset > 0.95 and voice_indep < 0.45:
+        return False
+    # One dominant line with weak supporting voices.
+    if voice_balance < 0.25:
+        return False
+    # Weak phrase closure.
+    if cadence < 0.30:
+        return False
+    return True
+
+
+def _resolve_candidate_batch_size(
+    device: torch.device,
+    requested: int | None,
+) -> int:
+    """Choose candidate batch size for sampling generation."""
+    if requested is not None:
+        return max(1, requested)
+    if device.type == "cuda":
+        return 8
+    if device.type == "mps":
+        # Conservative default for MPS; can be overridden from CLI.
+        return 2
+    return 2
+
+
+def _required_non_empty_voices(num_voices: int) -> int:
+    """Required non-empty voices for retaining a generated candidate."""
+    return max(2, min(num_voices, 4))
+
+
 def generate(
     model: BachTransformer,
     tokenizer: BachTokenizer,
@@ -94,6 +165,7 @@ def generate(
     harmonic_rhythm: str | None = None,
     harmonic_tension: str | None = None,
     chromaticism: str | None = None,
+    candidate_batch_size: int | None = None,
 ) -> list[GenerationResult]:
     """Generate Bach-style compositions and return top results.
 
@@ -125,6 +197,8 @@ def generate(
         harmonic_rhythm: Harmonic rhythm conditioning (slow/moderate/fast).
         harmonic_tension: Harmonic tension conditioning (low/moderate/high).
         chromaticism: Chromaticism conditioning (low/moderate/high).
+        candidate_batch_size: Number of candidates to decode in parallel
+            during sampling mode. If None, auto-select per device.
 
     Returns:
         List of top GenerationResult, sorted by score.
@@ -140,6 +214,7 @@ def generate(
     # Resolve num_voices from form
     if num_voices is None:
         num_voices = FORM_DEFAULTS.get(form, (2, 768))[0]
+    min_non_empty_voices = _required_non_empty_voices(num_voices)
 
     # Parse key
     key_root, key_mode = parse_key(key_str)
@@ -204,23 +279,35 @@ def generate(
             comp.source = f"beam_{i+1}"
 
             non_empty = sum(1 for v in comp.voices if v)
-            if non_empty < 2:
+            if non_empty < min_non_empty_voices:
                 continue
 
             score = score_composition(comp, token_sequence=tokens, tokenizer=tokenizer, form=form)
-            candidates.append(GenerationResult(
+            if not _passes_candidate_guardrails(score, form):
+                if progress_callback:
+                    progress_callback(i + 1, len(beam_sequences))
+                continue
+            _push_top_result(candidates, GenerationResult(
                 composition=comp,
                 tokens=tokens,
                 score=score,
-            ))
+            ), top_k_results)
 
             if progress_callback:
                 progress_callback(i + 1, len(beam_sequences))
     else:
         # --- Sampling mode ---
         logger.info(f"Using sampling (candidates={num_candidates})")
-        for i in range(num_candidates):
-            tokens = _generate_one(
+        batch_size = min(
+            num_candidates,
+            _resolve_candidate_batch_size(device, candidate_batch_size),
+        )
+        logger.info(f"Sampling candidate batch size: {batch_size}")
+
+        generated = 0
+        while generated < num_candidates:
+            curr_batch = min(batch_size, num_candidates - generated)
+            batch_tokens = _generate_batch(
                 model=model,
                 tokenizer=tokenizer,
                 prompt=prompt_tokens,
@@ -232,38 +319,57 @@ def generate(
                 max_length=max_length,
                 device=device,
                 use_rope=use_rope,
+                batch_size=curr_batch,
             )
-            if device.type == "mps":
-                torch.mps.empty_cache()
 
-            # Decode to composition
-            comp = tokenizer.decode(tokens)
-            comp.key_root = key_root
-            comp.key_mode = key_mode
-            comp.source = f"generated_{i+1}"
+            for batch_idx, tokens in enumerate(batch_tokens):
+                i = generated + batch_idx
 
-            # Skip empty generations — need at least 2 non-empty voices
-            non_empty = sum(1 for v in comp.voices if v)
-            if non_empty < 2:
-                continue
+                # Decode to composition
+                comp = tokenizer.decode(tokens)
+                comp.key_root = key_root
+                comp.key_mode = key_mode
+                comp.source = f"generated_{i+1}"
 
-            # Score
-            score = score_composition(comp, token_sequence=tokens, tokenizer=tokenizer, form=form)
+                # Keep only generations that satisfy requested voice count.
+                non_empty = sum(1 for v in comp.voices if v)
+                if non_empty < min_non_empty_voices:
+                    if device.type == "mps":
+                        torch.mps.empty_cache()
+                    if progress_callback:
+                        progress_callback(i + 1, num_candidates)
+                    continue
 
-            candidates.append(GenerationResult(
-                composition=comp,
-                tokens=tokens,
-                score=score,
-            ))
+                # Score
+                score = score_composition(comp, token_sequence=tokens, tokenizer=tokenizer, form=form)
+                if not _passes_candidate_guardrails(score, form):
+                    if device.type == "mps":
+                        torch.mps.empty_cache()
+                    if progress_callback:
+                        progress_callback(i + 1, num_candidates)
+                    continue
 
-            if progress_callback:
-                progress_callback(i + 1, num_candidates)
+                _push_top_result(candidates, GenerationResult(
+                    composition=comp,
+                    tokens=tokens,
+                    score=score,
+                ), top_k_results)
+                if device.type == "mps":
+                    torch.mps.empty_cache()
 
-    # Sort by composite score (descending)
-    candidates.sort(key=lambda r: r.score.composite, reverse=True)
+                if progress_callback:
+                    progress_callback(i + 1, num_candidates)
 
-    # Take top K
-    top_results = candidates[:top_k_results]
+            generated += curr_batch
+
+    # Sort retained top-k candidates by score (descending)
+    top_results = sorted(candidates, key=lambda r: r.score.composite, reverse=True)
+    if len(top_results) < top_k_results:
+        logger.warning(
+            "Only %d/%d candidates met the %d-voice minimum for form=%s. "
+            "Consider increasing --candidates.",
+            len(top_results), top_k_results, min_non_empty_voices, form,
+        )
 
     # Save MIDI files
     output_path = Path(output_dir)
@@ -336,22 +442,57 @@ def _build_prompt(
         tokens.append(tokenizer.METER_TO_TOKEN[meter])
 
     # Texture conditioning token
+    # Defaults by form family:
+    # - fugue/invention/sinfonia: polyphonic
+    # - chorale: homophonic
+    if texture is None:
+        if form in {"fugue", "invention", "sinfonia"}:
+            texture = "polyphonic"
+        elif form == "chorale":
+            texture = "homophonic"
     if texture and hasattr(tokenizer, "TEXTURE_TO_TOKEN") and texture in tokenizer.TEXTURE_TO_TOKEN:
         tokens.append(tokenizer.TEXTURE_TO_TOKEN[texture])
 
     # Imitation conditioning token
+    # Defaults by form family:
+    # - fugue/invention/sinfonia: high
+    # - chorale: none
+    if imitation is None:
+        if form in {"fugue", "invention", "sinfonia"}:
+            imitation = "high"
+        elif form == "chorale":
+            imitation = "none"
     if imitation and hasattr(tokenizer, "IMITATION_TO_TOKEN") and imitation in tokenizer.IMITATION_TO_TOKEN:
         tokens.append(tokenizer.IMITATION_TO_TOKEN[imitation])
 
     # Harmonic rhythm conditioning token
+    # Default: moderate harmonic rhythm for chorale.
+    if harmonic_rhythm is None and form == "chorale":
+        harmonic_rhythm = "moderate"
     if harmonic_rhythm and hasattr(tokenizer, "HARMONIC_RHYTHM_TO_TOKEN") and harmonic_rhythm in tokenizer.HARMONIC_RHYTHM_TO_TOKEN:
         tokens.append(tokenizer.HARMONIC_RHYTHM_TO_TOKEN[harmonic_rhythm])
 
     # Harmonic tension conditioning token
+    # Defaults by form family:
+    # - fugue/invention/sinfonia: high
+    # - chorale: moderate
+    if harmonic_tension is None:
+        if form in {"fugue", "invention", "sinfonia"}:
+            harmonic_tension = "high"
+        elif form == "chorale":
+            harmonic_tension = "moderate"
     if harmonic_tension and hasattr(tokenizer, "HARMONIC_TENSION_TO_TOKEN") and harmonic_tension in tokenizer.HARMONIC_TENSION_TO_TOKEN:
         tokens.append(tokenizer.HARMONIC_TENSION_TO_TOKEN[harmonic_tension])
 
     # Chromaticism conditioning token
+    # Defaults by form family:
+    # - fugue/invention/sinfonia: high
+    # - chorale: low
+    if chromaticism is None:
+        if form in {"fugue", "invention", "sinfonia"}:
+            chromaticism = "high"
+        elif form == "chorale":
+            chromaticism = "low"
     if chromaticism and hasattr(tokenizer, "CHROMATICISM_TO_TOKEN") and chromaticism in tokenizer.CHROMATICISM_TO_TOKEN:
         tokens.append(tokenizer.CHROMATICISM_TO_TOKEN[chromaticism])
 
@@ -406,6 +547,7 @@ def generate_voice_by_voice(
     harmonic_tension: str | None = None,
     chromaticism: str | None = None,
     provided_voice_midi: str | None = None,
+    candidate_batch_size: int | None = None,
 ) -> list[GenerationResult]:
     """Generate compositions voice-by-voice using sequential encoding.
 
@@ -423,6 +565,7 @@ def generate_voice_by_voice(
 
     if num_voices is None:
         num_voices = FORM_DEFAULTS.get(form, (2, 768))[0]
+    min_non_empty_voices = _required_non_empty_voices(num_voices)
 
     key_root, key_mode = parse_key(key_str)
     key_name = get_key_signature_name(key_root, key_mode)
@@ -482,8 +625,16 @@ def generate_voice_by_voice(
     form_label = form.replace("-", "")
 
     logger.info(f"Voice-by-voice generation (candidates={num_candidates})")
-    for i in range(num_candidates):
-        tokens = _generate_one(
+    batch_size = min(
+        num_candidates,
+        _resolve_candidate_batch_size(device, candidate_batch_size),
+    )
+    logger.info(f"Voice-by-voice candidate batch size: {batch_size}")
+
+    generated = 0
+    while generated < num_candidates:
+        curr_batch = min(batch_size, num_candidates - generated)
+        batch_tokens = _generate_batch(
             model=model,
             tokenizer=tokenizer,
             prompt=prompt_tokens,
@@ -495,31 +646,45 @@ def generate_voice_by_voice(
             max_length=max_length,
             device=device,
             use_rope=use_rope,
+            batch_size=curr_batch,
         )
-        if device.type == "mps":
-            torch.mps.empty_cache()
 
-        comp = tokenizer.decode(tokens)
-        comp.key_root = key_root
-        comp.key_mode = key_mode
-        comp.source = f"vbv_generated_{i+1}"
+        for batch_idx, tokens in enumerate(batch_tokens):
+            i = generated + batch_idx
 
-        non_empty = sum(1 for v in comp.voices if v)
-        if non_empty < 2:
-            continue
+            if device.type == "mps":
+                torch.mps.empty_cache()
 
-        score = score_composition(comp, token_sequence=tokens, tokenizer=tokenizer, form=form)
-        candidates.append(GenerationResult(
-            composition=comp,
-            tokens=tokens,
-            score=score,
-        ))
+            comp = tokenizer.decode(tokens)
+            comp.key_root = key_root
+            comp.key_mode = key_mode
+            comp.source = f"vbv_generated_{i+1}"
 
-        if progress_callback:
-            progress_callback(i + 1, num_candidates)
+            non_empty = sum(1 for v in comp.voices if v)
+            if non_empty >= min_non_empty_voices:
+                score = score_composition(comp, token_sequence=tokens, tokenizer=tokenizer, form=form)
+                if not _passes_candidate_guardrails(score, form):
+                    if progress_callback:
+                        progress_callback(i + 1, num_candidates)
+                    continue
+                _push_top_result(candidates, GenerationResult(
+                    composition=comp,
+                    tokens=tokens,
+                    score=score,
+                ), top_k_results)
 
-    candidates.sort(key=lambda r: r.score.composite, reverse=True)
-    top_results = candidates[:top_k_results]
+            if progress_callback:
+                progress_callback(i + 1, num_candidates)
+
+        generated += curr_batch
+
+    top_results = sorted(candidates, key=lambda r: r.score.composite, reverse=True)
+    if len(top_results) < top_k_results:
+        logger.warning(
+            "Only %d/%d candidates met the %d-voice minimum for form=%s (voice-by-voice). "
+            "Consider increasing --candidates.",
+            len(top_results), top_k_results, min_non_empty_voices, form,
+        )
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -533,6 +698,115 @@ def generate_voice_by_voice(
         logger.info(f"Saved {midi_path} (score: {result.score.composite:.3f})")
 
     return top_results
+
+
+@torch.no_grad()
+def _generate_batch(
+    model: BachTransformer,
+    tokenizer: BachTokenizer,
+    prompt: list[int],
+    constraints: DecodingConstraints,
+    temperature: float,
+    top_k: int,
+    top_p: float,
+    min_p: float,
+    max_length: int,
+    device: torch.device,
+    use_rope: bool = True,
+    batch_size: int = 1,
+) -> list[list[int]]:
+    """Generate multiple token sequences in parallel.
+
+    Falls back to single-sequence generation when ``batch_size <= 1``.
+    """
+    if batch_size <= 1:
+        return [
+            _generate_one(
+                model=model,
+                tokenizer=tokenizer,
+                prompt=prompt,
+                constraints=constraints,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                min_p=min_p,
+                max_length=max_length,
+                device=device,
+                use_rope=use_rope,
+            ),
+        ]
+
+    model.eval()
+    max_seq_len = model.config.max_seq_len
+    prompt_slice = prompt[-max_seq_len:]
+
+    tokens_batch = [list(prompt) for _ in range(batch_size)]
+    states = [constraints.initial_state(tokens) for tokens in tokens_batch]
+    finished = [False] * batch_size
+    next_tokens = [tokenizer.EOS] * batch_size
+
+    prompt_ids = torch.tensor([prompt_slice] * batch_size, dtype=torch.long, device=device)
+    logits, kv_cache = model(prompt_ids, use_rope=use_rope, use_cache=True)
+    raw_next_logits = logits[:, -1, :]
+
+    for i in range(batch_size):
+        candidate_raw = raw_next_logits[i, :]
+        candidate_logits = constraints.apply(candidate_raw, states[i])
+        tok = sample_next_token(
+            candidate_logits,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            min_p=min_p,
+            fallback_logits=candidate_raw,
+        )
+        next_tokens[i] = tok
+        tokens_batch[i].append(tok)
+        states[i] = constraints.update_state(states[i], tok)
+        if tok == tokenizer.EOS:
+            finished[i] = True
+
+    if all(finished):
+        del kv_cache
+        return tokens_batch
+
+    for _ in range(max_length - 1):
+        step_ids = torch.tensor([[tok] for tok in next_tokens], dtype=torch.long, device=device)
+        logits, kv_cache = model(
+            step_ids, use_rope=use_rope, use_cache=True, kv_cache=kv_cache,
+        )
+        raw_next_logits = logits[:, -1, :]
+
+        all_done = True
+        for i in range(batch_size):
+            if finished[i]:
+                next_tokens[i] = tokenizer.EOS
+                continue
+
+            candidate_raw = raw_next_logits[i, :]
+            candidate_logits = constraints.apply(candidate_raw, states[i])
+            tok = sample_next_token(
+                candidate_logits,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                min_p=min_p,
+                fallback_logits=candidate_raw,
+            )
+
+            next_tokens[i] = tok
+            tokens_batch[i].append(tok)
+            states[i] = constraints.update_state(states[i], tok)
+            if tok == tokenizer.EOS:
+                finished[i] = True
+            else:
+                all_done = False
+
+        if all_done:
+            break
+
+    del kv_cache
+    return tokens_batch
 
 
 @torch.no_grad()
@@ -559,7 +833,7 @@ def _generate_one(
 
     # --- Prefill phase: process entire prompt with caching ---
     prompt_ids = torch.tensor([tokens[-max_seq_len:]], dtype=torch.long, device=device)
-    logits, kv_caches = model(prompt_ids, use_rope=use_rope, use_cache=True)
+    logits, kv_cache = model(prompt_ids, use_rope=use_rope, use_cache=True)
     raw_next_logits = logits[0, -1, :]
 
     # Apply constraints and sample first token
@@ -576,27 +850,14 @@ def _generate_one(
     state = constraints.update_state(state, next_token)
 
     if next_token == tokenizer.EOS:
-        del kv_caches
+        del kv_cache
         return tokens
 
     # --- Incremental phase: one token at a time ---
     for _ in range(max_length - 1):
-        # Overflow: if cache has reached max_seq_len, drop oldest entries
-        # but keep pos_offset correct for absolute position encoding
-        if kv_caches[0].seq_len >= max_seq_len:
-            trim = kv_caches[0].seq_len - max_seq_len + 1
-            kv_caches = [
-                type(c)(
-                    k=c.k[:, :, trim:, :],
-                    v=c.v[:, :, trim:, :],
-                    pos_offset=c.pos_offset,
-                )
-                for c in kv_caches
-            ]
-
         step_ids = torch.tensor([[next_token]], dtype=torch.long, device=device)
-        logits, kv_caches = model(
-            step_ids, use_rope=use_rope, use_cache=True, kv_cache=kv_caches,
+        logits, kv_cache = model(
+            step_ids, use_rope=use_rope, use_cache=True, kv_cache=kv_cache,
         )
         raw_next_logits = logits[0, -1, :]
 
@@ -616,7 +877,7 @@ def _generate_one(
         if next_token == tokenizer.EOS:
             break
 
-    del kv_caches
+    del kv_cache
     return tokens
 
 

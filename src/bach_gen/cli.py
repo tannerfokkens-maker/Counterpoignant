@@ -1251,6 +1251,8 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
               default=None, help="Harmonic tension conditioning")
 @click.option("--chromaticism", type=click.Choice(["low", "moderate", "high"]),
               default=None, help="Chromaticism conditioning")
+@click.option("--candidate-batch-size", type=int, default=None,
+              help="Candidates decoded in parallel during sampling (auto if omitted)")
 @click.option("--voice-by-voice", is_flag=True, default=False,
               help="Use voice-by-voice (sequential) generation")
 @click.option("--provide-voice", default=None, type=click.Path(exists=True),
@@ -1276,6 +1278,7 @@ def generate(
     harmonic_rhythm: str | None,
     tension: str | None,
     chromaticism: str | None,
+    candidate_batch_size: int | None,
     voice_by_voice: bool,
     provide_voice: str | None,
 ) -> None:
@@ -1348,6 +1351,8 @@ def generate(
         console.print(f"  Strategy: beam search (width={beam_width}, length_penalty={length_penalty})")
     else:
         console.print(f"  Strategy: sampling ({candidates} candidates)")
+        if candidate_batch_size is not None:
+            console.print(f"  Candidate batch size: {candidate_batch_size}")
     if subject:
         console.print(f"  Subject: {subject}")
 
@@ -1391,6 +1396,7 @@ def generate(
             harmonic_rhythm=harmonic_rhythm,
             harmonic_tension=tension,
             chromaticism=chromaticism,
+            candidate_batch_size=candidate_batch_size,
         ) if not voice_by_voice else gen_vbv_fn(
             model=model,
             tokenizer=tokenizer,
@@ -1413,6 +1419,7 @@ def generate(
             harmonic_tension=tension,
             chromaticism=chromaticism,
             provided_voice_midi=provide_voice,
+            candidate_batch_size=candidate_batch_size,
         )
         progress.update(task, description="Done!")
 
@@ -1969,13 +1976,6 @@ def calibrate_forms(sample_size: int) -> None:
     dims = ["voice_leading", "statistical", "structural", "contrapuntal",
             "completeness", "thematic_recall"]
 
-    mode_path = DATA_DIR / "mode.json"
-    mode_info = {}
-    if mode_path.exists():
-        with open(mode_path) as f:
-            mode_info = json.load(f)
-    mode = mode_info.get("mode", "all")
-
     all_form_weights: dict[str, dict[str, float]] = {}
     all_form_results: dict[str, dict] = {}
 
@@ -1995,9 +1995,13 @@ def calibrate_forms(sample_size: int) -> None:
         for seq in sample:
             try:
                 comp = tokenizer.decode(seq)
-                tokens = tokenizer.encode(comp, form=mode)
-                sb = score_composition(comp, token_sequence=tokens,
-                                       vocab_size=tokenizer.vocab_size)
+                tokens = tokenizer.encode(comp, form=form_name)
+                sb = score_composition(
+                    comp,
+                    token_sequence=tokens,
+                    vocab_size=tokenizer.vocab_size,
+                    form=form_name,
+                )
                 corpus_breakdowns.append(sb)
             except Exception:
                 pass
@@ -2021,9 +2025,13 @@ def calibrate_forms(sample_size: int) -> None:
                     key_mode=comp.key_mode,
                     source="shuffled",
                 )
-                tokens = tokenizer.encode(shuffled_comp, form=mode)
-                sb = score_composition(shuffled_comp, token_sequence=tokens,
-                                       vocab_size=tokenizer.vocab_size)
+                tokens = tokenizer.encode(shuffled_comp, form=form_name)
+                sb = score_composition(
+                    shuffled_comp,
+                    token_sequence=tokens,
+                    vocab_size=tokenizer.vocab_size,
+                    form=form_name,
+                )
                 shuffled_breakdowns.append(sb)
             except Exception:
                 pass

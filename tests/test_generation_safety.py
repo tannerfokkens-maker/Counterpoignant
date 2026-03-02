@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import torch
 
+from bach_gen.data.tokenizer import BachTokenizer
 from bach_gen.data.scale_degree_tokenizer import ScaleDegreeTokenizer
+from bach_gen.generation.constraints import ConstraintState, DecodingConstraints
 from bach_gen.generation.sampling import sample_next_token
 from bach_gen.generation.scale_degree_constraints import (
     ScaleDegreeConstraintState,
@@ -88,3 +90,55 @@ def test_scale_degree_constraints_relax_range_as_last_resort():
 
     assert torch.isfinite(relaxed[oct2_tok]).item()
     assert torch.any(torch.isfinite(relaxed)).item()
+
+
+def test_scale_degree_constraints_block_eos_until_required_voices_have_notes():
+    tokenizer = ScaleDegreeTokenizer()
+    constraints = ScaleDegreeDecodingConstraints(
+        tokenizer=tokenizer,
+        key_root=0,
+        key_mode="major",
+        enforce_range=False,
+        form="sinfonia",
+        num_voices=3,
+    )
+
+    logits = torch.zeros((tokenizer.vocab_size,))
+    state = ScaleDegreeConstraintState(
+        current_voice=2,
+        recent_tokens=[tokenizer.VOICE_1, tokenizer.VOICE_2],
+        notes_in_current_voice=4,
+        notes_per_voice=(8, 7, 0, 0),
+    )
+
+    constrained = constraints.apply(logits, state)
+
+    assert not torch.isfinite(constrained[tokenizer.EOS]).item()
+    assert constrained[tokenizer.VOICE_3].item() > logits[tokenizer.VOICE_3].item()
+
+
+def test_absolute_constraints_block_eos_until_required_voices_have_notes():
+    tokenizer = BachTokenizer()
+    constraints = DecodingConstraints(
+        tokenizer=tokenizer,
+        key_root=0,
+        key_mode="major",
+        enforce_key=False,
+        enforce_range=False,
+        form="fugue",
+        num_voices=4,
+    )
+
+    logits = torch.zeros((tokenizer.vocab_size,))
+    state = ConstraintState(
+        current_voice=2,
+        recent_tokens=[tokenizer.VOICE_1, tokenizer.VOICE_2],
+        notes_in_current_voice=3,
+        notes_per_voice=(12, 9, 0, 0),
+    )
+
+    constrained = constraints.apply(logits, state)
+
+    assert not torch.isfinite(constrained[tokenizer.EOS]).item()
+    assert constrained[tokenizer.VOICE_3].item() > logits[tokenizer.VOICE_3].item()
+    assert constrained[tokenizer.VOICE_4].item() > logits[tokenizer.VOICE_4].item()

@@ -548,18 +548,26 @@ def score_thematic_recall(
     if all(i == 0 for i in subj_intervals):
         return 0.0
 
-    # Build fragment sets for matching
-    subj_frags: set[tuple[int, ...]] = set()
-    inv_frags: set[tuple[int, ...]] = set()
-    retro_frags: set[tuple[int, ...]] = set()
+    # Build fragment sets grouped by length.
+    frag_lengths = list(range(min(4, len(subj_intervals)), min(7, len(subj_intervals) + 1)))
+    subj_frags_by_len: dict[int, set[tuple[int, ...]]] = {}
+    inv_frags_by_len: dict[int, set[tuple[int, ...]]] = {}
+    retro_frags_by_len: dict[int, set[tuple[int, ...]]] = {}
 
-    for frag_len in range(min(4, len(subj_intervals)), min(7, len(subj_intervals) + 1)):
+    for frag_len in frag_lengths:
+        subj_set: set[tuple[int, ...]] = set()
+        inv_set: set[tuple[int, ...]] = set()
+        retro_set: set[tuple[int, ...]] = set()
         for frag in _extract_fragments(subj_intervals, frag_len):
-            subj_frags.add(frag)
-            inv_frags.add(tuple(-i for i in frag))  # inversion
-            retro_frags.add(tuple(reversed(frag)))  # retrograde
+            subj_set.add(frag)
+            inv_set.add(tuple(-i for i in frag))  # inversion
+            retro_set.add(tuple(reversed(frag)))  # retrograde
+        if subj_set:
+            subj_frags_by_len[frag_len] = subj_set
+            inv_frags_by_len[frag_len] = inv_set
+            retro_frags_by_len[frag_len] = retro_set
 
-    if not subj_frags:
+    if not subj_frags_by_len:
         return 0.3
 
     # Search cutoff: use proportional cutoff (after first 25% of the piece)
@@ -571,70 +579,121 @@ def score_thematic_recall(
     total_duration = max_tick - min_tick
     late_cutoff = min_tick + total_duration * 0.25
 
-    # Search all voices past the cutoff
+    # Search all voices past the cutoff with local deduplication to avoid
+    # counting many near-identical sliding-window hits as separate entries.
     exact_entries = 0
-    approx_entries = 0
     inv_entries = 0
     retro_entries = 0
+    approx_entries = 0
+    weighted_entries = 0.0
     voices_with_entries: set[int] = set()
+    min_entry_gap = TICKS_PER_QUARTER * 4  # one bar
 
     for voice_idx, voice in enumerate(voices):
         late_notes = [n for n in voice if n[0] >= late_cutoff]
         if len(late_notes) < 4:
             continue
         voice_intervals = _get_interval_sequence(late_notes)
+        if len(voice_intervals) < 3:
+            continue
 
-        for frag_len in range(min(4, len(subj_intervals)), min(7, len(subj_intervals) + 1)):
-            voice_frags = _extract_fragments(voice_intervals, frag_len)
+        last_entry_tick = -10**12
+        voice_had_entry = False
 
-            for vf in voice_frags:
-                if vf in subj_frags:
-                    exact_entries += 1
-                    voices_with_entries.add(voice_idx)
-                    break
-                elif vf in inv_frags:
-                    inv_entries += 1
-                    voices_with_entries.add(voice_idx)
-                    break
-                elif vf in retro_frags:
-                    retro_entries += 1
-                    voices_with_entries.add(voice_idx)
-                    break
-                else:
-                    # Approximate matching: check ±1 semitone tolerance
-                    for sf in subj_frags:
-                        if len(sf) == len(vf):
-                            if all(abs(a - b) <= 1 for a, b in zip(sf, vf)):
-                                approx_entries += 1
-                                voices_with_entries.add(voice_idx)
-                                break
-                    else:
-                        continue
-                    break  # found approx match
+        # Check each local starting position and keep only the strongest
+        # match type at that position.
+        for i in range(len(voice_intervals)):
+            if i >= len(late_notes):
+                break
+            entry_tick = late_notes[i][0]
+            if entry_tick - last_entry_tick < min_entry_gap:
+                continue
 
-    # Score based on entries found (weighted by match quality)
+            best_kind: str | None = None
+            best_weight = 0.0
+
+            for frag_len in frag_lengths:
+                if i + frag_len > len(voice_intervals):
+                    continue
+                vf = tuple(voice_intervals[i:i + frag_len])
+                subj_set = subj_frags_by_len.get(frag_len, set())
+                inv_set = inv_frags_by_len.get(frag_len, set())
+                retro_set = retro_frags_by_len.get(frag_len, set())
+
+                if vf in subj_set:
+                    best_kind = "exact"
+                    best_weight = 1.0
+                    break  # strongest possible
+                if vf in inv_set and best_weight < 0.85:
+                    best_kind = "inv"
+                    best_weight = 0.85
+                    continue
+                if vf in retro_set and best_weight < 0.60:
+                    best_kind = "retro"
+                    best_weight = 0.60
+                    continue
+
+                # Approximate matching: only against same-length fragments.
+                if best_weight < 0.28:
+                    for sf in subj_set:
+                        if all(abs(a - b) <= 1 for a, b in zip(sf, vf)):
+                            best_kind = "approx"
+                            best_weight = 0.28
+                            break
+
+            if best_kind is None:
+                continue
+
+            if best_kind == "exact":
+                exact_entries += 1
+            elif best_kind == "inv":
+                inv_entries += 1
+            elif best_kind == "retro":
+                retro_entries += 1
+            else:
+                approx_entries += 1
+
+            weighted_entries += best_weight
+            last_entry_tick = entry_tick
+            voice_had_entry = True
+
+        if voice_had_entry:
+            voices_with_entries.add(voice_idx)
+
+    # Approximate-only evidence should not dominate the score.
+    approx_effective = min(2, approx_entries)
     weighted_entries = (
         exact_entries * 1.0
-        + inv_entries * 0.8
-        + retro_entries * 0.6
-        + approx_entries * 0.4
+        + inv_entries * 0.85
+        + retro_entries * 0.60
+        + approx_effective * 0.28
     )
 
-    if weighted_entries < 0.1:
+    if weighted_entries < 0.25:
         score = 0.0
     elif weighted_entries < 1.0:
-        score = 0.2 + weighted_entries * 0.2
+        score = 0.12 + (weighted_entries - 0.25) * 0.28
     elif weighted_entries < 2.0:
-        score = 0.4 + (weighted_entries - 1.0) * 0.2
-    elif weighted_entries < 4.0:
-        score = 0.6 + (weighted_entries - 2.0) * 0.1
+        score = 0.33 + (weighted_entries - 1.0) * 0.20
+    elif weighted_entries < 3.5:
+        score = 0.53 + (weighted_entries - 2.0) * 0.14
     else:
-        score = 0.8
+        score = 0.74
 
     # Bonus if entries span multiple voices
     if len(voices_with_entries) >= 2:
-        score += 0.15
+        score += 0.10
     if len(voices_with_entries) >= 3:
-        score += 0.05
+        score += 0.06
+
+    strong_entries = exact_entries + inv_entries
+    transformed_entries = exact_entries + inv_entries + retro_entries
+    # Cap high scores when evidence is only approximate or weakly transformed.
+    if strong_entries == 0:
+        score = min(score, 0.62)
+    if transformed_entries == 0:
+        score = min(score, 0.48)
+    if len(voices_with_entries) <= 1:
+        score = min(score, 0.80)
 
     return min(1.0, score)

@@ -28,6 +28,7 @@ class ScaleDegreeConstraintState:
     pending_octave: int | None = None
     pending_accidental: str = ""
     notes_in_current_voice: int = 0
+    notes_per_voice: tuple[int, int, int, int] = (0, 0, 0, 0)
 
 
 class ScaleDegreeDecodingConstraints:
@@ -70,6 +71,12 @@ class ScaleDegreeDecodingConstraints:
             else:
                 self._voice_ranges[v] = LOWER_VOICE_RANGE
 
+        # Temporal tokens used for anti-lockstep soft bias.
+        self._temporal_tokens: list[int] = []
+        for name, tok in self.tokenizer.name_to_token.items():
+            if name == "BAR" or name.startswith("BEAT_") or name.startswith("TimeShift_"):
+                self._temporal_tokens.append(tok)
+
     # ------------------------------------------------------------------
     # State management
     # ------------------------------------------------------------------
@@ -91,6 +98,7 @@ class ScaleDegreeDecodingConstraints:
         pending_octave = state.pending_octave
         pending_accidental = state.pending_accidental
         notes_in_voice = state.notes_in_current_voice
+        notes_per_voice = state.notes_per_voice
 
         name = self.tokenizer.token_to_name.get(token, "")
 
@@ -116,11 +124,15 @@ class ScaleDegreeDecodingConstraints:
             pending_octave = None
             pending_accidental = ""
             notes_in_voice += 1
+            idx = max(0, min(3, current_voice - 1))
+            mutable = list(notes_per_voice)
+            mutable[idx] += 1
+            notes_per_voice = tuple(mutable)
         elif name.startswith("TimeShift_"):
             pending_octave = None
             pending_accidental = ""
 
-        recent = state.recent_tokens[-5:] + [token]  # keep last 6
+        recent = state.recent_tokens[-31:] + [token]  # keep last 32
 
         return ScaleDegreeConstraintState(
             current_voice=current_voice,
@@ -129,6 +141,7 @@ class ScaleDegreeDecodingConstraints:
             pending_octave=pending_octave,
             pending_accidental=pending_accidental,
             notes_in_current_voice=notes_in_voice,
+            notes_per_voice=notes_per_voice,
         )
 
     # ------------------------------------------------------------------
@@ -149,12 +162,14 @@ class ScaleDegreeDecodingConstraints:
                 x, current_voice, state,
             )
             degenerate_fn = lambda x: self._prevent_degenerate_from_state(x, state)
+            coverage_fn = lambda x: self._enforce_min_voice_coverage_from_state(x, state)
         else:
             current_voice = self._get_current_voice(generated_tokens)
             range_fn = lambda x: self._apply_range_constraint(
                 x, current_voice, generated_tokens,
             )
             degenerate_fn = lambda x: self._prevent_degenerate(x, generated_tokens)
+            coverage_fn = lambda x: self._enforce_min_voice_coverage(x, generated_tokens)
 
         # Full constraints.
         constrained = self._apply_constraint_pass(
@@ -165,6 +180,7 @@ class ScaleDegreeDecodingConstraints:
             range_fn=range_fn,
             degenerate_fn=degenerate_fn,
         )
+        constrained = coverage_fn(constrained)
         if self._has_valid_token(constrained):
             return constrained
 
@@ -177,6 +193,7 @@ class ScaleDegreeDecodingConstraints:
             range_fn=range_fn,
             degenerate_fn=degenerate_fn,
         )
+        constrained = coverage_fn(constrained)
         if self._has_valid_token(constrained):
             return constrained
 
@@ -189,6 +206,7 @@ class ScaleDegreeDecodingConstraints:
             range_fn=range_fn,
             degenerate_fn=degenerate_fn,
         )
+        constrained = coverage_fn(constrained)
         if self._has_valid_token(constrained):
             return constrained
 
@@ -201,6 +219,7 @@ class ScaleDegreeDecodingConstraints:
             range_fn=range_fn,
             degenerate_fn=degenerate_fn,
         )
+        constrained = coverage_fn(constrained)
         return self._ensure_valid_logits(constrained, base_logits)
 
     # ------------------------------------------------------------------
@@ -356,6 +375,7 @@ class ScaleDegreeDecodingConstraints:
 
         logits[self.tokenizer.PAD] = float("-inf")
         logits[self.tokenizer.BOS] = float("-inf")
+        logits = self._apply_soft_anti_lockstep(logits, tokens[-32:])
         return logits
 
     def _prevent_degenerate_from_state(
@@ -384,6 +404,49 @@ class ScaleDegreeDecodingConstraints:
         if voice_sep_tok is not None and voice_sep_tok < logits.size(0):
             if state.notes_in_current_voice < min_notes_before_sep:
                 logits[voice_sep_tok] = float("-inf")
+
+        logits = self._apply_soft_anti_lockstep(logits, state.recent_tokens)
+        return logits
+
+    def _apply_soft_anti_lockstep(
+        self,
+        logits: torch.Tensor,
+        recent_tokens: list[int],
+    ) -> torch.Tensor:
+        """Softly discourage excessive same-time multi-voice attacks in fugues."""
+        if self.form != "fugue":
+            return logits
+        if not recent_tokens:
+            return logits
+
+        voices_in_slot: list[int] = []
+        for tok in reversed(recent_tokens):
+            name = self.tokenizer.token_to_name.get(tok, "")
+            if name == "BAR" or name.startswith("BEAT_") or name.startswith("TimeShift_"):
+                break
+            if name == "VOICE_SEP":
+                break
+            if tok in self._voice_token_ids:
+                voices_in_slot.append(self._voice_token_ids[tok])
+
+        distinct = len(set(voices_in_slot))
+        if distinct <= 1:
+            return logits
+
+        voice_tokens = getattr(self.tokenizer, "VOICE_TOKENS", [])
+        if distinct >= 3:
+            # Heavy same-time stacking: nudge toward temporal advance.
+            for tok in voice_tokens:
+                if tok < logits.size(0) and torch.isfinite(logits[tok]):
+                    logits[tok] -= 1.1
+            for tok in self._temporal_tokens:
+                if tok < logits.size(0) and torch.isfinite(logits[tok]):
+                    logits[tok] += 0.35
+        elif distinct == 2:
+            # Mild pressure away from triadic/tetradic block onset.
+            for tok in voice_tokens:
+                if tok < logits.size(0) and torch.isfinite(logits[tok]):
+                    logits[tok] -= 0.25
 
         return logits
 
@@ -414,3 +477,54 @@ class ScaleDegreeDecodingConstraints:
             if name.startswith("OCT_") or name.startswith("Dur_") or name.startswith("TimeShift_") or name.startswith("VOICE_"):
                 return ""
         return ""
+
+    def _required_voice_count(self) -> int:
+        """Required non-empty voices for this generation request."""
+        return max(2, min(self.num_voices, 4))
+
+    def _enforce_min_voice_coverage_from_state(
+        self, logits: torch.Tensor, state: ScaleDegreeConstraintState,
+    ) -> torch.Tensor:
+        return self._apply_voice_coverage_floor(logits, state.notes_per_voice)
+
+    def _enforce_min_voice_coverage(
+        self, logits: torch.Tensor, tokens: list[int],
+    ) -> torch.Tensor:
+        return self._apply_voice_coverage_floor(logits, self._notes_per_voice_from_tokens(tokens))
+
+    def _apply_voice_coverage_floor(
+        self, logits: torch.Tensor, notes_per_voice: tuple[int, int, int, int],
+    ) -> torch.Tensor:
+        required = self._required_voice_count()
+        covered = sum(1 for i in range(required) if notes_per_voice[i] > 0)
+        if covered >= required:
+            return logits
+
+        if self.tokenizer.EOS < logits.size(0):
+            logits[self.tokenizer.EOS] = float("-inf")
+
+        voice_tokens = getattr(self.tokenizer, "VOICE_TOKENS", [])
+        for i in range(required):
+            if notes_per_voice[i] > 0:
+                continue
+            if i >= len(voice_tokens):
+                continue
+            voice_tok = voice_tokens[i]
+            if voice_tok < logits.size(0) and torch.isfinite(logits[voice_tok]):
+                logits[voice_tok] += 1.5
+        return logits
+
+    def _notes_per_voice_from_tokens(
+        self, tokens: list[int],
+    ) -> tuple[int, int, int, int]:
+        counts = [0, 0, 0, 0]
+        current_voice = 1
+        for tok in tokens:
+            if tok in self._voice_token_ids:
+                current_voice = self._voice_token_ids[tok]
+                continue
+            name = self.tokenizer.token_to_name.get(tok, "")
+            if name.startswith("Dur_"):
+                idx = max(0, min(3, current_voice - 1))
+                counts[idx] += 1
+        return tuple(counts)

@@ -169,7 +169,7 @@ def score_composition(
     all_details["thematic_recall"] = {"score": tr_score}
 
     # Composite (information dimension removed — zero discrimination power)
-    composite = (
+    raw_composite = (
         vl_score * w.get("voice_leading", 0.22)
         + stat_score * w.get("statistical", 0.10)
         + struct_score * w.get("structural", 0.15)
@@ -177,6 +177,21 @@ def score_composition(
         + comp_score * w.get("completeness", 0.05)
         + tr_score * w.get("thematic_recall", 0.30)
     )
+    guardrail_mult, guardrail_flags = _guardrail_multiplier(
+        form=form,
+        comp=comp,
+        voice_leading=vl_score,
+        structural_details=struct_details,
+        contrapuntal_details=cp_details,
+        completeness=comp_score,
+    )
+    composite = raw_composite * guardrail_mult
+    if guardrail_flags:
+        all_details["guardrails"] = {
+            "multiplier": guardrail_mult,
+            "flags": guardrail_flags,
+            "raw_composite": raw_composite,
+        }
 
     return ScoreBreakdown(
         voice_leading=vl_score,
@@ -189,6 +204,61 @@ def score_composition(
         composite=composite,
         details=all_details,
     )
+
+
+def _guardrail_multiplier(
+    *,
+    form: str | None,
+    comp: VoiceComposition,
+    voice_leading: float,
+    structural_details: dict,
+    contrapuntal_details: dict,
+    completeness: float,
+) -> tuple[float, list[str]]:
+    """Compute post-weighting guardrail multiplier and trigger flags."""
+    mult = 1.0
+    flags: list[str] = []
+
+    # Global quality floors.
+    if voice_leading < 0.65:
+        mult *= 0.80
+        flags.append("low_voice_leading")
+    if completeness < 0.50:
+        mult *= 0.80
+        flags.append("low_completeness")
+
+    if form == "fugue":
+        total_notes = sum(len(v) for v in comp.voices if v)
+        # Avoid over-penalising tiny toy snippets used in tests/debug.
+        if total_notes < 32:
+            return mult, flags
+
+        non_empty = sum(1 for v in comp.voices if v)
+        cadence = float(structural_details.get("cadence", 0.0))
+        onset_stagger = float(contrapuntal_details.get("onset_staggering", 0.0))
+        voice_indep = float(contrapuntal_details.get("voice_independence", 0.0))
+        voice_balance = float(contrapuntal_details.get("voice_balance", 1.0))
+
+        if non_empty < 4:
+            mult *= 0.70
+            flags.append("fugue_missing_voice")
+        if cadence < 0.45:
+            mult *= 0.85
+            flags.append("fugue_weak_cadence")
+        if voice_balance < 0.35:
+            mult *= 0.75
+            flags.append("fugue_unbalanced_voices")
+        if onset_stagger > 0.90 and voice_indep < 0.45:
+            mult *= 0.80
+            flags.append("fugue_fragmented_not_dialogic")
+        if onset_stagger < 0.10:
+            mult *= 0.85
+            flags.append("fugue_over_lockstep")
+        if completeness < 0.65:
+            mult *= 0.80
+            flags.append("fugue_incomplete_form")
+
+    return max(0.0, min(1.0, mult)), flags
 
 
 def score_voice_pair(
