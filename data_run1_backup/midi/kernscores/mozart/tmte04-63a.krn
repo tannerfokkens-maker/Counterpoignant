@@ -1,0 +1,81 @@
+!!!OTL: 63a. Mozart, Piano Sonata in D major, K. 576, mvt. 3, mm. 1-9
+!!!OMD: Allegretto
+**kern	**kern	**dynam
+*staff2	*staff1	*staff1/2
+*Ipiano	*Ipiano	*Ipiano
+*clefG2	*clefG2	*clefG2
+*k[f#c#]	*k[f#c#]	*k[f#c#]
+*D:	*D:	*D:
+*M2/4	*M2/4	*M2/4
+*MM104	*MM104	*MM104
+=1-	=1-	=1-
+*^	*	*
+8r	8ry	(8.dd\L	p
+8a/L	8f#\L	.	.
+.	.	32ee\LL	.
+.	.	32dd\JJJ	.
+8a/	8f#\	8cc#\L)	.
+8a/J	8f#\J	8dd\J	.
+=2	=2	=2	=2
+8r	8ry	(8dd#\L	.
+8b/L	8g\L	8ee\J)	.
+8b/	8g\	8ee\	.
+8b/J	8g\J	8r	.
+=3	=3	=3	=3
+8r	8ry	(8.ee\L	.
+8a/L	8c#\L	.	.
+.	.	32ff#\LL	.
+.	.	32ee\JJJ	.
+8a/	8c#\	8ddn\L)	.
+8a/J	8c#\J	8ee\J	.
+=4	=4	=4	=4
+8r	8ry	(8ee#\L	.
+8a/L	8d\L	8ff#\J)	.
+8a/	8d\	8ff#\	.
+8a/J	8d\J	8r	.
+=5	=5	=5	=5
+[4a/	8f#\L	(16.aa\LL	.
+.	.	32bb\k	.
+.	8e\J	16.gg\	.
+.	.	32aa\JJk)	.
+8a/]	8d\	8ff#'\L	.
+8r	8ry	8dd'\J	.
+=6	=6	=6	=6
+[4a/	8e\L	(16.gg\LL	.
+.	.	32aa\k	.
+.	8f#\J	16.ff#\	.
+.	.	32gg\JJk)	.
+8a/]	8g\	8ee'\L	.
+8r	8ry	8cc#'\J	.
+=7	=7	=7	=7
+8a/	8f#\	8dd'\L	.
+8r	8ry	8dd'\J	.
+8a/	8e\	8cc#'\L	.
+8r	8ry	8cc#'\J	.
+*v	*v	*	*
+*clefF4	*	*
+=8	=8	=8
+4E\ (4d\	(16.bT\LL	.
+.	32a\k	.
+.	16.b\	.
+.	32cc#\JJk)	.
+8A\ 8c#\)	8a/	.
+8r	8r	.
+=9	=9	=9
+24d\LL	(8.dd\L	f
+24e\	.	.
+24f#\JJ	.	.
+24e\LL	.	.
+24d\	.	.
+.	32ee\LL	.
+24c#\JJ	.	.
+.	32dd\JJJ	.
+24B\LL	8cc#\L)	.
+24c#\	.	.
+24d\JJ	.	.
+24c#\LL	8dd\J	.
+24B\	.	.
+24A\JJ	.	.
+=	=	=
+*-	*-	*-
+!!!hum2abc: -q

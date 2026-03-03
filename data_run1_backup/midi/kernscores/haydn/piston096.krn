@@ -1,0 +1,36 @@
+!!!COM: Haydn, Josef
+!!!OTL: Sonata
+!!!SCT: Piston 96
+!!!citation: Harmony by Walter Piston.  W.W.Norton: New York; 1941.
+!!!label: Ex. 96.  Haydn -- <i>Sonata</i>
+!!!chapter: Chapter 5 (Harmonic Rhythm)
+!!!page: 51
+!!!ENC: Craig Stuart Sapp
+**kern	**kern	**root	**harm
+*staff2	*staff1	*staff3	*staff3
+*clefF4	*clefG2	*clefF4	*
+*M6/8	*M6/8	*M6/8	*M6/8
+*MM64	*MM64	*MM64	*MM64
+*k[f#c#g#]	*k[f#c#g#]	*k[f#c#g#]	*k[f#c#g#]
+*E-:	*E-:	*E-:	*E-:
+4r	8.ee-	4EE-	I
+.	16dd	.	.
+(8e-' 8g'	8cc)	8CC	VI
+4d' 4f'	(8cc	4BB-	V
+.	8b-)	.	.
+8c' 4e-)	8a-	8AA-	IV
+=	=	=	=
+.	16gq	.	.
+.	16b-q	.	.
+(4B-' 4d'	(8a-	4GG	III
+.	8g	.	.
+8A-' 8c')	8f)	8FF	ii
+4A- 4B- 4d 4f	(8.b-	4BB-	V
+.	32cc	.	.
+.	32b-	.	.
+8G 8B- 8E-	32cc	8EE-	I
+.	32b-	.	.
+.	32a	.	.
+.	32g	.	.
+=	=	=	=
+*-	*-	*-	*-

@@ -1,0 +1,25 @@
+!!!COM: Mozart, Wolfgang Amadeus
+!!!OTL: Piano Sonata
+!!!SCT: Piston 69
+!!!citation: Harmony by Walter Piston.  W.W.Norton: New York; 1941.
+!!!label: Ex. 69.  Mozart -- <i>Piano Sonata</i>
+!!!chapter: Chapter 4 (Tonality and Modality)
+!!!page: 36
+!!!ENC: Craig Stuart Sapp
+**kern	**kern	**root	**harm
+*staff2	*staff1	*staff2	*staff2
+*clefF4	*clefG2	*clefF4	*
+*M4/4	*M4/4	*M4/4	*M4/4
+*MM120	*MM120	*MM120	*MM120
+*k[]	*k[]	*k[]	*k[]
+*C:	*C:	*C:	*C:
+8FF' 8F'	8a' 8d' 8f' 8aa'	4DD	ii
+8r	8r	.	.
+8GG' 8G'	8d' 8f' 8g' 8b'	4GG	V7
+8r	8r	.	.
+=	=	=	=
+8CC' 8EE' 8GG' 8CC'	8c' 8e' 8g' 8cc'	2CC	I
+8r	8r	.	.
+4r	4r	.	.
+=||	=||	=||	=||
+*-	*-	*-	*-

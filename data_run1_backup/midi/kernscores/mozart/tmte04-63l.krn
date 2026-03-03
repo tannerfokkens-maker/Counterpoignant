@@ -1,0 +1,65 @@
+!!!OTL: 63l. Mozart, Piano Sonata in F major, K. 332, mvt. 1, mm. 12-22
+!!!OMD: Allegro
+**kern	**kern	**dynam
+*staff2	*staff1	*staff1/2
+*clefF4	*clefG2	*clefG2
+*k[b-]	*k[b-]	*k[b-]
+*F:	*F:	*F:
+*M3/4	*M3/4	*M3/4
+*MM132	*MM132	*MM132
+=12-	=12-	=12-
+4FF/	4A/ 4f/	.
+4r	4r	.
+*clefG2	*	*
+8.a/ 8.cc/L	8.ccc\L	p
+16g/ 16b-/Jk	16bb-\Jk	.
+=13	=13	=13
+4f/ 4a/	4aa\	.
+4f/ 4a/	4aa\	.
+8.f/ 8.a/L	8.aa\L	.
+16c/ 16g/Jk	16gg\Jk	.
+=14	=14	=14
+4A/ 4f/	4ff\	.
+4A/ 4f/	4ff\	.
+(4A/ 4f/	(4ff\	.
+=15	=15	=15
+4c/) 4g/	4ee\ 4gg\)	.
+4c/ 4g/	4ee\ 4gg\	.
+4c/ 4g/	4ee\ 4gg\	.
+=16	=16	=16
+(4c/ 4g/	4ee\ (4gg\	.
+4f/) 4a/	4ff\ 4aa\)	.
+8.a/ 8.cc/L	(16ccc\LL	.
+.	16ddd\	.
+.	16ccc\	.
+16g/ 16b-/Jk	16bb-\JJ	.
+=17	=17	=17
+4f/ 4a/	4aa\)	.
+4f/ 4a/	4aa\	.
+8.f/ 8.a/L	(16aa\LL	.
+.	16bb-\	.
+.	16aa\	.
+16c/ 16g/Jk	16gg\JJ	.
+=18	=18	=18
+4A/ 4f/	4ff\)	.
+4A/ 4f/	4ff\	.
+4A/ 4f/	4ff\	.
+=19	=19	=19
+4c/ 4g/	4gg\	.
+4r	4bb-\	.
+(4c/ 4g/	4b-\ (4ee\	.
+=20	=20	=20
+4f/)	4a\ 4ff\)	.
+4r	4r	.
+(4c/ 4e/ 4b-/	(4ccc\	.
+=21	=21	=21
+4f/) 4a/	4ff\)	.
+4r	4r	.
+*clefF4	*	*
+4C\ 4E\ (4B-\	(4cc\	.
+=22	=22	=22
+4F\ 4A\)	4f/)	.
+4r	4r	.
+=	=	=
+*-	*-	*-
+!!!hum2abc: -q

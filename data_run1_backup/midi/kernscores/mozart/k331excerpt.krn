@@ -1,0 +1,63 @@
+!!!COM: Mozart, Wolfgang Amadeus
+!!!YEM: Copyright 2003 Recordare LLC
+!!!OPS: K. 331
+!!!OPR: Piano Sonata in A Major
+!!!RDT: 2003/03/14/
+**kern	**kern
+!Piano	!Piano
+*Ipiano	*Ipiano
+*clefG2	*clefG2
+*k[f#c#g#]	*k[f#c#g#]
+*M2/4	*M2/4
+=1-	=1-
+*	*^
+(16AAq/LL	.	.
+16C#q/	.	.
+16Eq/JJ	.	.
+8A\L)	4cc#:\ 4ee:\ 4aa:\	2ccc#:/
+8A\	.	.
+8A\	4ryy	.
+8A\J	.	.
+*	*v	*v
+=2	=2
+(16AAq/LL	.
+16C#q/	.
+16Eq/JJ	.
+8A\L)	(16ddd\LL
+.	16ccc#\)
+8A\	16bb'\
+.	16ccc#'\JJ
+8A\	(16ddd\LL
+.	16ccc#\)
+8A\J	16bb'\
+.	16ccc#'\JJ
+=3	=3
+(16DDq/LL	.
+16FF#q/	.
+16AAq/JJ	.
+8D\L)	2ff#\ 2aa\ 2ddd\
+8D\	.
+8D\	.
+8D\J	.
+=4	=4
+(16AAq/LL	.
+16C#q/	.
+16Eq/JJ	(32dddq/
+8A\L)	8ee\L 8aa\ 8ccc#\)
+.	(32dddq/
+8A\	8ee\ 8aa\ 8ccc#\)
+.	(32dddq/
+8A\	8ee\ 8aa\ 8ccc#\)
+.	(32dddq/
+8A\J	8ee\J 8aa\ 8ccc#\)
+=5	=5
+*	*^
+(16EEq/LL	.	.
+16GG#q/	.	.
+16BBq/JJ	.	.
+8E\L)	2ee\ 2gg#\	(4.bb/
+8E\	.	.
+8E\	.	.
+8E\J	.	8eee/)
+*	*v	*v
+*-	*-

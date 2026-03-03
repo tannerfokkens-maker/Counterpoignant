@@ -1,0 +1,741 @@
+!!!COA: Haydn, Franz Joseph
+!!!CDT: 1732/03/31-1809/05/31
+!!!CNT: Austrian
+!!!OTL: Sonata No. 12 in A major
+!!!SCT: Hob. XVI:12
+!!!OMV: 1
+!!!OMD: Andante.
+!!!ODT: ~1750-1755
+**kern	**kern	**dynam
+*staff2	*staff1	*staff1/2
+*Ipiano	*Ipiano	*Ipiano
+*>[A,A,B,B]	*>[A,A,B,B]	*>[A,A,B,B]
+*>norep[A,B]	*>norep[A,B]	*>norep[A,B]
+*>A	*>A	*>A
+*clefF4	*clefG2	*clefG2
+*k[f#c#g#]	*k[f#c#g#]	*k[f#c#g#]
+*A:	*A:	*A:
+*M2/4	*M2/4	*M2/4
+*MM80	*MM80	*MM80
+=1	=1	=1
+!	!	!LO:DY:t=%s dolce
+8r	4aasSSs	p
+(8A' 8c#'L	.	.
+!	!LO:TUP:a	!
+8A' 8c#'	(24aaLL	.
+.	24gg#	.
+.	24ff#JJ	.
+!	!LO:TUP:a	!
+8A' 8c#'J)	24eeLL	.
+.	24dd	.
+.	24cc#JJ	.
+=2	=2	=2
+!	!LO:TUP:a	!
+8r	24bLL	.
+.	24ee	.
+.	24ddJ)	.
+8A' (8B'L	8ddJ	.
+*	*Xtuplet	*
+8A' 8B'	(24ddLL	.
+.	24cc#	.
+.	24ddJJ)	.
+8A' 8B'J)	(24ddLL	.
+.	24cc#	.
+.	24ddJJ)	.
+=3	=3	=3
+8r	8dd'L	.
+(8G#' 8B'L	[8bbJ	.
+8G#' 8B'	(24bbLL]	.
+.	24aa	.
+.	24gg#JJ	.
+8G#' 8B'J)	24ff#LL	.
+.	24ee	.
+.	24ddJJ	.
+!!LO:LB:g=z
+=4	=4	=4
+4A	24cc#LL	.
+.	24ee	.
+.	24g#J)	.
+.	8a`J	.
+!LO:TUP:b	!	!
+(24AALL	4r	.
+24C#	.	.
+24EJJ	.	.
+!LO:TUP:a	!	!
+24BBLL	.	.
+24D	.	.
+24G#JJ	.	.
+=5	=5	=5
+4A)	(24aLL<	mf
+.	24cc#	.
+.	24aJJ	.
+.	24eeLL	.
+.	24cc#	.
+.	24aJJ	.
+8r	24ddLL	.
+.	24b	.
+.	24g#JJ	.
+8E (8B	24dLL	.
+.	24g#	.
+.	24dJJ	.
+=6	=6	=6
+4AA 4A)	(>24c#LL)	<
+.	24e	.
+.	24aJJ	.
+.	24cc#LL	.
+.	24ee	.
+.	24aJJ	.
+8r	24ddLL	.
+.	24b	.
+.	24g#JJ	.
+8E (8B	24dLL	.
+.	24g#	.
+.	24dJJ	.
+!!LO:LB:g=z
+=7	=7	=7
+!	!	!LO:DY:rj
+8AA 8A)	(24c#LL)	f
+.	24e	.
+.	24aJJ	.
+8A' (8c#'L	24eLL	.
+.	24a	.
+.	24cc#JJ	.
+8A' 8c#'	24aLL	.
+.	24cc#	.
+.	24eeJJ	.
+8A' 8c#'J)	24cc#LL	.
+.	24ee	.
+.	24aaJJ)	.
+=8	=8	=8
+8r	(24eLL	.
+.	24g#	.
+.	24bJJ	.
+8E' (8G#'L	24g#LL	.
+.	24b	.
+.	24eeJJ	.
+8E' 8G#'	24bLL	.
+.	24ee	.
+.	24gg#JJ	.
+8E' 8G#'J)	24eeLL	.
+.	24gg#	.
+.	24bbJJ)	.
+=9	=9	=9
+(8F#L	(24aaLL	.
+.	24gg#	.
+.	24ff#JJ)	.
+8A	24ff#`LL	.
+.	(24ff#	.
+.	24eeJJ	.
+8B	24dd#`LL)	.
+.	(24dd#	.
+.	24cc#JJ	.
+8d#J	24b`LL)	.
+.	(24b	.
+.	24aJJ	.
+!!LO:LB:g=z
+=10	=10	=10
+8eL)	24g#LL	.
+.	24f#	.
+.	24eJJ)	.
+(8G#J	(24bLL	>
+.	24cc#	.
+.	24ddnJJ	.
+4A	24cc#LL	.
+.	24b	.
+.	24aJJ	.
+.	24aaLL	.
+.	24gg#	.
+.	24ff#JJ	.
+=11	=11	=11
+.	(8qqPee	.
+8B`L)	4dd#p))	.
+8BB`J	.	.
+*clefG2	*	*
+*Xtuplet	*	*
+(24BLL	[4bTT	p
+24d#	.	.
+24f#JJ	.	.
+24d#LL	.	.
+24f#	.	.
+24aJJ	.	.
+.	8qa#	.
+=12	=12	=12
+4g#)	24bLL]	<
+.	(24bb	.
+.	24aaJJ	.
+.	24gg#LL	.
+.	24ff#	.
+.	24eeJJ)	.
+(24BLL	[4bTT	mf
+24d#	.	.
+24f#JJ	.	.
+24d#LL	.	.
+24f#	.	.
+24aJJ	.	.
+.	8qa#	.
+!!LO:LB:g=z
+=13	=13	=13
+4g#)	24bLL]	.
+.	(24bb	.
+.	24aaJJ	.
+.	24gg#LL	.
+.	24ff#	.
+.	24eeJJ	.
+(24ALL	8ccc#L)	f
+24c#	.	.
+24f#JJ	.	.
+24aLL	(24ff#L	.
+24g#	24gg#	.
+24f#JJ)	24aaJJ	.
+=14	=14	=14
+(24G#LL	8bbL)	.
+24B	.	.
+24eJJ	.	.
+24g#LL	(24eeL	.
+24f#	24ff#	.
+24eJJ	24gg#JJ	.
+8d#L	24aaLL	.
+.	24gg#	.
+.	24ff#JJ	.
+24eL	24gg#LL	.
+24f#	24ff#	>
+24g#JJ	24eeJJ	.
+=15	=15	=15
+24aLL	24dd#LL	.
+24g#	24ee	.
+24f#JJ	24ff#JJ)	.
+(24g#LL)	(24eeLL	.
+24f#	24ff#	.
+24eJJ	24gg#JJ	.
+8d#L	24aaLL	.
+.	24gg#	.
+.	24ff#JJ	.
+8eJ)	24gg#LL	.
+.	24ff#	.
+.	24eeJJ	.
+=16	=16	=16
+(8d#L	24aaLL	.
+.	24ff#	.
+.	24bJJ	.
+8eJ)	24gg#LL	<
+.	24ee	.
+.	24bJJ)	.
+*clefF4	*	*
+8A' (8c#'L	(24ff#LL	.
+.	24ee#	.
+.	24ff#JJ)	.
+8A' 8c#'J)	(24ff#LL	.
+.	24ee#	.
+.	24ff#JJ)	[[
+!!LO:LB:g=z
+=17	=17	=17
+8.G# 8.BL	(24bbLL	mf
+.	24gg#	.
+.	24eenJJ	.
+.	24bLL	.
+.	24g#	.
+(16c#Jk	.	.
+.	24eJJ	.
+8B'L)	4f#T	.
+8BB'J	.	.
+.	16qeLLL	.
+.	16qf#JJJ	.
+=18	=18	=18
+*^	*	*
+8rc	2E	8e')	.
+(8G#L	.	24ee`LL	.
+.	.	(24ee	.
+.	.	24bJJ	.
+8A)	.	24cc#`LL)	.
+.	.	(24cc#	.
+.	.	24aJJ	.
+(8AJ	.	24f#LL	.
+.	.	24b	.
+.	.	24d#JJ	.
+=19	=19	=19	=19
+8G#L)	2E	8e')	.
+(8G#	.	24ee`LL	.
+.	.	(24ee	.
+.	.	24bJJ	.
+8A)	.	24cc#`LL)	.
+.	.	(24cc#	<
+.	.	24aJJ	.
+(8F#J	.	24aa`LL)	.
+.	.	(24aa	.
+.	.	24dd#JJ)	[
+*v	*v	*	*
+=20	=20	=20
+8E' 8G#'L)	4eew	>
+8e'J	.	]
+4r	4r	.
+!!LO:LB:g=z
+=21:|!|:	=21:|!|:	=21:|!|:
+*>B	*>B	*>B
+*clefG2	*	*
+*Xbrackettup	*	*
+*tuplet	*	*
+!	!LO:TX:c:i:t=dolce	!
+24r	8eesSSs	.
+(24eLL	.	.
+24g#JJ)	.	.
+!	!LO:TURN:lacc=none	!
+24r	8eesSSs	.
+(24f#LL	.	.
+24aJJ)	.	.
+!	!LO:TURN:lacc=none	!
+24r	8eesSSs	.
+(24g#LL	.	.
+24bJJ)	.	.
+!	!LO:TURN:lacc=none	!
+24r	8eesSSs	.
+(24aLL>	.	.
+24cc#JJ)	.	.
+=22	=22	=22
+*Xtuplet	*	*
+(24bLL	[2eeTT	<
+24ddn	.	.
+24bJJ	.	.
+24g#LL	.	.
+24b	.	.
+24g#JJ	.	.
+8e')	.	.
+*clefF4	*	*
+8EE' 8E'	.	.
+=23	=23	=23
+(>24AAALL	(2ee]TTT	.
+24AA	.	.
+24C#JJ	.	.
+24ELL	.	.
+24A	.	.
+24c#JJ	.	.
+24eLL	.	.
+24c#	.	.
+24AJJ	.	.
+24ELL	.	.
+24d	.	.
+24BJJ	.	.
+.	8qdd#	.
+!!LO:LB:g=z
+=24	=24	=24
+4c#)	24eeLL)	mf
+.	(24aa	.
+.	24gg#JJ	.
+.	24aaLL	.
+.	24ee	.
+.	24cc#JJ	.
+8r	24a`LL<)	.
+.	(24a	.
+.	24cc#JJ	.
+8E' 8G#'	24b`LL)	.
+.	(24b	.
+.	24ddJJ	.
+=25	=25	=25
+4AA 4A	24cc#LL)	.
+.	(24aa	.
+.	24gg#JJ	.
+.	24aaLL	.
+.	24ee	.
+.	24cc#JJ)	.
+8r	(24aLL	.
+.	24ggn)	.
+.	24gg`JJ	.
+8A' 8c#'	(24ggLL	.
+.	24ff#	.
+.	24eeJJ	.
+=26	=26	=26
+(24DLL	8ff#')	f
+24F#	.	.
+24AJJ	.	.
+24dLL	8r	.
+24f#	.	.
+24aJJ	.	.
+4d)	(24ff#LL	.
+.	24ddd	.
+.	24aaJJ	.
+.	24ff#LL	.
+.	24dd	.
+.	24ff#JJ	.
+=27	=27	=27
+(24AALL	8ee)	.
+24C#	.	.
+24EJJ	.	.
+24ALL	8r	.
+24c#	.	.
+24eJJ	.	.
+)4A	(24eeLL	.
+.	24ccc#	.
+.	24aaJJ	.
+.	24eeLL	.
+.	24cc#	.
+.	24eeJJ	.
+!!LO:LB:g=z
+=28	=28	=28
+(24ELL	8dd)	.
+24G#	.	.
+24BJJ	.	.
+*clefG2	*	*
+24eLL	8r	.
+24g#	.	.
+24bJJ	.	.
+4e)	(24ddLL	>
+.	24bb	.
+.	24gg#JJ	.
+.	24ddLLL	.
+.	24bJ	.
+.	24ddJJ	]d
+*clefF4	*	*
+=29	=29	=29
+4AA	24cc#LL)	p
+.	(24ee	.
+.	24ddJJ	.
+.	24cc#`LL)	.
+.	(24cc#	.
+.	24bJJ	.
+(4AA	24a`LL)	.
+.	(24a	.
+.	24g#JJ	.
+.	24f#`LL)	.
+.	(<24f#	.
+.	24eJJ	.
+=30	=30	=30
+4.BB)	24d`LL)	<
+.	(24ff#	.
+.	24eeJJ	.
+.	24dd`LL)	.
+.	(24dd	.
+.	24cc#JJ	.
+.	24b`LL)	.
+.	(24b	.
+.	24aJJ	.
+(8BB	24g#`LL)	.
+.	(<24g#	.
+.	24f#JJ	.
+=31	=31	=31
+4.C#)	24e`LL)	.
+.	(24gg#	.
+.	24ff#JJ	.
+.	24ee`LL)	.
+.	(24ee	.
+.	24ddJJ	.
+.	24cc#`LL)	.
+.	(24cc#	.
+.	24bJJ	.
+(8C#	24a`LL)	.
+.	(24a	.
+.	24g#JJ	.
+!!LO:LB:g=z
+=32	=32	=32
+4.D)	24f#`LL)	<
+.	(24aa	.
+.	24gg#JJ	.
+.	24ff#`LL)	.
+.	(24ff#	.
+.	24eeJJ	.
+.	24dd`LL)	.
+.	(24dd	.
+.	24cc#JJ	.
+(8D#	24b`LL)	.
+.	(<24b	.
+.	24aJJ	[
+=33	=33	=33
+8EL)	24g#`LL)	.
+.	(24bb	f
+.	24aaJJ	.
+(8G#	24gg#`LL)	.
+.	(24gg#	.
+.	24ff#JJ	.
+8B	24ee`LL)	.
+.	(24ee	.
+.	24ddJJ	.
+8eJ)	24cc#LL	.
+.	24dd	.
+.	24bJJ)	.
+=34	=34	=34
+(24ALL	(24cc#LL	.
+24c#	24b	.
+24eJJ	24aJ	.
+24ALL	8ee`J)	.
+24c#	.	.
+24eJJ	.	.
+24G#LL	(24ccc#LL	.
+24B	24gg#	.
+24eJJ	24eeJ	.
+24G#LL	8dd`J)	.
+24B	.	.
+24eJJ)	.	.
+=35	=35	=35
+(24ALL	(24cc#LL	p
+24c#	24b	.
+24eJJ	24aJ	.
+24ALL	8ee`J)	.
+24c#	.	.
+24eJJ	.	.
+24G#LL	(24bbLL	.
+24B	24gg#	.
+24eJJ	24eeJJ	.
+24G#LL	8dd`)	.
+24B	.	.
+24eJJ	.	.
+!!LO:LB:g=z
+=36	=36	=36
+8AL)	(24cc#LL	mf
+.	24b	.
+.	24aJJ)	.
+(8c#	(24aaLL	.
+.	24ee	.
+.	24ee#JJ	.
+8d	24ff#LL)	.
+.	(24a#	.
+.	24bJJ	.
+8DJ)	24ddLL	.
+.	24f#	.
+.	24bJJ	.
+=37	=37	=37
+.	(8qqanP	.
+(8EL	4g#p))	.
+8EE'J)	.	.
+(24ELL	4r	>
+24F#	.	.
+24EJJ	.	.
+24DLL	.	.
+24C#	.	.
+24BBJJ	.	]]
+=38	=38	=38
+!	!LO:TX:b:i:t=dolce	!
+8AA')	4aasSSs	.
+8A' (8c#'L	.	.
+8A' 8c#'	(24aaLL	.
+.	24gg#	.
+.	24ff#JJ	.
+8A' 8c#'J)	24eeLL	.
+.	24dd	.
+.	24cc#JJ	.
+=39	=39	=39
+8r	24bLL	.
+.	24ee	.
+.	24ddJ)	.
+8A' (8B'L	8ddJ	.
+8A' 8B'	(24ddLL	.
+.	24cc#	.
+.	24ddJJ)	.
+8A' 8B'J)	(24ddLL	.
+.	24cc#	.
+.	24ddJJ)	.
+!!LO:LB:g=z
+=40	=40	=40
+8r	8dd'L	.
+8G#' 8B'L	[8bbJ	.
+8G#' 8B'	(24bbLL]	.
+.	24aa	.
+.	24gg#JJ	.
+8G#' 8B'J	24ff#LL	.
+.	24ee	.
+.	24ddJJ	.
+=41	=41	=41
+4A	24cc#LL)	mf
+.	(24a	.
+.	24cc#JJ	.
+.	24eeLL	.
+.	24cc#	.
+.	24aJJ	.
+8r	24ddLL	.
+.	24b	.
+.	24g#JJ	.
+(8E 8B	24dLL	.
+.	24g#	.
+.	24dJJ	.
+=42	=42	=42
+4AA 4A)	24c#LL	<
+.	24e	.
+.	24aJJ	.
+.	(24cc#LL)	.
+.	24ee	.
+.	24aJJ	.
+8r	24ddLL	.
+.	24b	.
+.	24g#JJ	.
+(8E 8B	24dLL	.
+.	24g#	.
+.	24dJJ	.
+=43	=43	=43
+4AA 4A)	(24c#LL)	f
+.	24e	.
+.	24aJJ	.
+.	24eLL	.
+.	24a	.
+.	24cc#JJ	.
+8r	24aLL	.
+.	24cc#	.
+.	24eeJJ	.
+(8A	24cc#LL	.
+.	24ee	.
+.	24ggnJJ	.
+!!LO:LB:g=z
+=44	=44	=44
+8dL	(24ff#LL)	.
+.	24ee	.
+.	24ff#JJ	.
+8B	24dddLL	.
+.	24dd	.
+.	24ff#JJ	.
+8c#	24eeLL	.
+.	24aa	.
+.	24gg#XJJ	.
+8AJ	24aaLL	.
+.	24cc#	.
+.	24eeJJ	.
+=45	=45	=45
+8BL	24ddLL	.
+.	24cc#	.
+.	24ddJJ	.
+8G#	24ff#LL	.
+.	24ee	.
+.	24ddJJ	.
+8A)	24cc#LL)	.
+.	(24aa	.
+.	24eeJJ	.
+(8DJ	24ff#LL	.
+.	24dd	.
+.	24bJJ	.
+=46	=46	=46
+8E'L)	4g#)	.
+8EE'J	.	.
+(24ELL	(4eeTT	p
+24G#	.	.
+24BJJ	.	.
+24G#LL	.	.
+24B	.	.
+24dJJ	.	.
+.	16qqdd#	.
+=47	=47	=47
+4c#)	24eeLL	.
+.	24gg#	.
+.	24aaJJ)	.
+.	(24aaLL	.
+.	24gg#	.
+.	24aa`JJ)	.
+(24ELL	(4eeTT	<
+24G#	.	.
+24BJJ	.	.
+24G#LL	.	.
+24B	.	.
+24dJJ	.	.
+.	16qqdd#	.
+!!LO:LB:g=z
+=48	=48	=48
+4c#)	24eeLL	.
+.	24gg#	.
+.	24aaJJ	.
+.	24ccc#LL	.
+.	24gg#	.
+.	24aaJJ	.
+(24DLL	8ff#L)	f
+24F#	.	.
+24BJJ	.	.
+24dLL	(24bL	.
+24c#	24cc#	.
+24BJJ)	24ddJJ	.
+=49	=49	=49
+(24C#LL	8eeL)	.
+24E	.	.
+24AJJ	.	.
+24c#LL	(24aL	.
+24B	24b	.
+24AJJ	24cc#JJ	.
+()8G#L	24ddLL	.
+.	24cc#	.
+.	24bJJ	.
+24AL	24cc#LL	.
+24B	24b	.
+24c#JJ	24aJJ	.
+!!LO:LB:g=z
+=50	=50	=50
+24dLL	24g#LL	>
+24c#	24a	.
+24BJJ	24bJJ	.
+24c#LL	24aLL	.
+24B	24b	.
+24AJJ	24cc#JJ	.
+8G#L	24ddLL	.
+.	24cc#	.
+.	24bJJ	.
+8AJ)	24cc#LL	.
+.	24b	.
+.	24aJJ)	.
+=51	=51	=51
+8GG# (8G#L	(24ddLL	.
+.	24b	.
+.	24eJJ	.
+8AA 8AJ)	24cc#LL	.
+.	24a	.
+.	24eJJ)	.
+8D' (8F#'L	(24bLLM	<
+.	24a#	.
+.	24b`JJ)	.
+8D' 8F#'J)	(24bLLM	.
+.	24a#	.
+.	24b`JJ)	[
+!!LO:LB:g=z
+=52	=52	=52
+8.C# 8.EL	(24eeLL	mf
+.	24cc#	.
+.	24aJJ	.
+.	24aaLL	.
+.	24ff#	.
+(16F#Jk	.	.
+.	24ddJJ	.
+8E'L)	8cc#L	>
+8EE'J	8bTJ	]]
+.	32qaLLL	.
+.	32qbJJJ	.
+=53	=53	=53
+*^	*	*
+!	!	!aq/LLL	!.
+!	!	!bq/JJJ	!.
+8rF	2AA	8a)	.
+(8C#L	.	24a`LL	p
+.	.	(24a	.
+.	.	24eJJ	.
+8D)	.	24f#`LL)	.
+.	.	(24f#	.
+.	.	24dJJ	.
+(8DJ	.	24BLL	.
+.	.	24e	.
+.	.	24G#JJ	.
+=54	=54	=54	=54
+8C#L)	2AA	8A')	.
+(8C#	.	24a`LL	.
+.	.	(24a	.
+.	.	24eJJ	.
+8D)	.	24f#`LL)	<
+.	.	(24f#	.
+.	.	24dJJ	.
+(8BBJ	.	24dd`LL>)	[
+.	.	(24dd	.
+.	.	24g#JJ)	.
+=55	=55	=55	=55
+8C#L)	4AA	4aw	>
+8AJ	.	.	]
+4r	4ryy	4r	.
+*v	*v	*	*
+==:|!	==:|!	==:|!
+*-	*-	*-
+!!!RDF**kern: > = above
+!!!RDF**kern: < = below
+!!!RDF**dynam: > = dim.
+!!!PPR: Universal Edition 1-4
+!!!PTL: Haydn Piano Sonatas, Vol. 1, No. 5
+!!!YOY: 1901
+!!!ONB: Stich und Druck von Jos. Eberle & Co. Wien VII. Seidengasse 3-9
+!!!ONM-ue: I:5.1
+!!!YEC: 2021 Craig Stuart Sapp
+!!!YEM: Licence: (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0
+!!!YER: 2021
+!!!ENC: Craig Stuart Sapp
+!!!END: 2008/07/04
+!!!EED: Craig Stuart Sapp
+!!!EEV: 2021/01/31
+!!!URL: https://github.com/craigsapp/haydn-keyboard-sonatas
+!!!URL-vhv: https://verovio.humdrum.org?file=haydn/sonatas/sonata12-1.krn
+!!!URL-pdf: https://github.com/craigsapp/haydn-keyboard-sonatas/raw/master/reference-edition/sonata12-1.pdf
+!!!title: @{OTL}, mvmt. @{OMV} (@{SCT}), UE @{ONM-ue}

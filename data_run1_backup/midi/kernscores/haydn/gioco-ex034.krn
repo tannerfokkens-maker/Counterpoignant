@@ -1,0 +1,197 @@
+!!!COM: Stadler, Maximilian
+!!!CDT: 1748///-1833///
+!!!COA: Haydn, Joseph
+!!!OTL@@IT: Gioco filarmonico
+!!!OTL@EN: Philharmonic Joke
+!!!OTA@@IT: o sia maniera facile per comporre un infinito numero de minuetti e trio anche senza sapere il contrapunto
+!!!OTA@EN: or the Art of Composing an Infinite Number of Minutes Without the Least Knowledge of Counterpoint
+!!!PDT: 1781///
+!!!PPR: Artaria
+!!!SML: Gesellschaft der Musikfreundes, Vienna
+!!!PPR2: Luigi Marescalchi
+!!!PPP2: Napoli
+!!!PDT2: 1790///
+**kern	**kern	**kern
+*Icello	*Ivioln	*Ivioln
+*>[A,A,B,B,A]	*>[A,A,B,B,A]	*>[A,A,B,B,A]
+*>norep[A,B]	*>norep[A,B]	*>norep[A,B]
+*>A	*>A	*>A
+*k[]	*k[]	*k[]
+*M3/4	*M3/4	*M3/4
+*MM120	*MM120	*MM120
+!!section:  I
+!!measure:  A
+!!diceroll: 8
+=152	=152	=152
+4r	4e	12gg
+.	.	12ee
+.	.	12cc
+4E	4c	4g
+4C	4e	4cc
+!!section:  I
+!!measure:  B
+!!diceroll: 10
+=142	=142	=142
+8BB	4r	8.gg
+8G	.	.
+.	.	32ff
+.	.	32gg
+8D	8.ff	8.aa
+8G	.	.
+.	16b	16ff
+8C	4cc	4ee
+8G	.	.
+!!section:  I
+!!measure:  C
+!!diceroll: 6
+=163	=163	=163
+8E	4g	4cc
+8G	.	.
+8BB	4g	8.dd
+8G	.	.
+.	.	32cc
+.	.	32dd
+8C	4g	4ee
+8G	.	.
+!!section:  I
+!!measure:  D
+!!diceroll: 8
+=53	=53	=53
+2G	4r	8cc
+.	.	8b
+.	4f	8dd
+.	.	8b
+4c	4e	4cc
+!!section:  I
+!!measure:  E
+!!diceroll: 11
+=135	=135	=135
+4r	4r	8.f#
+.	.	16a
+4C	4f#	8.dd
+.	.	16a
+4C	4a	8.ff#
+.	.	16a
+!!section:  I
+!!measure:  F
+!!diceroll: 10
+=129	=129	=129
+4B	4g	8gg
+.	.	8dd
+4A	4f#	16ee
+.	.	16dd
+.	.	8cc
+4G	4g	16dd
+.	.	16cc
+.	.	8b
+!!section:  I
+!!measure:  G
+!!diceroll: 4
+=110	=110	=110
+4r	4r	12g
+.	.	12b
+.	.	12dd
+4BB	4g	4f
+8.C	4g	8.ee
+16E	.	16cc
+!!section:  I
+!!measure:  H
+!!diceroll: 6
+=107	=107	=107
+8r	2.g	2.g
+8G	.	.
+8D	.	.
+8BB	.	.
+4GG	.	.
+*>B	*>B	*>B
+!!section:  II
+!!measure:  A
+!!diceroll: 7
+=138	=138	=138
+4r	4r	8g
+.	.	8gg
+4G	4B-	8ff
+.	.	8ee
+4G	4B-	8dd
+.	.	8cc#
+!!section:  II
+!!measure:  B
+!!diceroll: 8
+=155	=155	=155
+4r	4r	4dd
+4A	4c#	16ee
+.	.	16dd
+.	.	16ee
+.	.	16gg
+4D	4d	4ff
+!!section:  II
+!!measure:  C
+!!diceroll: 10
+=19	=19	=19
+4r	4r	8b
+.	.	8dd
+4F	4g	8r
+.	.	8dd
+4F	4g	16cc
+.	.	16b
+.	.	16a
+.	.	16g
+!!section:  II
+!!measure:  D
+!!diceroll: 6
+=125	=125	=125
+4C	12c	8dd
+.	12e	.
+.	.	8ee
+.	12g	.
+4C	12c	2cc
+.	12e	.
+.	12g	.
+4C	12c	.
+.	12e	.
+.	12g	.
+!!section:  II
+!!measure:  E
+!!diceroll: 2
+=112	=112	=112
+8A	8c	8.cc
+8c	8r	.
+.	.	16ff
+8A	8c	8.ff
+8c	8r	.
+.	.	32ee
+.	.	32ff
+8F	8c	4aa
+8c	8r	.
+!!section:  II
+!!measure:  F
+!!diceroll: 5
+=160	=160	=160
+4r	4r	12f
+.	.	12ff
+.	.	12dd
+4G	4d	12b
+.	.	12dd
+.	.	12f
+4A	4c	4e
+!!section:  II
+!!measure:  G
+!!diceroll: 7
+=23	=23	=23
+4F	4c	16a
+.	.	16aa
+.	.	16gg
+.	.	16ff
+4G	4c	4ee
+4G	4B	4dd
+!!section:  II
+!!measure:  H
+!!diceroll: 9
+=111	=111	=111
+8C	2.cc	2.cc
+8c	.	.
+8G	.	.
+8E	.	.
+4C	.	.
+*-	*-	*-
+!!!END: 2004/11/01/

@@ -1,0 +1,92 @@
+!!!OTL: 63q. Mozart, Piano Sonata in B-flat major, K. 281, mvt. 1, mm. 1-8
+!!!OMD: Allegro
+**kern	**kern	**dynam
+*staff2	*staff1	*staff1/2
+*clefF4	*clefG2	*clefG2
+*k[b-e-]	*k[b-e-]	*k[b-e-]
+*B-:	*B-:	*B-:
+*M2/4	*M2/4	*M2/4
+*MM104	*MM104	*MM104
+=1-	=1-	=1-
+4B-\ 4d\	8.b-T\L	f
+.	32cc\LL	.
+.	32dd\JJJ	.
+4c\ 4e-\	(24b-\LL	.
+.	24a\	.
+.	24cc\	.
+.	24b-\	.
+.	24a\	.
+.	24ee-\JJ)	.
+=2	=2	=2
+4d\ 4f\	(24cc\LL	.
+.	24b-\	.
+.	24dd\	.
+.	24cc\	.
+.	24b-\	.
+.	24ff\JJ)	.
+4r	8dd\	.
+.	8r	.
+=3	=3	=3
+8E-\ 8e-\L	8b-:\ 8ee-:\ 8gg:\L	.
+8BB-\ 8B-\J	8b-:\ 8dd:\ 8ff:\J	.
+4r	32ff\LLL	.
+.	32bb-\	.
+.	32aa\	.
+.	32bb-\JJJ	.
+.	32ddd\LLL	.
+.	32bb-\	.
+.	32aa\	.
+.	32bb-\JJJ	.
+=4	=4	=4
+.	16ddQ/ 16ffQ/	.
+8FF\ 8F\L	8cc\ 8ee-\L	.
+8BB-\ 8B-\J	8b-\ 8dd\J	.
+4r	4r	.
+=5	=5	=5
+4BB-/ 4D/	8.B-T/L	p
+.	32c/LL	.
+.	32d/JJJ	.
+4C\ 4E-\	(24B-/LL	.
+.	24A/	.
+.	24c/	.
+.	24B-/	.
+.	24A/	.
+.	24e-/JJ)	.
+=6	=6	=6
+4D\ 4F\	(24c/LL	.
+.	24B-/	.
+.	24d/	.
+.	24c/	.
+.	24B-/	.
+.	24f/JJ)	.
+4r	8d/	.
+.	8r	.
+=7	=7	=7
+*^	*	*
+4ry	4E-\ 4G\ 4c\	24g\LL	f
+.	.	24cc\	.
+.	.	24ee-\JJ	.
+.	.	24cc\LL	.
+.	.	24ee-\	.
+.	.	24gg\JJ	.
+.	.	32ggQ/	.
+8d/L	4F\	16ff\LL	.
+.	.	32ee-\L	.
+.	.	32dd\JJJ	.
+.	.	32ddQ/	.
+8e-/J	.	16cc\LL	.
+.	.	32b-\L	.
+.	.	32a\JJJ	.
+*v	*v	*	*
+=8	=8	=8
+16B-\ 16d\LL	4b-\	.
+16B-\ 16d\	.	.
+16B-\ 16d\	.	.
+16B-\ 16d\JJ	.	.
+16B-\ 16d\LL	16r	.
+16B-\ 16d\	(16b-/LL	.
+16B-\ 16d\	16a/	.
+16B-\ 16d\JJ	16a-/JJ)	.
+=	=	=
+*-	*-	*-
+!!!hum2abc: -q

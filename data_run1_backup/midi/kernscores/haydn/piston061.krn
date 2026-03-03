@@ -1,0 +1,48 @@
+!!!COM: Haydn, Josef
+!!!OTL: Quartet, Op. 77, No. 1
+!!!OPS: Op. 77
+!!!ONM: No. 1
+!!!SCT: Piston 61
+!!!citation: Harmony by Walter Piston.  W.W.Norton: New York; 1941.
+!!!label: Ex. 61.  Haydn -- <i>Quartet, op. 77, no. 1</i>
+!!!chapter: Chapter 4 (Tonallity and Modality)
+!!!page: 34
+!!!ENC: Craig Stuart Sapp
+**kern	**kern	**root	**harm
+*staff2	*staff1	*staff2	*staff2
+*clefF4	*clefG2	*clefF4	*
+*M3/4	*M3/4	*M3/4	*M3/4
+*MM200	*MM200	*MM200	*MM200
+*k[f#]	*k[f#]	*k[f#]	*k[f#]
+*G:	*G:	*G:	*G:
+*	*^	*	*
+*	*^	*	*	*
+4C	2.f#	2.a	(8dL	2.DD	V
+.	.	.	8e	.	.
+4c	.	.	8f#	.	.
+.	.	.	8g)	.	.
+4c	.	.	8a	.	.
+.	.	.	8f#J	.	.
+=	=	=	=	=	=
+*G:a:	*G:a:	*G:a:	*G:a:	*G:a:	*G:a:
+4BB	2.g	2.g	4d	2.GG	I:VII
+4B	.	.	2dd	.	.
+4B	.	.	.	.	.
+=	=	=	=	=	=
+*a:	*a:	*a:	*a:	*a:	*a:
+4AA	4fn	2.cc	4fn	2.FF	VI
+4A	4a	.	2ffn	.	.
+4A	4cc	.	.	.	.
+=	=	=	=	=	=
+4GG#	2.b;	2.ee;	4ee	2.EE	V
+2G#;	.	.	2eee;	.	.
+=	=	=	=	=	=
+2.c	2.a	2.a	(8aL	2.AA	i
+.	.	.	8b	.	.
+.	.	.	8cc	.	.
+.	.	.	8dd)	.	.
+.	.	.	8ee	.	.
+.	.	.	8ccJ	.	.
+*	*v	*v	*v	*	*
+=	=	=	=
+*-	*-	*-	*-

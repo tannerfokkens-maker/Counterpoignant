@@ -1,0 +1,660 @@
+!!!!SEGMENT: sonata07-3.krn
+!!!COM: Beethoven, Ludwig van
+!!!CDT: 1770///-1827///
+!!!OTL: Piano Sonata no. 7 in D major
+!!!OPS: 10
+!!!ONM: 3
+!!!OMV: 3
+!!!OMD: MINUETTO\nAllegro
+**kern	**kern	**dynam
+*staff2	*staff1	*staff1/2
+*Ipiano	*Ipiano	*Ipiano
+*>[A,A,B,B,C,A,B]	*>[A,A,B,B,C,A,B]	*>[A,A,B,B,C,A,B]
+*>norep[A,B,C,A,B]	*>norep[A,B,C,A,B]	*>norep[A,B,C,A,B]
+*>A	*>A	*>A
+*clefF4	*clefG2	*
+*k[f#c#]	*k[f#c#]	*
+*kcancel	*kcancel	*
+*D:	*D:	*
+*M3/4	*M3/4	*
+*MM132	*MM132	*
+4r	(>[4a	p
+=1	=1	=1
+*	*^	*
+2.D 2.A	4a]	2.f#	.
+.	4ff#	.	.
+.	4ee	.	.
+=2	=2	=2	=2
+2.E 2.A	4dd	2.g	.
+.	4cc#	.	.
+.	4ee)	.	.
+=3	=3	=3	=3
+2.F# 2.A	[2.dd	2.a	.
+=4	=4	=4	=4
+2.D 2.A	(4dd]	2.f#	.
+.	4a	.	.
+.	4b)	.	.
+=5	=5	=5	=5
+*^	*	*	*
+2.A	(2C#	(4a	2e	.
+.	.	4g)	.	.
+.	4AA	4a'	4c#	.
+*v	*v	*	*	*
+=6	=6	=6	=6
+2D	4e 4g	2A	.
+.	4d 4f#	.	.
+4GG\	4e' 4g'	4B	.
+=7	=7	=7	=7
+2AA)	(2.d 2.f#	2.A	.
+!	!	!	!LO:DY:b=2
+!	!	!	!LO:HP:b=2
+[4A	.	.	sf >
+*	*v	*v	*
+=8	=8	=8
+(4A]	4c# 4e)	.
+4G	4r	.
+4F#)	[4b/	] p
+!!LO:LB:g=original
+=9	=9	=9
+*	*^	*
+2.E 2.G 2.B	(4b]	2.g	.
+.	4gg	.	.
+.	4ff#	.	.
+=10	=10	=10	=10
+*^	*	*	*
+2.B 2.d#	2.F# 2.A	4ee	2.a	.
+.	.	4dd#	.	.
+.	.	4ff#)	.	.
+=11	=11	=11	=11	=11
+2.B 2.e	2.G	[2.ee	2.b	.
+=12	=12	=12	=12	=12
+2.A 2.c#	2.E 2.G	(4ee]	2.g	.
+.	.	4b	.	.
+.	.	4cc#)	.	.
+*v	*v	*	*	*
+=13	=13	=13	=13
+2F# 2A 2d	(4cc#	2a	.
+.	4dd)	.	.
+4D	4a'	4f#	.
+=14	=14	=14	=14
+2A	(4a	2c#	.
+.	4g)	.	.
+4AA	4e'	4G 4c#	.
+*	*v	*v	*
+=15	=15	=15
+*^	*	*
+(2DD/	[2.DD	(>2.G< 2.c# 2.e	.
+4AA/	.	.	.
+*v	*v	*	*
+=16	=16	=16
+4DD] 4D)	4F#< 4d)	.
+4r	4r	.
+=:|!|:	=:|!|:	=:|!|:
+*>B	*>B	*>B
+4FFF#	4r	.
+=17	=17	=17
+2FF#z	2.r	.
+(8EE#L	.	.
+8FF#J	.	.
+=18	=18	=18
+8GGL	2.r	.
+8FF#	.	.
+8EEn	.	.
+8DD	.	.
+8CC#	.	.
+8FF#J)	.	.
+!!LO:LB:g=original
+=19	=19	=19
+!	!LO:DY:rj	!
+4DD'	2B<z	.
+4BBB'	.	.
+4r	(8A#<L	.
+.	8B<J	.
+=20	=20	=20
+4rBB	8c#<L	.
+.	8B<J	.
+4r>	8An<L<	.
+.	8G#<	.
+4r>	8F#<	.
+.	8B<J)	.
+=21	=21	=21
+4G#'	2ee	sf
+4E'	.	.
+4r	(8dd#L	.
+.	8eeJ	.
+=22	=22	=22
+2.r	8ff#L	.
+.	8ee	.
+.	8ddn	.
+.	8cc#	.
+.	8b	.
+.	8eeJ)	.
+*clefG2	*	*
+=23	=23	=23
+!LO:DY:rj	!	!
+2az	4cc#'	.
+.	4aa'	.
+(8g#L	4aa'	.
+8aJ	.	.
+=24	=24	=24
+8bL	4aa'	.
+8a	.	.
+8gn	4aa'	.
+8f#	.	.
+8g	4aa'	.
+8eJ)	.	.
+=25	=25	=25
+*	*^	*
+2.d 2.f#	[2.aaTT	4r	.
+.	.	N(4ff#	p
+.	.	4ee	.
+*	*v	*v	*
+=26	=26	=26
+*^	*	*
+4dd	2.e 2.g	2.aa_TTT	.
+4cc#	.	.	.
+4ee	.	.	.
+!!LO:LB:g=original
+=27	=27	=27	=27
+4dd	[2.f# 2.a	2.aa_TTT	<
+4cc#	.	.	.
+4b	.	.	.
+=28	=28	=28	=28
+4a	2f#]	4aa]TTT	.
+4a#N)	.	4aa#TTT	.
+.	.	(<16qgg##LL	.
+.	.	16qaa#XJJ	.
+4b'	4d#	4bb')	.
+=29	=29	=29	=29
+(4an	2e	(4aan	p
+4gn)	.	4ggn)	.
+4a'	4c#	4aa'	.
+=30	=30	=30	=30
+(4g	2d	4ee (4gg	.
+4f#)	.	4dd 4ff#)	.
+4g'	4G	4b' 4ee' 4gg'	.
+*v	*v	*	*
+=31	=31	=31
+*	*^	*
+*	*^	*	*
+4r	(2ff# 2dd	2ryy	2.a\	>
+*clefF4	*	*	*	*
+!	!	!	!	!LO:DY:b=2
+(<4AA	.	.	.	] ff
+!	!	!	!	!LO:DY:b=2
+!	!	!	!	!LO:HP:b=2
+[4A)	4ee)	4cc#	.	sf >
+*	*v	*v	*	*
+=32	=32	=32	=32
+(4A]	4r	4ryy	.
+4G	4r	4ryy	.
+4F#)	([4b	4b	] p
+=33	=33	=33	=33
+2.E 2.G 2.B	4b]	2.g	.
+.	4gg	.	.
+.	4ff#	.	.
+=34	=34	=34	=34
+*^	*	*	*
+2.B 2.d#	2.F# 2.A	4ee	2.a	.
+.	.	4dd#	.	.
+.	.	4ff#)	.	.
+=35	=35	=35	=35	=35
+2.B 2.dn	2.G	(4ddn	2.b	.
+.	.	4bb	.	<
+.	.	4aa	.	.
+*v	*v	*	*	*
+*clefG2	*	*	*
+!!LO:LB:g=original
+=36	=36	=36	=36
+2.A 2.cn 2.d 2.f#	4gg	2.ccn	.
+.	4ff#	.	.
+.	4aa)	.	.
+=37	=37	=37	=37
+2.B 2.d 2.g	(2gg	4r	.
+.	.	[2dd	.
+!	!LO:DY:rj	!	!
+.	[4dddz	.	.
+=38	=38	=38	=38
+2.B- 2.d 2.e 2.g#	4ddd]	2.dd] 2.gg#	sf
+.	4ccc#	.	.
+.	4eee)	.	.
+=39	=39	=39	=39
+(2A 2c#	(4ddd	2ee	p
+.	4ccc#	.	.
+4Bn 4d	4bb	4dd	.
+=40	=40	=40	=40
+2c# 2e	4aa	2a	.
+.	4gg	.	.
+4d 4f#)	4ff#)	4a	.
+*clefF4	*	*	*
+=41	=41	=41	=41
+(2G	4g 4ee	2b	.
+.	4f# 4dd#	.	.
+4G#	4b 4ddn	4fn	.
+=42	=42	=42	=42
+2A	(4b	2d 2f#	.
+.	4a)	.	.
+4AA)	4a'	4c# 4g	.
+=43	=43	=43	=43
+*^	*	*	*
+4r	[2.DD	2f# 2a	2d	.
+4r	.	.	.	.
+4AA	.	4r	4ryy	pp
+*	*	*v	*v	*
+=44	=44	=44	=44
+(4AA	4DD]	2.r	.
+4F#	4rEE	.	.
+4E)	4rEE	.	.
+=45	=45	=45	=45
+2.D	[2.EE	4r	.
+.	.	4r	.
+!	!	!	!LO:DY:rj
+.	.	4A 4g 4a	pp
+!!LO:LB:g=original
+=46	=46	=46	=46
+*	*	*^	*
+2.C#	2.EE]	4A ((4a	2g	.
+.	.	4B 4b))	.	.
+.	.	4A'< 4a'<	4g	.
+*	*	*v	*v	*
+=47	=47	=47	=47
+4r	[2.DD	2A 2f# 2a	.
+4r	.	.	.
+4AA	.	4r	.
+=48	=48	=48	=48
+(4AA	4DD]	2.r	.
+4F#	4rEE	.	.
+4E)	4rEE	.	.
+*v	*v	*	*
+=49	=49	=49
+[2.EE 2.D	4r	.
+.	4r	.
+.	4A 4g 4a	.
+=50	=50	=50
+*	*^	*
+2.EE] 2.C#	4A ((4a	2g	.
+.	4B- 4b-))	.	.
+.	4A'< 4a'<	4g	.
+=51	=51	=51	=51
+2.DD 2.D	4A ((4a	2f#	.
+.	4G# 4g#))	.	.
+.	4A'< 4a'<	4f#	.
+=52	=52	=52	=52
+2.EE 2.C#	4A ((4a	2gn	.
+.	4Bn 4bn))	.	.
+.	4A'< 4a'<	4g	.
+*	*v	*v	*
+=53	=53	=53
+(>[2.DD 2.C#	[2.A (2.g [2.a	pp
+=54	=54	=54
+4DD] 4D)	4A] 4f#) 4a]	.
+4r	4r	.
+!!LO:TX:rj:b:i:t=Fin.
+!!LO:LB:g=original
+=:|!	=:|!	=:|!
+*>C	*>C	*>C
+*clefF4	*clefF4	*
+*k[f#]	*k[f#]	*
+!!LO:TX:a:i:t=TRIO
+*M3/4	*M3/4	*
+*	*	*below:2
+!	!	!LO:DY:rj
+4DD'	(12GL	f
+.	12B	.
+.	12dJ)	.
+=55	=55	=55
+*	*Xtuplet	*
+4GG'	12GL	.
+.	12B	.
+.	12dJ	.
+4r	12GL	.
+.	12B	.
+.	12dJ	.
+*clefG2	*	*
+!	!	!LO:DY:rj
+4dd'	12GL	f
+.	12B	.
+.	12dJ	.
+=56	=56	=56
+4gg'	12GL	.
+.	12B	.
+.	12dJ	.
+4r	12GL	.
+.	12B	.
+.	12dJ	.
+*clefF4	*	*
+!	!	!LO:DY:rj
+4GG'	12GL	p
+.	12B	.
+.	12dJ	.
+=57	=57	=57
+(4GG	12AL	.
+.	12c	.
+.	12dJ	.
+4FF#)	12AL	.
+.	12c	.
+.	12dJ	.
+4AA'	12AL	.
+.	12c	.
+.	12dJ	.
+=58	=58	=58
+4DD'	12AL	.
+.	12c	.
+.	12dJ	.
+4r	12AL	.
+.	12c	.
+.	12dJ	.
+!	!	!LO:DY:rj
+4DD'	12AL	f
+.	12c	.
+.	12dJ	.
+!!LO:LB:g=original
+=59	=59	=59
+4C'	12F#L	.
+.	12A	.
+.	12dJ	.
+4r	12F#L	.
+.	12A	.
+.	12dJ	.
+*clefG2	*	*
+!	!	!LO:DY:rj
+4dd'	12F#L	f
+.	12A	.
+.	12dJ	.
+=60	=60	=60
+4ccc'	12F#L	.
+.	12A	.
+.	12dJ	.
+4r	12F#L	.
+.	12A	.
+.	12dJ	.
+*clefF4	*	*
+4C'	12F#L	p
+.	12A	.
+.	12dJ	.
+=61	=61	=61
+(4C	12GL	.
+.	12B	.
+.	12dJ	.
+4BB)	12GL	.
+.	12B	.
+.	12dJ	.
+4D'/	12GL	.
+.	12B	.
+.	12dJ	.
+=62	=62	=62
+4GG'	12GL	.
+.	12B	.
+.	12dJ	.
+4r	12GL	.
+.	12B	.
+.	12dJ	.
+!	!	!LO:DY:rj
+4BBB'	12F#L	f
+.	12B	.
+.	12d#J	.
+=63	=63	=63
+4BB'	12F#L	.
+.	12B	.
+.	12d#J	.
+4r	12F#L	.
+.	12B	.
+.	12d#J	.
+*clefG2	*	*
+4b'/	12F#L	f
+.	12B	.
+.	12d#J	.
+!!LO:LB:g=original
+=64	=64	=64
+4bb'	12F#L	.
+.	12B	.
+.	12d#J	.
+4r	12F#L	.
+.	12B	.
+.	12d#J	.
+*clefF4	*	*
+4EE'	12GL	.
+.	12B	.
+.	12eJ	.
+=65	=65	=65
+4E'	12GL	.
+.	12B	.
+.	12eJ	.
+4r	12GL	.
+.	12B	.
+.	12eJ	.
+*clefG2	*	*
+4ee'	12GL	.
+.	12B	.
+.	12eJ	.
+=66	=66	=66
+4eee'	12GL	.
+.	12B	.
+.	12eJ	.
+4r	12GL	.
+.	12B	.
+.	12eJ	.
+*clefF4	*	*
+4AAA'	12GL	.
+.	12c#	.
+.	12eJ	.
+*	*clefG2	*
+=67	=67	=67
+*	*	*center
+[2.AA/ [2.E/ [2.G/	(12gL	ff
+.	12cc#	.
+.	12eeJ)	.
+.	(8ggL	.
+.	8ff#)	.
+.	8ee'	.
+.	8dd'J	.
+=68	=68	=68
+2.AA/] 2.E/] 2.G/]	8cc#'L	.
+.	8b'	.
+.	8a'	.
+.	8g'	.
+.	8f#'	.
+.	8e'J	.
+!!LO:LB:g=original
+=69	=69	=69
+4D 4F#	(8dL	p
+.	8a	.
+4r	8g	.
+.	8f#	.
+4r	8e	.
+.	8dJ	.
+=70	=70	=70
+4r	8cnL	.
+.	8e	.
+4r	8d	.
+.	8c	.
+*	*	*below:2
+!	!	!LO:DY:rj
+4DD'	8B	f
+.	8AJ)	.
+*	*clefF4	*
+=71	=71	=71
+*	*tuplet	*
+4GG'	(12GL	.
+.	12B	.
+.	12dJ)	.
+*	*Xtuplet	*
+4r	12GL	.
+.	12B	.
+.	12dJ	.
+*clefG2	*	*
+(4dd	12GL	f
+.	12B	.
+.	12dJ	.
+=72	=72	=72
+4gg')	12GL	.
+.	12B	.
+.	12dJ	.
+4r	12GL	.
+.	12B	.
+.	12dJ	.
+*clefF4	*	*
+!	!	!LO:DY:rj
+4GG'	12GL	p
+.	12B	.
+.	12dJ	.
+=73	=73	=73
+(4GG	12AL	.
+.	12c	.
+.	12dJ	.
+4FF#)	12AL	.
+.	12c	.
+.	12dJ	.
+4AA'	12AL	.
+.	12c	.
+.	12dJ	.
+=74	=74	=74
+4DD'	12AL	.
+.	12c	.
+.	12dJ	.
+4r	12AL	.
+.	12c	.
+.	12dJ	.
+!	!	!LO:DY:rj
+(4DD	12AL	f
+.	12c	.
+.	12dJ	.
+!!LO:LB:g=original
+=75	=75	=75
+4C')	12F#L	.
+.	12A	.
+.	12dJ	.
+4r	12F#L	.
+.	12A	.
+.	12dJ	.
+*clefG2	*	*
+!	!	!LO:DY:rj
+(4dd	12F#L	f
+.	12A	.
+.	12dJ	.
+=76	=76	=76
+4ccc')	12F#L	.
+.	12A	.
+.	12dJ	.
+4r	12F#L	.
+.	12A	.
+.	12dJ	.
+*clefF4	*	*
+4C'	12F#L	p
+.	12A	.
+.	12dJ	.
+=77	=77	=77
+(4C	12GL	.
+.	12B	.
+.	12dJ	.
+4BB)	12GL	.
+.	12B	.
+.	12dJ	.
+4D'	12GL	.
+.	12B	.
+.	12dJ	.
+=78	=78	=78
+4GG'	12GL	.
+.	12B	.
+.	12dJ	.
+4r	12GL	.
+.	12B	.
+.	12dJ	.
+!	!	!LO:DY:rj
+(4BBB	12F#L	f
+.	12B	.
+.	12d#J	.
+=79	=79	=79
+4BB')	12F#L	.
+.	12B	.
+.	12d#J	.
+4r	12F#L	.
+.	12B	.
+.	12d#J	.
+*clefG2	*	*
+(4b	12F#L	f
+.	12B	.
+.	12d#J	.
+=80	=80	=80
+4bb')	12F#L	.
+.	12B	.
+.	12d#J	.
+4r	12F#L	.
+.	12B	.
+.	12d#J	.
+*clefF4	*	*
+(<4EE	12GL	f
+.	12B	.
+.	12eJ	.
+!!LO:LB:g=original
+=81	=81	=81
+4E)	12GL	.
+.	12B	.
+.	12eJ	.
+4r	12GL	.
+.	12B	.
+.	12eJ	.
+*clefG2	*	*
+(4ee	12GL	f
+.	12B	.
+.	12eJ	.
+=82	=82	=82
+4eee')	12GL	.
+.	12B	.
+.	12eJ	.
+4r	12GL	.
+.	12B	.
+.	12eJ	.
+*clefF4	*	*
+!	!	!LO:DY:rj
+(4AAA	12GL	ff
+.	12c#	.
+.	12eJ	.
+*	*clefG2	*
+=83	=83	=83
+!	!	!LO:DY:c
+4AA')	12c#L	ff
+.	12e	.
+.	12gJ	.
+4r	12c#L	.
+.	12e	.
+.	12gJ	.
+(<4AA	12c#L	ff
+.	12e	.
+.	12gJ	.
+=84	=84	=84
+4A')	12c#L	.
+.	12e	.
+.	12gJ	.
+4r	12c#L	.
+.	12e	.
+.	12gJ	.
+*clefG2	*	*
+(4a\	12c#L	ff
+.	12e	.
+.	12gJ	.
+=85	=85	=85
+4aa')	12c#L	.
+.	12e	.
+.	12gJ	.
+4r	4r	.
+4r	4r	.
+=86	=86	=86
+4r	4r	.
+4r	4r	.
+!	!LO:TX:c:i:rj:t=D.C.\nMinuetto\nma senza\nreplica	!
+=||	=||	=||
+*-	*-	*-
+!!!RDF**kern: > = above
+!!!RDF**kern: < = below
+!!!RDF**kern: N = linked
+!!!verovio: beamFrenchStyle
+!!!LOR: Durand 1915, plates 9327/9328, Paul Dukas, ed.
+!!!PED: Dukas, Paul
+!!!URL-github: https://github.com/craigsapp/beethoven-piano-sonatas/blob/main/kern/sonata07-3.krn
+!!!URL-vhv: https://verovio.humdrum.org/?file=beethoven/sonatas/sonata07-3.krn
+!!!URL-pdf: https://github.com/craigsapp/beethoven-piano-sonatas/blob/master/reference-edition/sonata07-3.pdf
+!!!ENC: Craig Stuart Sapp
+!!!END: 2005/08/26
+!!!EED: Craig Stuart Sapp
+!!!EEV: 2022/05/05

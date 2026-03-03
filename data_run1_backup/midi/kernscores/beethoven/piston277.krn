@@ -1,0 +1,55 @@
+!!!COM: Beethoven, Ludwig van
+!!!OTL: Piano Sonata, Op. 13
+!!!OPS: Op. 13
+!!!SCT: Piston 277
+!!!citation: Harmony by Walter Piston.  W.W.Norton: New York; 1941.
+!!!label: Ex. 277.  Beethoven -- <i>Sonata, op. 13</i>
+!!!chapter: Chapter 13 (The Dominant Seventh Chord)
+!!!page: 145
+!!!ENC: Craig Stuart Sapp
+**kern	**kern	**root	**harm
+*staff2	*staff1	*staff2	*staff2
+*clefF4	*clefF4	*clefF4	*
+*M2/4	*M2/4	*M2/4	*M2/4
+*MM48	*MM48	*MM48	*MM48
+*k[b-e-a-d-]	*k[b-e-a-d-]	*k[b-e-a-d-]	*k[b-e-a-d-]
+*A-:	*A-:	*A-:	*A-:
+*	*^	*	*
+4AA-	16A-	4c	4AA-	I
+.	16E-	.	.	.
+.	16A-	.	.	.
+.	16E-	.	.	.
+4D-	16G	4B-	4EE-	V7d
+.	16E-	.	.	.
+.	16G	.	.	.
+.	16E-	.	.	.
+=	=	=	=	=
+4C	16A-	4.e-	4AA-	Ib
+.	16E-	.	.	.
+.	16A-	.	.	.
+.	16E-	.	.	.
+4GG	16B-	.	4EE-	V7b
+.	16E-	.	.	.
+.	16B-	8d-	.	.
+.	16E-	.	.	.
+=	=	=	=	=
+8AA-	16A-	8c	8AA-	I
+.	16E-	.	.	.
+8GG	16B-	8e-	8EE-	Vb
+.	16E-	.	.	.
+8FF	16c	8a-	8FF	vi
+.	16A-	.	.	.
+8F	16dn	8b-	8BB-	V7d/V
+.	16A-	.	.	.
+=	=	=	=	=
+4E-	16G	4.e-	2EE-	V
+.	16B-	.	.	.
+.	16G	.	.	.
+.	16B-	.	.	.
+4EE-	16G	.	.	.
+.	16B-	.	.	.
+.	16G	8en	.	.
+.	16B-	.	.	.
+=	=	=	=	=
+*	*v	*v	*	*
+*-	*-	*-	*-

@@ -1,0 +1,39 @@
+!!!COM: Scarlatti, Domenico
+!!!OTL: Sonata
+!!!SCT: Piston 95
+!!!citation: Harmony by Walter Piston.  W.W.Norton: New York; 1941.
+!!!label: Ex. 95.  Scarlatti -- <i>Sonata</i>
+!!!chapter: Chapter 5 (Harmonic Rhythm)
+!!!page: 51
+!!!ENC: Craig Stuart Sapp
+**kern	**kern	**root	**harm
+*staff2	*staff1	*staff3	*staff3
+*clefF4	*clefG2	*clefF4	*
+*M2/4	*M2/4	*M2/4	*M2/4
+*MM164	*MM164	*MM164	*MM164
+*k[f#c#g#]	*k[f#c#g#]	*k[f#c#g#]	*k[f#c#g#]
+*b:	*b:	*b:	*b:
+*	*^	*	*
+*	*^	*	*	*
+2r	8b	8dd	[2bb	2BB	i
+.	8dd	8ff#	.	.	.
+.	8cc#	8ee	.	.	.
+.	8b	8dd	.	.	.
+=	=	=	=	=	=
+2r	4f#	8cc#	8bb]	2FF#	V
+.	.	8ee	8ggn 8aa#	.	.
+.	4ryy	8dd	8ff# 8bb	.	.
+.	.	8cc#	8ee 8aa#	.	.
+=	=	=	=	=	=
+2r	8b	8dd	[2bb	2BB	i
+.	8dd	8ff#	.	.	.
+.	8cc#	8ee	.	.	.
+.	8b	8dd	.	.	.
+=	=	=	=	=	=
+2r	4f#	8cc#	8bb]	2FF#	V
+.	.	8ee	8ggn 8aa#	.	.
+.	4ryy	8dd	8ff# 8bb	.	.
+.	.	8cc#	8ee 8aa#	.	.
+*	*v	*v	*v	*	*
+=	=	=	=
+*-	*-	*-	*-

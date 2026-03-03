@@ -1,0 +1,5 @@
+{
+  "mode": "all",
+  "num_voices": 4,
+  "tokenizer_type": "scale-degree"
+}

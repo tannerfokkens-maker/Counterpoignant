@@ -1,0 +1,52 @@
+!!!COM: Mozart, Wolfgang Amadeus
+!!!OTL: Piano Concerto K 466
+!!!SCT: Piston 298
+!!!SCT: K 466
+!!!citation: Harmony by Walter Piston.  W.W.Norton: New York; 1941.
+!!!label: Ex. 298.  Mozart -- <i>Pianoforte Concerto, K. no. 466</i>
+!!!chapter: Chapter 14 (Secondary Dominants)
+!!!page: 157
+!!!ENC: Craig Stuart Sapp
+**kern	**kern	**root	**harm
+*staff2	*staff1	*staff2	*staff2
+*clefF4	*clefG2	*clefF4	*
+*M4/4	*M4/4	*M4/4	*M4/4
+*MM144	*MM144	*MM144	*MM144
+*k[b-]	*k[b-]	*k[b-]	*k[b-]
+*d:	*d:	*d:	*d:
+*^	*	*	*
+1A	2f\	(8bb-/	2DD	ib
+.	.	8aa/)	.	.
+.	.	8gg/	.	.
+.	.	8ff/	.	.
+.	2g\	(8ff/	2AA	V7
+.	.	8ee/)	.	.
+.	.	8dd/	.	.
+.	.	8cc#/	.	.
+*	*staff2	*	*	*
+*v	*v	*	*	*
+=	=	=	=
+2B-\ 2fu\	(8ee/	2BB-	VI
+.	8dd/	.	.
+.	8cc#/	.	.
+.	8dd/)	.	.
+2A\ 2cn\ 2f#u\	4dd/	2DD	V7c/IV
+.	4dd/	.	.
+=	=	=	=
+*^	*	*	*
+*	*staff1	*	*	*
+2G\ 2B-\	2g\	(4dd/	2FF	iv
+.	.	2ddd/)	.	.
+2G\	2d\ 2e\	.	2EE	ii7b
+.	.	8ccc/	.	.
+.	.	8bb-/	.	.
+=	=	=	=	=
+1A	2d\ 2fn\	(8bb-/	2DD	ic
+.	.	8aa/	.	.
+.	.	8gg/	.	.
+.	.	8ff/)	.	.
+.	2c#\ 2g\	4ee/	2AA	V7
+.	.	4aa/	.	.
+*v	*v	*	*	*
+=	=	=	=
+*-	*-	*-	*-

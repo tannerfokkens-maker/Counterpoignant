@@ -351,8 +351,8 @@ def _part_to_notes(
         except Exception:
             pass
 
-        start_tick = int(offset_quarters * TICKS_PER_QUARTER)
-        dur_tick = int(float(element.quarterLength) * TICKS_PER_QUARTER)
+        start_tick = int(round(offset_quarters * TICKS_PER_QUARTER))
+        dur_tick = int(round(float(element.quarterLength) * TICKS_PER_QUARTER))
 
         if dur_tick <= 0:
             continue

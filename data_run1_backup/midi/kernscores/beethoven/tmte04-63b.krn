@@ -1,0 +1,76 @@
+!!!OTL: 63b. Beethoven, Piano Sonata in E major, op. 109, mvt. 3, mm. 1-8
+!!!OMD: Andante molto cantabile ed espressivo
+**kern	**kern	**dynam
+*staff2	*staff1	*staff1/2
+*Ipiano	*Ipiano	*Ipiano
+*>[A,A]	*>[A,A]	*>[A,A]
+*>norep[A]	*>norep[A]	*>norep[A]
+*>A	*>A	*>A
+*clefF4	*clefG2	*clefG2
+*k[f#c#g#d#]	*k[f#c#g#d#]	*k[f#c#g#d#]
+*E:	*E:	*E:
+*M3/4	*M3/4	*M3/4
+*MM92	*MM92	*MM92
+=1-	=1-	=1-
+*	*^	*
+!!mezza voce
+(4EE/	(4g#/	4B\	.
+4GG#/	4.e/	4B\	.
+4AA/	.	4c#\	.
+.	8f#/)	.	.
+*	*v	*v	*
+=2	=2	=2
+4BB/	4F#/ 4d#/	.
+4C#/	2F#/ 2A/ 2B/	.
+4D#\)	.	.
+=3	=3	=3
+*	*^	*
+(4E\	(4g#/	(4G#\ 4B\	.
+4G#\	4.e/	4B\	.
+4A#\	.	4c#\)	.
+.	8f#/)	.	.
+=4	=4	=4	=4
+4B\	(4f#/	(4d#\	<
+4F#\	4a#/	4c#\ 4e\	.
+8BB/L	4b/)	4d#\ 4f#\)	.
+8AAn/J)	.	.	.
+*	*v	*v	*
+=5	=5	=5
+*^	*	*
+.	.	(32BQ/LLL	.
+.	.	32eQ/	.
+.	.	32g#Q/JJJ	.
+*	*	*^	*
+(4GG#/	2GG#\	4b/	4r	>
+4G#/)	.	4.e/	4B\	.
+4AA/	4ry	.	4c#\	.
+.	.	16g#/LL	.	.
+.	.	16f#/JJ	.	.
+*	*	*v	*v	*
+*v	*v	*	*
+=6	=6	=6
+4BB\ 4F#\	4d#/	.
+4C#\ 4E\	4B/	.
+.	16AQ/LL	.
+.	16BQ/	.
+.	32AQ/L	.
+.	32G#Q/JJJ	.
+4D#\ 4F#\	4A/)	.
+=7	=7	=7
+*^	*	*
+4ry	(4E\	4G#/	<
+2E/	4CC#\ 4C#\	(4.e/	.
+.	4CCn\) 4Cn\	.	.
+.	.	8A#/)	.
+*	*	*clefF4	*clefF4
+=8	=8	=8	=8
+*	*	*^	*
+(4EE/	2CCn\	(2A#/	4Gn\	p
+4GGn/	.	.	4E\	.
+4BB/)	4BBB\	4B/)	4D#\	.
+*v	*v	*	*	*
+*	*v	*v	*
+*	*clefG2	*clefG2
+==:|!	==:|!	==:|!
+*-	*-	*-
+!!!hum2abc: -q

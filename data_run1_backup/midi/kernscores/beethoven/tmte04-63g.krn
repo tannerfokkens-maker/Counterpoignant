@@ -1,0 +1,59 @@
+!!!OTL: 63g. Beethoven, Piano Sonata in D minor, op. 31 no. 2, mvt. 1, mm. 1-6
+!!!OMD: Largo
+**kern	**kern	**dynam
+*staff2	*staff1	*staff1/2
+*clefF4	*clefG2	*clefG2
+*k[b-]	*k[b-]	*k[b-]
+*d:	*d:	*d:
+*M2/2	*M2/2	*M2/2
+*met(C|)	*met(C|)	*met(C|)
+*MM44	*MM44	*MM44
+=1-	=1-	=1-
+[1CC#: [1EE: [1AA:	2C#:/ 2E:/ 2A:/	.
+.	(4c#'/	pp
+.	4e'/)	.
+=2	=2	=2
+2.CC#;/] 2.EE;/] 2.AA;/]	2.a;/	.
+!!Allegro
+*MM144	*MM144	*MM144
+4C#'\ 4A'\	(8a/L	p
+.	8g/J)	.
+=3	=3	=3
+4D'\ 4A'\	(8g/L	.
+.	8f/J)	.
+4E'\ 4A'\	(8f/L	.
+.	8e/J)	.
+4F'\ 4A'\	(8e/L	.
+.	8d/J)	.
+4C#'\ 4A'\	(8a/L	.
+.	8g/J)	.
+=4	=4	=4
+4D'\ 4A'\	(8g/L	.
+.	8f/J)	.
+4E'\ 4A'\	(8f/L	.
+.	8e/J)	.
+4F'\ 4A'\	(8e/L	.
+.	8d/J)	<
+4F#'\ 4d'\	(8dd\L	.
+.	8ccn\J)	.
+=5	=5	=5
+4G'\ 4d'\	(8cc\L	.
+.	8b-\J)	.
+4A'\ 4d'\	(8b-/L	.
+.	8a/J)	.
+4B-'\ 4d'\	8a/L	.
+.	8g/J	.
+4B-'\ 4d'\	(8g/L	.
+.	8g#/J)	.
+=6	=6	=6
+!!Adagio
+*MM60	*MM60	*MM60
+*	*^	*
+2A\ 2d\	(4.g#S/	2fn\	>
+.	16bn/LL	.	.
+.	16a/JJ	.	.
+2A;\ 2c#;\	2a;/)	2e;\	p
+*	*v	*v	*
+=	=	=
+*-	*-	*-
+!!!hum2abc: -q
