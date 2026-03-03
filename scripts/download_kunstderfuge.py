@@ -22,6 +22,8 @@ import sys
 import time
 import urllib.parse
 import copy
+import math
+from dataclasses import dataclass, field
 from pathlib import Path
 from html.parser import HTMLParser
 
@@ -579,96 +581,493 @@ def deperform_all(triage_results: dict, base_dir: Path, grid: int = 16) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Voice separation via MuseScore
+# Voice separation (local MIDI algorithm, no MuseScore)
 # ---------------------------------------------------------------------------
 
-MUSESCORE_PATHS = [
-    "/Applications/MuseScore 4.app/Contents/MacOS/mscore",
-    "/Applications/MuseScore 3.app/Contents/MacOS/mscore",
-    "mscore",
-    "musescore",
-    "mscore4",
-]
+VOICE_SEP_SAFETY_MAX = 32
+VOICE_SEP_MAX_ASSIGN_DUR_QN = 2
 
 
-def find_musescore() -> str | None:
-    """Find the MuseScore binary."""
-    import shutil
-    for path in MUSESCORE_PATHS:
-        if "/" in path:
-            if Path(path).exists():
-                return path
+@dataclass
+class SeparatedNote:
+    """A note event used by the local voice-separation algorithm."""
+
+    start_tick: int
+    end_tick: int
+    effective_end_tick: int
+    pitch: int
+    velocity: int
+    src_track: int
+    src_channel: int
+    assign_start_tick: int = 0
+
+
+@dataclass
+class VoiceStream:
+    """Mutable voice state for assignment."""
+
+    notes: list[SeparatedNote] = field(default_factory=list)
+    last_pitch: int | None = None
+    last_end_tick_effective: int = 0
+    mean_pitch: float | None = None
+    note_count: int = 0
+    register_center: float | None = None
+
+
+def _voice_ref_pitch(voice: VoiceStream) -> float:
+    if voice.mean_pitch is not None:
+        return voice.mean_pitch
+    if voice.last_pitch is not None:
+        return float(voice.last_pitch)
+    if voice.register_center is not None:
+        return voice.register_center
+    return 60.0
+
+
+def _flatten_midi_notes(mid, ignore_pedal: bool) -> list[SeparatedNote]:
+    """Flatten all tracks into note events for voice assignment."""
+    from collections import defaultdict, deque
+
+    max_assign_dur = VOICE_SEP_MAX_ASSIGN_DUR_QN * max(1, int(mid.ticks_per_beat))
+    notes: list[SeparatedNote] = []
+
+    for track_idx, track in enumerate(mid.tracks):
+        current_tick = 0
+        active = defaultdict(deque)
+        for msg in track:
+            current_tick += int(msg.time)
+            if msg.type == "note_on" and msg.velocity > 0:
+                channel = int(getattr(msg, "channel", 0))
+                key = (channel, int(msg.note))
+                active[key].append((current_tick, int(msg.velocity), channel))
+            elif msg.type == "note_off" or (msg.type == "note_on" and msg.velocity == 0):
+                channel = int(getattr(msg, "channel", 0))
+                key = (channel, int(msg.note))
+                if not active[key]:
+                    continue
+                start_tick, velocity, src_channel = active[key].popleft()
+                if not active[key]:
+                    del active[key]
+
+                end_tick = max(current_tick, start_tick + 1)
+                effective_end_tick = end_tick
+                if ignore_pedal:
+                    effective_end_tick = min(end_tick, start_tick + max_assign_dur)
+
+                notes.append(
+                    SeparatedNote(
+                        start_tick=start_tick,
+                        end_tick=end_tick,
+                        effective_end_tick=effective_end_tick,
+                        pitch=int(msg.note),
+                        velocity=velocity,
+                        src_track=track_idx,
+                        src_channel=src_channel,
+                        assign_start_tick=start_tick,
+                    )
+                )
+
+    notes.sort(key=lambda n: (n.start_tick, -n.pitch, n.end_tick))
+    return notes
+
+
+def _build_onset_clusters(
+    notes: list[SeparatedNote],
+    jitter_ticks: int,
+) -> list[tuple[int, list[SeparatedNote]]]:
+    """Group near-simultaneous note onsets into clusters."""
+    if not notes:
+        return []
+
+    clusters: list[tuple[int, list[SeparatedNote]]] = []
+    current: list[SeparatedNote] = []
+    current_sum = 0.0
+
+    def flush_cluster() -> None:
+        nonlocal current, current_sum
+        if not current:
+            return
+        canonical = int(round(current_sum / len(current)))
+        for note in current:
+            note.assign_start_tick = canonical
+        clusters.append((canonical, list(current)))
+        current = []
+        current_sum = 0.0
+
+    for note in notes:
+        if not current:
+            current = [note]
+            current_sum = float(note.start_tick)
+            continue
+
+        center = current_sum / len(current)
+        if abs(note.start_tick - center) <= jitter_ticks:
+            current.append(note)
+            current_sum += float(note.start_tick)
         else:
-            found = shutil.which(path)
-            if found:
-                return found
-    return None
+            flush_cluster()
+            current = [note]
+            current_sum = float(note.start_tick)
+
+    flush_cluster()
+    return clusters
 
 
-def voice_separate_mscore(src: Path, dest: Path, mscore_bin: str) -> bool:
-    """Use MuseScore to import MIDI and export as MusicXML.
+def _p90_cluster_size(values: list[int]) -> int:
+    if not values:
+        return 2
+    ordered = sorted(values)
+    idx = max(0, math.ceil(0.9 * len(ordered)) - 1)
+    return ordered[idx]
 
-    MuseScore's MIDI importer performs voice separation and quantization
-    as part of its notation inference. The resulting MusicXML has distinct
-    voices/staves that music21 can read as separate parts.
 
-    The MusicXML is then re-exported as MIDI with voices on separate tracks.
-    """
-    import subprocess
-    import tempfile
+def _assignment_crosses_neighbors(note_pitch: int, voice_idx: int, voices: list[VoiceStream]) -> bool:
+    """Check if assigning note_pitch to voice_idx would cross adjacent voices."""
+    if len(voices) <= 1:
+        return False
 
-    # Step 1: MIDI → MusicXML via MuseScore
-    with tempfile.NamedTemporaryFile(suffix=".musicxml", delete=False) as tmp:
-        mxml_path = tmp.name
+    ranked = sorted(range(len(voices)), key=lambda i: _voice_ref_pitch(voices[i]), reverse=True)
+    if voice_idx not in ranked:
+        return False
+
+    pos = ranked.index(voice_idx)
+    if pos > 0:
+        above_pitch = _voice_ref_pitch(voices[ranked[pos - 1]])
+        if note_pitch > above_pitch:
+            return True
+    if pos < len(ranked) - 1:
+        below_pitch = _voice_ref_pitch(voices[ranked[pos + 1]])
+        if note_pitch < below_pitch:
+            return True
+    return False
+
+
+def _assignment_cost(note: SeparatedNote, voice_idx: int, voices: list[VoiceStream], tpqn: int) -> float:
+    """Compute assignment cost for one note/voice pair."""
+    voice = voices[voice_idx]
+
+    center = voice.register_center if voice.register_center is not None else float(note.pitch)
+    last_pitch = float(voice.last_pitch) if voice.last_pitch is not None else center
+    pitch_continuity = abs(float(note.pitch) - last_pitch)
+
+    register_penalty = 0.0
+    if voice.mean_pitch is not None:
+        register_penalty = abs(float(note.pitch) - voice.mean_pitch)
+
+    crossing_penalty = 1.0 if _assignment_crosses_neighbors(note.pitch, voice_idx, voices) else 0.0
+
+    inactivity_penalty = 0.0
+    if voice.note_count > 0:
+        inactivity_penalty = (
+            float(note.assign_start_tick - voice.last_end_tick_effective) / float(max(1, tpqn))
+        )
+
+    return (
+        pitch_continuity * 1.0
+        + register_penalty * 0.3
+        + crossing_penalty * 50.0
+        + inactivity_penalty * 0.1
+    )
+
+
+def _assign_note(voice: VoiceStream, note: SeparatedNote) -> None:
+    voice.notes.append(note)
+    if voice.note_count == 0:
+        voice.mean_pitch = float(note.pitch)
+        voice.register_center = float(note.pitch)
+        voice.note_count = 1
+    else:
+        prev = voice.mean_pitch if voice.mean_pitch is not None else float(note.pitch)
+        voice.mean_pitch = (prev * voice.note_count + float(note.pitch)) / (voice.note_count + 1)
+        voice.note_count += 1
+    voice.last_pitch = note.pitch
+    voice.last_end_tick_effective = note.effective_end_tick
+
+
+def _recompute_voice_state(voice: VoiceStream) -> None:
+    voice.notes.sort(key=lambda n: (n.assign_start_tick, n.effective_end_tick, -n.pitch))
+    if not voice.notes:
+        voice.last_pitch = None
+        voice.last_end_tick_effective = 0
+        voice.mean_pitch = None
+        voice.note_count = 0
+        voice.register_center = None
+        return
+
+    pitches = [n.pitch for n in voice.notes]
+    voice.mean_pitch = float(sum(pitches)) / len(pitches)
+    voice.note_count = len(voice.notes)
+    voice.last_pitch = voice.notes[-1].pitch
+    voice.last_end_tick_effective = voice.notes[-1].effective_end_tick
+    if voice.register_center is None:
+        voice.register_center = voice.mean_pitch
+
+
+def _can_swap_note(voice: VoiceStream, idx: int, note: SeparatedNote) -> bool:
+    prev_note = voice.notes[idx - 1] if idx > 0 else None
+    next_note = voice.notes[idx + 1] if idx + 1 < len(voice.notes) else None
+    if prev_note and note.assign_start_tick < prev_note.effective_end_tick:
+        return False
+    if next_note and next_note.assign_start_tick < note.effective_end_tick:
+        return False
+    return True
+
+
+def _crossing_cleanup(voices: list[VoiceStream]) -> None:
+    """Swap local crossings between adjacent voices when monophony allows it."""
+    if len(voices) < 2:
+        return
+
+    for voice in voices:
+        voice.notes.sort(key=lambda n: (n.assign_start_tick, n.effective_end_tick, -n.pitch))
+
+    any_swapped = False
+    for upper_idx in range(len(voices) - 1):
+        upper = voices[upper_idx]
+        lower = voices[upper_idx + 1]
+        lower_index_by_start = {n.assign_start_tick: i for i, n in enumerate(lower.notes)}
+        for i, up_note in enumerate(upper.notes):
+            j = lower_index_by_start.get(up_note.assign_start_tick)
+            if j is None:
+                continue
+            low_note = lower.notes[j]
+            if up_note.pitch >= low_note.pitch:
+                continue
+            if not _can_swap_note(upper, i, low_note):
+                continue
+            if not _can_swap_note(lower, j, up_note):
+                continue
+            upper.notes[i], lower.notes[j] = low_note, up_note
+            any_swapped = True
+
+    if any_swapped:
+        for voice in voices:
+            _recompute_voice_state(voice)
+
+
+def _validate_voice_assignment(voices: list[VoiceStream]) -> tuple[bool, str | None]:
+    """Validate strict monophony under effective-end assignment durations."""
+    for i, voice in enumerate(voices):
+        voice.notes.sort(key=lambda n: (n.assign_start_tick, n.effective_end_tick, -n.pitch))
+        for a, b in zip(voice.notes, voice.notes[1:]):
+            if b.assign_start_tick < a.effective_end_tick:
+                return (
+                    False,
+                    f"voice {i + 1} overlap at tick {b.assign_start_tick}"
+                    f" (< prev end {a.effective_end_tick})",
+                )
+    return True, None
+
+
+def _extract_preserved_meta(mid) -> list[tuple[int, object]]:
+    """Extract tempo/time-signature meta events to keep in separated output."""
+    keep = []
+    seen = set()
+    for track in mid.tracks:
+        tick = 0
+        for msg in track:
+            tick += int(msg.time)
+            if not msg.is_meta:
+                continue
+            if msg.type not in {"set_tempo", "time_signature"}:
+                continue
+            if msg.type == "set_tempo":
+                sig = (tick, msg.type, int(msg.tempo))
+            else:
+                sig = (
+                    tick,
+                    msg.type,
+                    int(msg.numerator),
+                    int(msg.denominator),
+                    int(msg.clocks_per_click),
+                    int(msg.notated_32nd_notes_per_beat),
+                )
+            if sig in seen:
+                continue
+            seen.add(sig)
+            keep.append((tick, msg.copy(time=0)))
+
+    keep.sort(key=lambda e: (e[0], 0 if e[1].type == "set_tempo" else 1))
+    return keep
+
+
+def _write_separated_midi(mid, voices: list[VoiceStream], dest: Path) -> None:
+    import mido
+
+    out_mid = mido.MidiFile(ticks_per_beat=mid.ticks_per_beat)
+    meta_track = mido.MidiTrack()
+    out_mid.tracks.append(meta_track)
+
+    meta_events = _extract_preserved_meta(mid)
+    if not meta_events:
+        meta_track.append(mido.MetaMessage("set_tempo", tempo=500000, time=0))
+    else:
+        current = 0
+        for tick, msg in meta_events:
+            delta = max(0, tick - current)
+            meta_track.append(msg.copy(time=delta))
+            current = tick
+
+    for voice_idx, voice in enumerate(voices):
+        if not voice.notes:
+            continue
+
+        track = mido.MidiTrack()
+        out_mid.tracks.append(track)
+
+        events = []
+        for note in sorted(voice.notes, key=lambda n: (n.start_tick, n.end_tick, -n.pitch)):
+            start = max(0, int(note.start_tick))
+            end = max(start + 1, int(note.end_tick))
+            channel = int(note.src_channel) if 0 <= int(note.src_channel) <= 15 else int(voice_idx % 16)
+            velocity = int(note.velocity) if int(note.velocity) > 0 else 64
+            events.append((start, 1, int(note.pitch), velocity, channel))
+            events.append((end, 0, int(note.pitch), 0, channel))
+
+        events.sort(key=lambda e: (e[0], e[1], e[2]))  # note_off before note_on at same tick
+
+        current = 0
+        for tick, is_on, pitch, velocity, channel in events:
+            delta = max(0, tick - current)
+            if is_on:
+                track.append(
+                    mido.Message(
+                        "note_on", note=pitch, velocity=velocity, time=delta, channel=channel
+                    )
+                )
+            else:
+                track.append(
+                    mido.Message(
+                        "note_off", note=pitch, velocity=0, time=delta, channel=channel
+                    )
+                )
+            current = tick
+
+    out_mid.save(str(dest))
+
+
+def voice_separate_midi(
+    src: Path,
+    dest: Path,
+    max_voices: int = 16,
+    mode: str = "auto",
+    jitter_ratio: float = 0.025,
+    on_cap: str = "fail",
+    ignore_pedal: bool = True,
+) -> tuple[bool, str | None]:
+    """Separate voices using direct MIDI event assignment (no MuseScore)."""
+    if max_voices < 2:
+        return False, "max voices must be >= 2"
+    if mode not in {"auto", "fixed"}:
+        return False, f"invalid mode: {mode}"
+    if on_cap not in {"fail", "raise-cap"}:
+        return False, f"invalid on-cap policy: {on_cap}"
+    if jitter_ratio <= 0:
+        return False, "jitter ratio must be > 0"
 
     try:
-        result = subprocess.run(
-            [mscore_bin, "-o", mxml_path, str(src)],
-            capture_output=True, text=True, timeout=120,
-        )
-        if result.returncode != 0 or not Path(mxml_path).exists():
-            return False
+        import mido
+        mid = mido.MidiFile(str(src))
+    except Exception as e:
+        return False, f"parse error: {e}"
 
-        # Step 2: Read MusicXML with music21 and export as multi-track MIDI
-        import music21
-        score = music21.converter.parse(mxml_path)
+    tpqn = max(1, int(mid.ticks_per_beat))
+    jitter_ticks = max(1, int(round(tpqn * jitter_ratio)))
+    notes = _flatten_midi_notes(mid, ignore_pedal=ignore_pedal)
+    if not notes:
+        return False, "no note events"
 
-        if len(score.parts) <= 1:
-            # MuseScore didn't separate voices — not much we can do
-            Path(mxml_path).unlink(missing_ok=True)
-            return False
+    clusters = _build_onset_clusters(notes, jitter_ticks=jitter_ticks)
+    if not clusters:
+        return False, "no onset clusters"
 
-        score.write("midi", fp=str(dest))
-        return True
+    cluster_sizes = [len(cnotes) for _, cnotes in clusters]
+    if mode == "auto":
+        target_voices = max(2, min(max_voices, _p90_cluster_size(cluster_sizes)))
+    else:
+        target_voices = max_voices
+    cap = target_voices
 
-    except (subprocess.TimeoutExpired, Exception):
-        return False
-    finally:
-        Path(mxml_path).unlink(missing_ok=True)
+    voices: list[VoiceStream] = []
+
+    for canonical_onset, cluster_notes in clusters:
+        if len(cluster_notes) > cap:
+            if on_cap == "raise-cap":
+                if len(cluster_notes) > VOICE_SEP_SAFETY_MAX:
+                    return False, (
+                        f"cluster of size {len(cluster_notes)} exceeds safety cap "
+                        f"{VOICE_SEP_SAFETY_MAX}"
+                    )
+                cap = min(VOICE_SEP_SAFETY_MAX, len(cluster_notes))
+            else:
+                return False, f"cluster of size {len(cluster_notes)} exceeds voice cap {cap}"
+
+        for note in sorted(cluster_notes, key=lambda n: n.pitch, reverse=True):
+            note.assign_start_tick = canonical_onset
+            best_idx = None
+            best_cost = None
+
+            for idx, voice in enumerate(voices):
+                if note.assign_start_tick < voice.last_end_tick_effective:
+                    continue
+                cost = _assignment_cost(note, idx, voices, tpqn)
+                if best_cost is None or cost < best_cost:
+                    best_cost = cost
+                    best_idx = idx
+
+            if best_idx is None:
+                if len(voices) < cap:
+                    voices.append(VoiceStream())
+                    best_idx = len(voices) - 1
+                else:
+                    return False, f"no legal voice for note at tick {canonical_onset} under cap {cap}"
+
+            _assign_note(voices[best_idx], note)
+
+    voices = [v for v in voices if v.notes]
+    if not voices:
+        return False, "no voices inferred"
+
+    voices.sort(key=_voice_ref_pitch, reverse=True)
+    _crossing_cleanup(voices)
+
+    ok, reason = _validate_voice_assignment(voices)
+    if not ok:
+        return False, reason
+
+    try:
+        _write_separated_midi(mid, voices, dest)
+    except Exception as e:
+        return False, f"write error: {e}"
+    return True, None
 
 
-def voice_separate_all(triage_results: dict, base_dir: Path) -> int:
-    """Run MuseScore voice separation on all single-track files.
-
-    Processed files are written with a .separated.mid suffix, then re-triaged.
-    Returns count of files successfully processed.
-    """
-    mscore_bin = find_musescore()
-    if not mscore_bin:
-        print("  ERROR: MuseScore not found. Install MuseScore 4 or set mscore in PATH.")
-        return 0
-
-    print(f"  Using MuseScore: {mscore_bin}")
-
+def voice_separate_all(
+    triage_results: dict,
+    base_dir: Path,
+    max_voices: int = 16,
+    mode: str = "auto",
+    jitter_ratio: float = 0.025,
+    on_cap: str = "fail",
+    ignore_pedal: bool = True,
+) -> int:
+    """Run local voice separation on all files marked as needs_voice_sep."""
     to_process = [
         (k, v) for k, v in triage_results.items()
         if v.get("status") == "needs_voice_sep"
+        and ".separated." not in k
+        and ".reduced." not in k
+        and ".deperformed." not in k
     ]
     if not to_process:
         print("  No files need voice separation.")
         return 0
 
-    print(f"  Processing {len(to_process)} files through MuseScore...")
+    print(
+        f"  Separating {len(to_process)} files"
+        f" (mode={mode}, cap={max_voices}, jitter_ratio={jitter_ratio:.4f},"
+        f" on_cap={on_cap}, ignore_pedal={ignore_pedal})..."
+    )
     processed = 0
 
     for key, info in to_process:
@@ -682,15 +1081,23 @@ def voice_separate_all(triage_results: dict, base_dir: Path) -> int:
             continue
 
         print(f"    Processing: {src.name}...", end=" ", flush=True)
-        if voice_separate_mscore(src, dest, mscore_bin):
+        ok, reason = voice_separate_midi(
+            src=src,
+            dest=dest,
+            max_voices=max_voices,
+            mode=mode,
+            jitter_ratio=jitter_ratio,
+            on_cap=on_cap,
+            ignore_pedal=ignore_pedal,
+        )
+        if ok:
             processed += 1
-            # Re-triage the result
             result = triage_midi(dest)
             new_key = key.replace(".mid", ".separated.mid")
             triage_results[new_key] = result
             print(f"→ {result['num_tracks']} tracks, {result['status']}")
         else:
-            print("failed (MuseScore couldn't separate)")
+            print(f"failed ({reason})")
 
     return processed
 
@@ -1519,6 +1926,49 @@ def collect_training_data(
     return collected
 
 
+def purge_derived_midis(base_dir: Path, triage_results: dict) -> dict[str, int]:
+    """Delete derived MIDIs and drop derived entries from triage_results."""
+    derived_suffixes = {
+        ".separated.mid": "separated",
+        ".reduced.mid": "reduced",
+        ".deperformed.mid": "deperformed",
+    }
+    counts = {"separated": 0, "reduced": 0, "deperformed": 0, "raw_preserved": 0}
+
+    for f in base_dir.rglob("*.mid"):
+        matched = None
+        for suffix, label in derived_suffixes.items():
+            if f.name.endswith(suffix):
+                matched = label
+                break
+        if matched is None:
+            continue
+        f.unlink(missing_ok=True)
+        counts[matched] += 1
+
+    derived_keys = [
+        k for k in list(triage_results.keys())
+        if any(s in k for s in (".separated.", ".reduced.", ".deperformed."))
+    ]
+    for key in derived_keys:
+        triage_results.pop(key, None)
+
+    counts["raw_preserved"] = sum(
+        1
+        for f in base_dir.rglob("*.mid")
+        if not any(f.name.endswith(suffix) for suffix in derived_suffixes)
+    )
+
+    print(
+        "  Purge complete:"
+        f" {counts['separated']} separated,"
+        f" {counts['reduced']} reduced,"
+        f" {counts['deperformed']} deperformed deleted;"
+        f" {counts['raw_preserved']} raw preserved"
+    )
+    return counts
+
+
 def main():
     # Credentials
     user = os.environ.get("KUNSTDERFUGE_USER")
@@ -1529,8 +1979,6 @@ def main():
 
     CACHE.mkdir(parents=True, exist_ok=True)
     OUT.mkdir(parents=True, exist_ok=True)
-
-    session = get_session(user, pwd)
 
     # Parse CLI args for test mode
     max_dl = MAX_DOWNLOADS
@@ -1560,6 +2008,41 @@ def main():
 
     # Voice separation mode
     do_voice_sep = "--voice-sep" in sys.argv
+    do_voice_fix = "--voice-fix" in sys.argv
+    if do_voice_fix:
+        do_voice_sep = True
+
+    voice_sep_max_voices = 16
+    if "--voice-sep-max-voices" in sys.argv:
+        idx = sys.argv.index("--voice-sep-max-voices")
+        voice_sep_max_voices = int(sys.argv[idx + 1])
+
+    voice_sep_mode = "auto"
+    if "--voice-sep-mode" in sys.argv:
+        idx = sys.argv.index("--voice-sep-mode")
+        voice_sep_mode = sys.argv[idx + 1].strip().lower()
+    if voice_sep_mode not in {"auto", "fixed"}:
+        raise SystemExit(f"Invalid --voice-sep-mode: {voice_sep_mode} (expected auto|fixed)")
+
+    voice_sep_jitter_ratio = 0.025
+    if "--voice-sep-jitter-ratio" in sys.argv:
+        idx = sys.argv.index("--voice-sep-jitter-ratio")
+        voice_sep_jitter_ratio = float(sys.argv[idx + 1])
+    if voice_sep_jitter_ratio <= 0:
+        raise SystemExit("Invalid --voice-sep-jitter-ratio: must be > 0")
+
+    voice_sep_on_cap = "fail"
+    if "--voice-sep-on-cap" in sys.argv:
+        idx = sys.argv.index("--voice-sep-on-cap")
+        voice_sep_on_cap = sys.argv[idx + 1].strip().lower()
+    if voice_sep_on_cap not in {"fail", "raise-cap"}:
+        raise SystemExit("Invalid --voice-sep-on-cap: expected fail|raise-cap")
+
+    voice_sep_ignore_pedal = True
+    if "--no-voice-sep-ignore-pedal" in sys.argv:
+        voice_sep_ignore_pedal = False
+    if "--voice-sep-ignore-pedal" in sys.argv:
+        voice_sep_ignore_pedal = True
 
     # Deduplication modes
     do_dedup = "--dedup" in sys.argv
@@ -1571,9 +2054,12 @@ def main():
     if "--max-voices" in sys.argv:
         idx = sys.argv.index("--max-voices")
         voice_reduce_max = int(sys.argv[idx + 1])
+    if do_voice_fix:
+        do_voice_reduce = True
 
     # Collect training data mode
     do_collect = "--collect" in sys.argv
+    do_purge_derived = "--purge-derived" in sys.argv
 
     total_new = 0
     total_skip = 0
@@ -1588,6 +2074,34 @@ def main():
     # Load existing triage report
     if REPORT_FILE.exists():
         triage_results = json.loads(REPORT_FILE.read_text())
+
+    if do_purge_derived:
+        print()
+        print("=" * 60)
+        print("  PURGE DERIVED MIDIS")
+        print("=" * 60)
+        purge_derived_midis(OUT, triage_results)
+
+    purge_only = do_purge_derived and not any(
+        [
+            triage_only,
+            do_deperform,
+            do_voice_sep,
+            do_voice_reduce,
+            do_dedup,
+            do_dedup_internal,
+            do_collect,
+        ]
+    )
+    if purge_only:
+        REPORT_FILE.write_text(json.dumps(triage_results, indent=2))
+        if failed_files:
+            FAILED_FILE.write_text(json.dumps(sorted(failed_files), indent=2))
+        return
+
+    session = None
+    if not triage_only:
+        session = get_session(user, pwd)
 
     for composer_page, sub_pages, dirname, era in COMPOSERS:
         if composer_filter and dirname not in composer_filter:
@@ -1683,13 +2197,21 @@ def main():
         n_fixed = deperform_all(triage_results, OUT, grid=deperform_grid)
         print(f"  Processed {n_fixed} files")
 
-    # Voice separation via MuseScore
+    # Voice separation (local MIDI)
     if do_voice_sep:
         print()
         print("=" * 60)
-        print("  VOICE SEPARATION (MuseScore)")
+        print("  VOICE SEPARATION (local)")
         print("=" * 60)
-        n_sep = voice_separate_all(triage_results, OUT)
+        n_sep = voice_separate_all(
+            triage_results,
+            OUT,
+            max_voices=voice_sep_max_voices,
+            mode=voice_sep_mode,
+            jitter_ratio=voice_sep_jitter_ratio,
+            on_cap=voice_sep_on_cap,
+            ignore_pedal=voice_sep_ignore_pedal,
+        )
         print(f"  Successfully separated {n_sep} files")
 
     # Voice reduction (N voices → 4)
@@ -1769,9 +2291,14 @@ def main():
     print("    uv run python scripts/download_kunstderfuge.py --triage-only          # re-triage without downloading")
     print("    uv run python scripts/download_kunstderfuge.py --deperform            # quantize + strip dynamics")
     print("    uv run python scripts/download_kunstderfuge.py --deperform --grid 12  # triplet-friendly grid")
-    print("    uv run python scripts/download_kunstderfuge.py --voice-sep            # MuseScore voice separation")
+    print("    uv run python scripts/download_kunstderfuge.py --voice-sep            # local voice separation")
+    print("    uv run python scripts/download_kunstderfuge.py --voice-fix            # separate then reduce")
+    print("    uv run python scripts/download_kunstderfuge.py --voice-sep --voice-sep-max-voices 16 --voice-sep-mode auto")
+    print("    uv run python scripts/download_kunstderfuge.py --voice-sep --voice-sep-jitter-ratio 0.025 --voice-sep-on-cap fail")
+    print("    uv run python scripts/download_kunstderfuge.py --voice-sep --no-voice-sep-ignore-pedal")
     print("    uv run python scripts/download_kunstderfuge.py --voice-reduce         # reduce >4 voice files to 4")
     print("    uv run python scripts/download_kunstderfuge.py --voice-reduce --max-voices 3  # reduce to 3 voices")
+    print("    uv run python scripts/download_kunstderfuge.py --purge-derived        # delete derived .mid files only")
     print("    uv run python scripts/download_kunstderfuge.py --dedup-internal        # pick best version of same piece")
     print("    uv run python scripts/download_kunstderfuge.py --dedup                # mark duplicates from trusted datasets")
     print("    uv run python scripts/download_kunstderfuge.py --collect              # copy training-ready files to _training/")
@@ -1779,7 +2306,7 @@ def main():
     print("  [+] Clean files can go straight into prepare-data.")
     print("  [~] De-perform files are fixable (run --deperform).")
     print("  [R] Voice reduction reduces >4 voice files to 4 (run --voice-reduce).")
-    print("  [V] Voice separation via MuseScore (run --voice-sep).")
+    print("  [V] Voice separation uses local MIDI assignment (run --voice-sep).")
     print("  Dedup marks duplicates in the triage report (originals preserved).")
     print("  Collect copies the best version of each file into _training/.")
 
