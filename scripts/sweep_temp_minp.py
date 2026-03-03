@@ -6,7 +6,7 @@ This script runs a grid over ``temperature`` x ``min_p`` for one or both forms
 writes an aggregated summary ranked by a form-aware selection score.
 
 Example:
-    ./.venv/bin/python sweep_temp_minp.py \
+    ./.venv/bin/python scripts/sweep_temp_minp.py \
       --model-path models_NEW/drope_best.pt \
       --temperatures 0.8,0.9,1.0 \
       --min-ps 0.01,0.03,0.05 \

@@ -65,19 +65,33 @@ def score_contrapuntal(item: VoicePair | VoiceComposition) -> tuple[float, dict]
     details["onset_staggering"] = _score_onset_staggering(voices)
     details["voice_balance"] = _score_voice_balance(voices)
 
-    # Weighted composite — emphasis on the most discriminating metrics
+    # Weighted composite — emphasize perceived flow/clarity over raw density.
     score = (
-        details["sequential_patterns"] * 0.16
-        + details["melodic_coherence"] * 0.16
-        + details["register_consistency"] * 0.12
-        + details["voice_independence"] * 0.11
-        + details["contrary_at_cadences"] * 0.11
-        + details["rhythmic_complementarity"] * 0.08
-        + details["onset_staggering"] * 0.10
-        + details["voice_balance"] * 0.10
+        details["sequential_patterns"] * 0.08
+        + details["melodic_coherence"] * 0.18
+        + details["register_consistency"] * 0.10
+        + details["voice_independence"] * 0.13
+        + details["contrary_at_cadences"] * 0.14
+        + details["rhythmic_complementarity"] * 0.09
+        + details["onset_staggering"] * 0.15
+        + details["voice_balance"] * 0.07
         + details["stretto"] * 0.04
         + details["pedal_points"] * 0.02
     )
+
+    # Penalize safe-but-homogenized textures that can still look "correct."
+    if (
+        details["voice_independence"] < 0.72
+        and details["onset_staggering"] < 0.62
+        and details["contrary_at_cadences"] < 0.42
+    ):
+        score *= 0.82
+    elif (
+        details["voice_independence"] < 0.78
+        and details["onset_staggering"] < 0.66
+        and details["contrary_at_cadences"] < 0.46
+    ):
+        score *= 0.90
 
     # Penalize degenerate content
     all_notes = [n for v in voices for n in v]

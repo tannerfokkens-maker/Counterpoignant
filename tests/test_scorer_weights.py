@@ -54,6 +54,7 @@ def test_form_specific_weights_change_composite(monkeypatch):
     monkeypatch.setattr(scorer, "score_contrapuntal", lambda comp: (1.0, {}))
     monkeypatch.setattr(scorer, "_score_completeness", lambda comp: 1.0)
     monkeypatch.setattr(scorer, "score_thematic_recall", lambda comp, token_sequence=None, tokenizer=None: 0.0)
+    monkeypatch.setattr(scorer, "_interaction_adjustment", lambda **kwargs: (0.0, []))
 
     # Inject calibrated weights: chorale has low thematic weight, fugue has high
     monkeypatch.setattr(scorer, "_form_weights", {
@@ -76,3 +77,95 @@ def test_form_specific_weights_change_composite(monkeypatch):
     # chorale: 0.95 * 1.0 + 0.05 * 0.0 = 0.95; fugue: 0.75 * 1.0 + 0.25 * 0.0 = 0.75
     assert abs(chorale_score.composite - 0.95) < 1e-9
     assert abs(fugue_score.composite - 0.75) < 1e-9
+
+
+def test_fugue_interaction_adjustment_prefers_rhetorical_flow():
+    """Rhetorical + flowing fugue profiles should receive a positive adjustment."""
+    flat_delta, flat_flags = scorer._interaction_adjustment(
+        form="fugue",
+        voice_leading=0.938,
+        structural_details={
+            "cadence": 0.573,
+            "phrase_structure": 0.651,
+            "key_consistency": 0.783,
+        },
+        contrapuntal_details={
+            "onset_staggering": 0.755,
+            "contrary_at_cadences": 0.367,
+            "melodic_coherence": 0.907,
+            "voice_independence": 0.990,
+        },
+    )
+    rhetorical_delta, rhetorical_flags = scorer._interaction_adjustment(
+        form="fugue",
+        voice_leading=0.940,
+        structural_details={
+            "cadence": 0.720,
+            "phrase_structure": 0.905,
+            "key_consistency": 0.840,
+        },
+        contrapuntal_details={
+            "onset_staggering": 0.848,
+            "contrary_at_cadences": 0.426,
+            "melodic_coherence": 0.922,
+            "voice_independence": 0.986,
+        },
+    )
+
+    assert flat_delta < 0.0
+    assert rhetorical_delta > 0.0
+    assert rhetorical_delta > flat_delta
+    assert "fugue_clean_but_flat" in flat_flags
+    assert "fugue_strong_rhetorical_shape" in rhetorical_flags
+
+
+def test_interaction_adjustment_non_fugue_is_neutral():
+    """Interaction adjustment remains neutral for forms without a profile."""
+    delta, flags = scorer._interaction_adjustment(
+        form="chorale",
+        voice_leading=1.0,
+        structural_details={},
+        contrapuntal_details={},
+    )
+    assert delta == 0.0
+    assert flags == []
+
+
+def test_invention_interaction_adjustment_prefers_rhetorical_flow():
+    """Invention mode should use the same convincing-vs-correct interaction logic."""
+    flat_delta, flat_flags = scorer._interaction_adjustment(
+        form="invention",
+        voice_leading=0.900,
+        structural_details={
+            "cadence": 0.560,
+            "phrase_structure": 0.630,
+            "key_consistency": 0.760,
+        },
+        contrapuntal_details={
+            "onset_staggering": 0.700,
+            "contrary_at_cadences": 0.340,
+            "melodic_coherence": 0.890,
+            "voice_independence": 0.910,
+        },
+    )
+    rhetorical_delta, rhetorical_flags = scorer._interaction_adjustment(
+        form="invention",
+        voice_leading=0.905,
+        structural_details={
+            "cadence": 0.700,
+            "phrase_structure": 0.820,
+            "key_consistency": 0.810,
+        },
+        contrapuntal_details={
+            "onset_staggering": 0.760,
+            "contrary_at_cadences": 0.390,
+            "melodic_coherence": 0.900,
+            "voice_independence": 0.920,
+        },
+    )
+
+    assert flat_delta < 0.0
+    assert rhetorical_delta > 0.0
+    assert rhetorical_delta > flat_delta
+    assert "invention_clean_but_flat" in flat_flags
+    assert "invention_strong_rhetorical_shape" in rhetorical_flags

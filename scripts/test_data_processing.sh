@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Usage:
-#   ./test_data_processing.sh [midi_dir] [out_dir]
+#   ./scripts/test_data_processing.sh [midi_dir] [out_dir]
 # Defaults:
 #   midi_dir: /Users/tfokkens/Documents/Claude/2pt-bach/data/midi
 #   out_dir : ./tmp/data_processing_test_YYYYmmdd_HHMMSS

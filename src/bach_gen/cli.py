@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
@@ -1462,7 +1463,37 @@ def generate(
 @click.argument("midi_file", type=click.Path(exists=True))
 @click.option("--mode", "-m", type=click.Choice(VALID_FORMS), default=None,
               help="Composition mode (auto-detected from voice count if not set)")
-def evaluate(midi_file: str, mode: str | None) -> None:
+@click.option("--render-audio/--no-render-audio", default=False,
+              help="Render a WAV file from the MIDI using FluidSynth.")
+@click.option("--soundfont", type=click.Path(exists=True, dir_okay=False), default=None,
+              help="Path to .sf2/.sf3 soundfont (defaults to auto-detect; prefers Jeux14).")
+@click.option("--audio-out", type=click.Path(dir_okay=False), default=None,
+              help="Output WAV path (default: <midi_stem>.organ.wav).")
+@click.option("--record-speed", type=float, default=0.75, show_default=True,
+              help="Tempo scale applied to MIDI before synthesis (0.75 = 75% speed).")
+@click.option("--reverb-mix", type=float, default=0.18, show_default=True,
+              help="Reverb amount in [0, 1].")
+@click.option("--stereo-width", type=float, default=1.20, show_default=True,
+              help="Stereo width scalar (1.0 = neutral).")
+@click.option("--spatialize-voices/--no-spatialize-voices", default=True, show_default=True,
+              help="Apply deterministic per-voice panning (higher voices to the right).")
+@click.option("--swap-stereo/--no-swap-stereo", default=False, show_default=True,
+              help="Swap left/right channels in rendered audio.")
+@click.option("--sample-rate", type=int, default=48000, show_default=True,
+              help="Rendered WAV sample rate.")
+def evaluate(
+    midi_file: str,
+    mode: str | None,
+    render_audio: bool,
+    soundfont: str | None,
+    audio_out: str | None,
+    record_speed: float,
+    reverb_mix: float,
+    stereo_width: float,
+    spatialize_voices: bool,
+    swap_stereo: bool,
+    sample_rate: int,
+) -> None:
     """Evaluate a MIDI file for Bach-style quality."""
     from bach_gen.utils.midi_io import load_midi, midi_to_note_events
     from bach_gen.data.extraction import VoiceComposition
@@ -1581,6 +1612,45 @@ def evaluate(midi_file: str, mode: str | None) -> None:
                         console.print(f"    {k}: {v:.4f}")
                     else:
                         console.print(f"    {k}: {v}")
+
+    if not render_audio:
+        return
+
+    midi_path = Path(midi_file)
+    sf_path = _resolve_soundfont(soundfont)
+    if sf_path is None:
+        console.print("[red]No usable soundfont found for rendering.[/red]")
+        console.print("Provide one with [bold]--soundfont /path/to/file.sf2[/bold]")
+        console.print("or install a system GM soundfont for FluidSynth.")
+        sys.exit(1)
+
+    out_path = Path(audio_out) if audio_out else midi_path.with_suffix(".organ.wav")
+    console.print(f"\n[bold]Rendering audio:[/bold] {midi_path.name}")
+    console.print(f"  Soundfont: {sf_path}")
+    console.print(
+        f"  Render options: speed={record_speed:.2f}, "
+        f"reverb_mix={reverb_mix:.2f}, stereo_width={stereo_width:.2f}, "
+        f"spatialize_voices={'yes' if spatialize_voices else 'no'}, "
+        f"swap_stereo={'yes' if swap_stereo else 'no'}"
+    )
+
+    try:
+        rendered = _render_midi_to_wav(
+            midi_path=midi_path,
+            wav_path=out_path,
+            soundfont=sf_path,
+            speed=record_speed,
+            reverb_mix=reverb_mix,
+            stereo_width=stereo_width,
+            spatialize_voices=spatialize_voices,
+            swap_stereo=swap_stereo,
+            sample_rate=sample_rate,
+        )
+    except Exception as exc:
+        console.print(f"[red]Audio render failed:[/red] {exc}")
+        sys.exit(1)
+
+    console.print(f"[green]Rendered audio:[/green] {rendered}")
 
 
 @cli.command()
@@ -1919,9 +1989,11 @@ def calibrate(sample_size: int) -> None:
 def calibrate_forms(sample_size: int) -> None:
     """Calibrate scorer weights per form (chorale, fugue, invention, etc.).
 
-    Groups training sequences by their FORM conditioning token, runs
-    Bach-vs-shuffled calibration per form, then derives optimal weights
-    proportional to each dimension's discrimination power within that form.
+    Groups training sequences by FORM conditioning token and computes
+    per-dimension discrimination against multiple degenerate baselines
+    (shuffled, random, repetitive). Then blends data-driven weights with
+    small form priors so recalibration stays aligned with listener-facing
+    quality (especially for fugue rhetoric and texture flow).
     """
     import random as rng
     import numpy as np
@@ -1973,11 +2045,152 @@ def calibrate_forms(sample_size: int) -> None:
     if unclassified:
         console.print(f"  (unclassified): {len(unclassified)}")
 
-    dims = ["voice_leading", "statistical", "structural", "contrapuntal",
-            "completeness", "thematic_recall"]
+    dims = [
+        "voice_leading",
+        "statistical",
+        "structural",
+        "contrapuntal",
+        "completeness",
+        "thematic_recall",
+    ]
+    baseline_mix = {
+        "shuffled": 0.45,
+        "random": 0.35,
+        "repetitive": 0.20,
+    }
+    # Soft priors: still data-driven, but prevents domination by any single metric.
+    form_priors: dict[str, dict[str, float]] = {
+        "fugue": {
+            "voice_leading": 0.18,
+            "statistical": 0.08,
+            "structural": 0.24,
+            "contrapuntal": 0.24,
+            "completeness": 0.06,
+            "thematic_recall": 0.20,
+        },
+        "invention": {
+            "voice_leading": 0.21,
+            "statistical": 0.10,
+            "structural": 0.23,
+            "contrapuntal": 0.23,
+            "completeness": 0.07,
+            "thematic_recall": 0.16,
+        },
+        "sinfonia": {
+            "voice_leading": 0.20,
+            "statistical": 0.10,
+            "structural": 0.23,
+            "contrapuntal": 0.23,
+            "completeness": 0.07,
+            "thematic_recall": 0.17,
+        },
+    }
+    prior_mix_by_form = {
+        "fugue": 0.45,
+        "invention": 0.30,
+        "sinfonia": 0.30,
+    }
 
     all_form_weights: dict[str, dict[str, float]] = {}
     all_form_results: dict[str, dict] = {}
+
+    def _normalize(raw: dict[str, float]) -> dict[str, float]:
+        positive = {k: max(0.0, float(v)) for k, v in raw.items()}
+        total = sum(positive.values())
+        if total <= 1e-9:
+            uniform = 1.0 / max(1, len(positive))
+            return {k: uniform for k in positive}
+        return {k: positive[k] / total for k in positive}
+
+    def _shift_weight(
+        weights: dict[str, float],
+        *,
+        from_dim: str,
+        to_dims: list[tuple[str, float]],
+        amount: float,
+    ) -> None:
+        """Move weight from one dimension to one or more target dimensions."""
+        if amount <= 0:
+            return
+        take = min(amount, max(0.0, weights.get(from_dim, 0.0)))
+        if take <= 0:
+            return
+        weights[from_dim] = weights.get(from_dim, 0.0) - take
+        mix_total = sum(max(0.0, r) for _, r in to_dims)
+        if mix_total <= 0:
+            return
+        for dim, ratio in to_dims:
+            if ratio <= 0:
+                continue
+            weights[dim] = weights.get(dim, 0.0) + take * (ratio / mix_total)
+
+    def _apply_form_constraints(form_name: str, weights: dict[str, float]) -> dict[str, float]:
+        """Apply small form-specific limits so calibration remains musically aligned."""
+        w = dict(weights)
+        form_constraints: dict[str, dict[str, object]] = {
+            "fugue": {
+                "thematic_cap": 0.30,
+                "thematic_shift_mix": [("structural", 0.65), ("contrapuntal", 0.35)],
+                "structural_floor": 0.14,
+                "donor_floors": [("thematic_recall", 0.16), ("voice_leading", 0.14), ("statistical", 0.05)],
+            },
+            "invention": {
+                "thematic_cap": 0.26,
+                "thematic_shift_mix": [("structural", 0.60), ("contrapuntal", 0.40)],
+                "structural_floor": 0.16,
+                "donor_floors": [("thematic_recall", 0.13), ("voice_leading", 0.14), ("statistical", 0.06)],
+            },
+            "sinfonia": {
+                "thematic_cap": 0.27,
+                "thematic_shift_mix": [("structural", 0.58), ("contrapuntal", 0.42)],
+                "structural_floor": 0.16,
+                "donor_floors": [("thematic_recall", 0.14), ("voice_leading", 0.14), ("statistical", 0.06)],
+            },
+        }
+
+        cfg = form_constraints.get(form_name)
+        if cfg:
+            thematic_cap = float(cfg["thematic_cap"])
+            # Do not let thematic recall dominate near-tied candidates.
+            if w.get("thematic_recall", 0.0) > thematic_cap:
+                excess = w["thematic_recall"] - thematic_cap
+                _shift_weight(
+                    w,
+                    from_dim="thematic_recall",
+                    to_dims=cfg["thematic_shift_mix"],  # type: ignore[arg-type]
+                    amount=excess,
+                )
+
+            # Keep structural perception meaningful after recalibration.
+            structural_floor = float(cfg["structural_floor"])
+            if w.get("structural", 0.0) < structural_floor:
+                needed = structural_floor - w["structural"]
+                # Pull mostly from dimensions that can over-dominate rankings.
+                for donor, donor_floor in cfg["donor_floors"]:  # type: ignore[assignment]
+                    if needed <= 1e-9:
+                        break
+                    available = max(0.0, w.get(donor, 0.0) - donor_floor)
+                    moved = min(available, needed)
+                    if moved > 0:
+                        w[donor] -= moved
+                        w["structural"] += moved
+                        needed -= moved
+
+        return _normalize(w)
+
+    def _blend_with_prior(form_name: str, data_weights: dict[str, float]) -> dict[str, float]:
+        prior = form_priors.get(form_name)
+        if not prior:
+            return data_weights
+        prior_mix = float(prior_mix_by_form.get(form_name, 0.0))
+        prior_mix = max(0.0, min(0.90, prior_mix))
+        blended = {}
+        for dim in dims:
+            blended[dim] = (
+                (1.0 - prior_mix) * data_weights.get(dim, 0.0)
+                + prior_mix * prior.get(dim, data_weights.get(dim, 0.0))
+            )
+        return _normalize(blended)
 
     for form_name, form_seqs in sorted(form_groups.items(), key=lambda x: -len(x[1])):
         n = min(sample_size, len(form_seqs))
@@ -1990,7 +2203,7 @@ def calibrate_forms(sample_size: int) -> None:
         console.print(f"[bold]{form_name.upper()} ({n} sequences)[/bold]")
         console.print('=' * 60)
 
-        # Score real Bach
+        # Score real Bach and baseline perturbations.
         corpus_breakdowns = []
         for seq in sample:
             try:
@@ -2006,33 +2219,77 @@ def calibrate_forms(sample_size: int) -> None:
             except Exception:
                 pass
 
-        # Score shuffled
+        def _build_shuffled(comp: VoiceComposition) -> VoiceComposition:
+            shuffled_voices = []
+            for voice in comp.voices:
+                if not voice:
+                    shuffled_voices.append(voice)
+                    continue
+                pitches = [n_[2] for n_ in voice]
+                rng.shuffle(pitches)
+                shuffled_voices.append([(n_[0], n_[1], p) for n_, p in zip(voice, pitches)])
+            return VoiceComposition(
+                voices=shuffled_voices,
+                key_root=comp.key_root,
+                key_mode=comp.key_mode,
+                source="shuffled",
+            )
+
+        def _build_random(comp: VoiceComposition) -> VoiceComposition:
+            rand_voices = []
+            for voice in comp.voices:
+                if not voice:
+                    rand_voices.append(voice)
+                    continue
+                pitches = [n_[2] for n_ in voice]
+                lo = min(pitches) if pitches else 48
+                hi = max(pitches) if pitches else 72
+                rand_voices.append([(n_[0], n_[1], rng.randint(lo, hi)) for n_ in voice])
+            return VoiceComposition(
+                voices=rand_voices,
+                key_root=comp.key_root,
+                key_mode=comp.key_mode,
+                source="random",
+            )
+
+        def _build_repetitive(comp: VoiceComposition) -> VoiceComposition:
+            rep_voices = []
+            base_pitches = [60, 55, 48, 43]
+            for i, voice in enumerate(comp.voices):
+                if not voice:
+                    rep_voices.append(voice)
+                    continue
+                pitch = base_pitches[i % len(base_pitches)]
+                rep_voices.append([(n_[0], n_[1], pitch) for n_ in voice])
+            return VoiceComposition(
+                voices=rep_voices,
+                key_root=comp.key_root,
+                key_mode=comp.key_mode,
+                source="repetitive",
+            )
+
         shuffled_breakdowns = []
+        random_breakdowns = []
+        repetitive_breakdowns = []
         for seq in sample:
             try:
                 comp = tokenizer.decode(seq)
-                shuffled_voices = []
-                for voice in comp.voices:
-                    if not voice:
-                        shuffled_voices.append(voice)
-                        continue
-                    pitches = [n_[2] for n_ in voice]
-                    rng.shuffle(pitches)
-                    shuffled_voices.append([(n_[0], n_[1], p) for n_, p in zip(voice, pitches)])
-                shuffled_comp = VoiceComposition(
-                    voices=shuffled_voices,
-                    key_root=comp.key_root,
-                    key_mode=comp.key_mode,
-                    source="shuffled",
-                )
-                tokens = tokenizer.encode(shuffled_comp, form=form_name)
-                sb = score_composition(
-                    shuffled_comp,
-                    token_sequence=tokens,
-                    vocab_size=tokenizer.vocab_size,
-                    form=form_name,
-                )
-                shuffled_breakdowns.append(sb)
+                for bucket, variant in [
+                    (shuffled_breakdowns, _build_shuffled(comp)),
+                    (random_breakdowns, _build_random(comp)),
+                    (repetitive_breakdowns, _build_repetitive(comp)),
+                ]:
+                    try:
+                        tokens = tokenizer.encode(variant, form=form_name)
+                        sb = score_composition(
+                            variant,
+                            token_sequence=tokens,
+                            vocab_size=tokenizer.vocab_size,
+                            form=form_name,
+                        )
+                        bucket.append(sb)
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
@@ -2040,63 +2297,95 @@ def calibrate_forms(sample_size: int) -> None:
             console.print(f"  [red]Scoring failed for {form_name}[/red]")
             continue
 
-        # Compute discrimination gaps per dimension
-        gaps = {}
+        # Compute discrimination signals per dimension.
+        signals = {}
         form_result = {}
         dim_table = Table(title=f"{form_name} — Per-Dimension Discrimination")
         dim_table.add_column("Dimension", style="bold")
         dim_table.add_column("Bach Mean", justify="right")
         dim_table.add_column("Shuffled Mean", justify="right")
-        dim_table.add_column("Gap", justify="right")
+        dim_table.add_column("Random Mean", justify="right")
+        dim_table.add_column("Repetitive Mean", justify="right")
+        dim_table.add_column("Signal", justify="right")
         dim_table.add_column("Discriminates?", justify="center")
 
         for dim in dims:
             bach_vals = [getattr(b, dim) for b in corpus_breakdowns]
             shuf_vals = [getattr(b, dim) for b in shuffled_breakdowns]
+            rand_vals = [getattr(b, dim) for b in random_breakdowns]
+            rep_vals = [getattr(b, dim) for b in repetitive_breakdowns]
             bach_mean = float(np.mean(bach_vals))
             shuf_mean = float(np.mean(shuf_vals))
-            gap = bach_mean - shuf_mean
-            gaps[dim] = max(gap, 0.001)  # floor at tiny positive to avoid zero weights
+            rand_mean = float(np.mean(rand_vals)) if rand_vals else 0.0
+            rep_mean = float(np.mean(rep_vals)) if rep_vals else 0.0
+            gap_shuf = bach_mean - shuf_mean
+            gap_rand = bach_mean - rand_mean
+            gap_rep = bach_mean - rep_mean
+            # Multi-baseline signal with square-root compression to avoid domination.
+            signal_raw = (
+                max(0.0, gap_shuf) * baseline_mix["shuffled"]
+                + max(0.0, gap_rand) * baseline_mix["random"]
+                + max(0.0, gap_rep) * baseline_mix["repetitive"]
+            )
+            signal = max(0.001, float(np.sqrt(signal_raw)))
+            signals[dim] = signal
 
             form_result[dim] = {
                 "bach_mean": bach_mean,
                 "shuffled_mean": shuf_mean,
-                "gap": gap,
+                "random_mean": rand_mean,
+                "repetitive_mean": rep_mean,
+                "gap_shuffled": gap_shuf,
+                "gap_random": gap_rand,
+                "gap_repetitive": gap_rep,
+                "signal_raw": signal_raw,
+                "signal": signal,
             }
 
-            if gap > 0.15:
+            if signal_raw > 0.15:
                 quality = "[bold green]Excellent[/bold green]"
-            elif gap > 0.08:
+            elif signal_raw > 0.08:
                 quality = "[green]Good[/green]"
-            elif gap > 0.03:
+            elif signal_raw > 0.03:
                 quality = "[yellow]Weak[/yellow]"
             else:
                 quality = "[red]Dead weight[/red]"
 
-            dim_table.add_row(dim, f"{bach_mean:.3f}", f"{shuf_mean:.3f}",
-                              f"{gap:.3f}", quality)
+            dim_table.add_row(
+                dim,
+                f"{bach_mean:.3f}",
+                f"{shuf_mean:.3f}",
+                f"{rand_mean:.3f}",
+                f"{rep_mean:.3f}",
+                f"{signal:.3f}",
+                quality,
+            )
 
         console.print(dim_table)
 
-        # Derive weights proportional to discrimination gap
-        total_gap = sum(gaps.values())
-        weights = {dim: gaps[dim] / total_gap for dim in dims}
+        # Derive data-driven weights, then blend with lightweight form prior.
+        data_weights = _normalize(signals)
+        weights = _blend_with_prior(form_name, data_weights)
+        weights = _apply_form_constraints(form_name, weights)
 
         # Display suggested weights
         weight_table = Table(title=f"{form_name} — Suggested Weights")
         weight_table.add_column("Dimension", style="bold")
         weight_table.add_column("Current", justify="right")
+        weight_table.add_column("Data-only", justify="right")
         weight_table.add_column("Suggested", justify="right")
         weight_table.add_column("Change", justify="right")
 
         for dim in sorted(dims, key=lambda d: -weights[d]):
             current = DEFAULT_WEIGHTS.get(dim, 0.0)
+            data_only = data_weights[dim]
             suggested = weights[dim]
             delta = suggested - current
             sign = "+" if delta > 0 else ""
             weight_table.add_row(
                 dim,
                 f"{current:.3f}",
+                f"{data_only:.3f}",
                 f"[bold]{suggested:.3f}[/bold]",
                 f"{sign}{delta:.3f}",
             )
@@ -2131,6 +2420,12 @@ def calibrate_forms(sample_size: int) -> None:
     output = {
         "weights_by_form": all_form_weights,
         "discrimination_by_form": all_form_results,
+        "meta": {
+            "calibration_method": "multi_baseline_signal_plus_perceptual_prior_v2",
+            "baseline_mix": baseline_mix,
+            "prior_mix_by_form": prior_mix_by_form,
+            "form_priors": form_priors,
+        },
     }
     with open(cal_path, "w") as f:
         json.dump(output, f, indent=2)
@@ -2146,13 +2441,254 @@ def calibrate_forms(sample_size: int) -> None:
     console.print("}")
 
 
+def _resolve_soundfont(explicit_path: str | None = None) -> Path | None:
+    """Resolve a soundfont path, preferring explicit and Jeux14 defaults."""
+    candidates: list[Path] = []
+
+    if explicit_path:
+        candidates.append(Path(explicit_path))
+
+    env_sf = os.environ.get("BACH_GEN_SOUNDFONT")
+    if env_sf:
+        candidates.append(Path(env_sf))
+
+    # Preferred local organ soundfont.
+    candidates.append(Path("/Users/tannerfokkens/Downloads/jeux14/Jeux14.SF2"))
+
+    # Common system locations.
+    candidates.extend([
+        Path("/usr/share/sounds/sf2/FluidR3_GM.sf2"),
+        Path("/usr/share/soundfonts/FluidR3_GM.sf2"),
+        Path("/usr/local/share/fluidsynth/FluidR3_GM.sf2"),
+        Path("/opt/homebrew/share/fluidsynth/FluidR3_GM.sf2"),
+        Path("/usr/share/sounds/sf2/default-GM.sf2"),
+    ])
+
+    # Homebrew Cellar fallback.
+    cellar_sf2_dir = Path("/opt/homebrew/Cellar/fluid-synth")
+    if cellar_sf2_dir.exists():
+        try:
+            for sf in sorted(cellar_sf2_dir.rglob("*.sf2")):
+                if sf.is_file():
+                    candidates.append(sf)
+        except Exception:
+            pass
+
+    seen: set[Path] = set()
+    for cand in candidates:
+        cand = cand.expanduser()
+        if cand in seen:
+            continue
+        seen.add(cand)
+        if cand.exists() and cand.is_file():
+            return cand
+    return None
+
+
+def _prepare_tempo_scaled_midi(
+    midi_path: Path,
+    out_path: Path,
+    speed: float,
+    spatialize_voices: bool = True,
+) -> Path:
+    """Write a MIDI with scaled tempo map (no audio time-stretching)."""
+    import mido
+    import shutil
+
+    if speed <= 0:
+        raise ValueError("record speed must be > 0")
+
+    if abs(speed - 1.0) < 1e-6 and not spatialize_voices:
+        shutil.copy2(midi_path, out_path)
+        return out_path
+
+    mid = mido.MidiFile(str(midi_path))
+    found_tempo = False
+    for track_idx, track in enumerate(mid.tracks):
+        for msg_idx, msg in enumerate(track):
+            if msg.type != "set_tempo":
+                continue
+            found_tempo = True
+            new_tempo = max(1, int(round(msg.tempo / speed)))
+            if new_tempo != msg.tempo:
+                mid.tracks[track_idx][msg_idx] = msg.copy(tempo=new_tempo)
+
+    if not found_tempo:
+        tempo_msg = mido.MetaMessage(
+            "set_tempo",
+            tempo=max(1, int(round(500000 / speed))),
+            time=0,
+        )
+        if mid.tracks:
+            mid.tracks[0].insert(0, tempo_msg)
+        else:
+            new_track = mido.MidiTrack()
+            new_track.append(tempo_msg)
+            mid.tracks.append(new_track)
+
+    if spatialize_voices:
+        # Compute average pitch per MIDI channel to map higher voices to the right.
+        pitch_stats: dict[int, tuple[int, int]] = {}
+        for track in mid.tracks:
+            for msg in track:
+                if msg.type == "note_on" and getattr(msg, "velocity", 0) > 0:
+                    ch = getattr(msg, "channel", None)
+                    if ch is None:
+                        continue
+                    total, count = pitch_stats.get(ch, (0, 0))
+                    pitch_stats[ch] = (total + int(msg.note), count + 1)
+
+        if pitch_stats:
+            channel_order = sorted(
+                pitch_stats.keys(),
+                key=lambda ch: (pitch_stats[ch][0] / max(1, pitch_stats[ch][1])),
+                reverse=True,  # highest average pitch first
+            )
+
+            # Pan range: right-biased highs, left-biased lows.
+            # MIDI pan: 0=left, 64=center, 127=right.
+            n = len(channel_order)
+            if n == 1:
+                pan_map = {channel_order[0]: 64}
+            else:
+                right = 104
+                left = 24
+                step = (right - left) / (n - 1)
+                pan_map = {
+                    ch: int(round(right - i * step))
+                    for i, ch in enumerate(channel_order)
+                }
+
+            assigned_channels: set[int] = set()
+            for track in mid.tracks:
+                track_channels = sorted({msg.channel for msg in track if hasattr(msg, "channel")})
+                for ch in track_channels:
+                    if ch in assigned_channels or ch not in pan_map:
+                        continue
+                    track.insert(
+                        0,
+                        mido.Message("control_change", channel=ch, control=10, value=pan_map[ch], time=0),
+                    )
+                    assigned_channels.add(ch)
+
+    mid.save(str(out_path))
+    return out_path
+
+
+def _render_midi_to_wav(
+    midi_path: Path,
+    wav_path: Path,
+    soundfont: Path,
+    speed: float = 0.75,
+    reverb_mix: float = 0.18,
+    stereo_width: float = 1.20,
+    spatialize_voices: bool = True,
+    swap_stereo: bool = False,
+    sample_rate: int = 48000,
+) -> Path:
+    """Render MIDI to WAV via FluidSynth + FFmpeg post-processing."""
+    import shutil
+    import subprocess
+
+    if shutil.which("fluidsynth") is None:
+        raise RuntimeError("fluidsynth is required for audio rendering.")
+
+    wav_path = wav_path.expanduser()
+    wav_path.parent.mkdir(parents=True, exist_ok=True)
+    raw_wav = wav_path.with_name(f"{wav_path.stem}.raw.wav")
+    scaled_midi = wav_path.with_name(f"{wav_path.stem}.speed.mid")
+
+    render_midi = midi_path
+    if abs(speed - 1.0) > 1e-6:
+        render_midi = _prepare_tempo_scaled_midi(
+            midi_path, scaled_midi, speed, spatialize_voices=spatialize_voices,
+        )
+    elif spatialize_voices:
+        render_midi = _prepare_tempo_scaled_midi(
+            midi_path, scaled_midi, 1.0, spatialize_voices=True,
+        )
+
+    synth_cmd = [
+        "fluidsynth",
+        "-ni",
+        "-F",
+        str(raw_wav),
+        "-r",
+        str(sample_rate),
+        "-g",
+        "0.9",
+        str(soundfont),
+        str(render_midi),
+    ]
+    subprocess.run(synth_cmd, check=True)
+    if not raw_wav.exists():
+        raise RuntimeError(
+            f"FluidSynth did not produce output file: {raw_wav}. "
+            "Check output path permissions and soundfont validity."
+        )
+
+    try:
+        if shutil.which("ffmpeg") is None:
+            if reverb_mix > 0 or abs(stereo_width - 1.0) > 1e-6:
+                raise RuntimeError(
+                    "ffmpeg is required for reverb/stereo processing. "
+                    "Install ffmpeg or render with reverb_mix=0 and stereo_width=1.0."
+                )
+            raw_wav.replace(wav_path)
+            return wav_path
+
+        mix = max(0.0, min(1.0, float(reverb_mix)))
+        width = max(0.25, min(2.0, float(stereo_width)))
+
+        filters: list[str] = []
+        if mix > 0:
+            wet_1 = 0.16 * mix
+            wet_2 = 0.08 * mix
+            filters.append(f"aecho=0.8:0.88:45|90:{wet_1:.4f}|{wet_2:.4f}")
+        if abs(width - 1.0) > 1e-6:
+            filters.append(f"stereotools=mlev=1.0:slev={width:.4f}")
+        if swap_stereo:
+            filters.append("pan=stereo|c0=c1|c1=c0")
+
+        ffmpeg_cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(raw_wav),
+        ]
+        if filters:
+            ffmpeg_cmd += ["-af", ",".join(filters)]
+        ffmpeg_cmd += [
+            "-ac",
+            "2",
+            "-ar",
+            str(sample_rate),
+            str(wav_path),
+        ]
+        subprocess.run(ffmpeg_cmd, check=True)
+        return wav_path
+    finally:
+        if raw_wav.exists():
+            raw_wav.unlink(missing_ok=True)
+        if scaled_midi.exists():
+            scaled_midi.unlink(missing_ok=True)
+
+
 @cli.command()
 @click.argument("midi_files", nargs=-1, type=click.Path(exists=True))
 @click.option("--output-dir", "-d", default="output", type=click.Path(),
               help="Directory to scan for MIDI files (if no files given)")
 @click.option("--tempo", default=120, type=int, help="Playback tempo in BPM")
+@click.option("--soundfont", type=click.Path(exists=True, dir_okay=False), default=None,
+              help="Path to .sf2/.sf3 soundfont (defaults to auto-detect; prefers Jeux14).")
 @click.option("--list", "list_only", is_flag=True, help="List available MIDI files without playing")
-def play(midi_files: tuple[str, ...], output_dir: str, tempo: int, list_only: bool) -> None:
+def play(
+    midi_files: tuple[str, ...],
+    output_dir: str,
+    tempo: int,
+    soundfont: str | None,
+    list_only: bool,
+) -> None:
     """Play MIDI files for quick audition.
 
     If MIDI_FILES are given, plays them in order.
@@ -2196,33 +2732,10 @@ def play(midi_files: tuple[str, ...], output_dir: str, tempo: int, list_only: bo
 
     if shutil.which("fluidsynth"):
         player = "fluidsynth"
-        # Try to find a soundfont
-        sf_paths = [
-            "/usr/share/sounds/sf2/FluidR3_GM.sf2",
-            "/usr/share/soundfonts/FluidR3_GM.sf2",
-            "/usr/local/share/fluidsynth/FluidR3_GM.sf2",
-            "/opt/homebrew/share/fluidsynth/FluidR3_GM.sf2",
-            "/usr/share/sounds/sf2/default-GM.sf2",
-        ]
-        # Also check Homebrew Cellar for any .sf2 files
-        try:
-            cellar_sf2_dir = Path("/opt/homebrew/Cellar/fluid-synth")
-            if cellar_sf2_dir.exists():
-                for sf in cellar_sf2_dir.rglob("*.sf2"):
-                    # Skip symlinks with special chars, use the real file
-                    if sf.is_file() and not sf.is_symlink():
-                        sf_paths.insert(0, str(sf))
-        except Exception:
-            pass
-
-        soundfont = None
-        for sf in sf_paths:
-            if Path(sf).exists():
-                soundfont = sf
-                break
-
-        if soundfont:
-            player_args = ["fluidsynth", "-ni", soundfont]
+        sf_path = _resolve_soundfont(soundfont)
+        if sf_path:
+            player_args = ["fluidsynth", "-ni", str(sf_path)]
+            console.print(f"  Soundfont: {sf_path}")
         else:
             console.print("[yellow]FluidSynth found but no soundfont detected.[/yellow]")
             console.print("  Install one: brew install fluid-synth && brew install soundfont-fluid")

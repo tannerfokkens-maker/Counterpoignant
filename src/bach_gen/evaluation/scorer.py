@@ -53,13 +53,14 @@ class ScoreBreakdown:
 
 
 # Default weights (used when no calibration data is available)
+# Favor perceptual structure and flow over single-axis "cleanliness."
 DEFAULT_WEIGHTS = {
-    "thematic_recall": 0.30,
-    "voice_leading": 0.22,
-    "contrapuntal": 0.18,
-    "structural": 0.15,
-    "statistical": 0.10,
+    "voice_leading": 0.20,
+    "statistical": 0.09,
+    "structural": 0.22,
+    "contrapuntal": 0.20,
     "completeness": 0.05,
+    "thematic_recall": 0.24,
 }
 
 # Calibrated per-form weights (populated by load_form_weights)
@@ -185,12 +186,25 @@ def score_composition(
         contrapuntal_details=cp_details,
         completeness=comp_score,
     )
-    composite = raw_composite * guardrail_mult
+    guarded_composite = raw_composite * guardrail_mult
+    interaction_delta, interaction_flags = _interaction_adjustment(
+        form=form,
+        voice_leading=vl_score,
+        structural_details=struct_details,
+        contrapuntal_details=cp_details,
+    )
+    composite = max(0.0, min(1.0, guarded_composite + interaction_delta))
     if guardrail_flags:
         all_details["guardrails"] = {
             "multiplier": guardrail_mult,
             "flags": guardrail_flags,
             "raw_composite": raw_composite,
+        }
+    if interaction_flags:
+        all_details["interactions"] = {
+            "delta": interaction_delta,
+            "flags": interaction_flags,
+            "pre_interaction_composite": guarded_composite,
         }
 
     return ScoreBreakdown(
@@ -259,6 +273,117 @@ def _guardrail_multiplier(
             flags.append("fugue_incomplete_form")
 
     return max(0.0, min(1.0, mult)), flags
+
+
+def _interaction_adjustment(
+    *,
+    form: str | None,
+    voice_leading: float,
+    structural_details: dict,
+    contrapuntal_details: dict,
+) -> tuple[float, list[str]]:
+    """Compute small additive interaction adjustments for form-specific quality."""
+    if form is None:
+        return 0.0, []
+
+    profiles: dict[str, dict[str, object]] = {
+        "fugue": {
+            "tag": "fugue",
+            "rhetoric": (0.62, 0.74, 0.74, 0.008, "fugue_rhetorical_shape"),
+            "rhetoric_strong": (0.70, 0.84, 0.80, 0.010, "fugue_strong_rhetorical_shape"),
+            "flow": (0.78, 0.40, 0.88, 0.006, "fugue_flowing_texture"),
+            "clean_flat": (0.90, 0.66, 0.40, -0.012, "fugue_clean_but_flat"),
+            "safe_homog": (0.92, 0.78, 0.66, 0.44, -0.018, "fugue_safe_homogenized_texture"),
+            "bound": 0.04,
+        },
+        "sinfonia": {
+            "tag": "sinfonia",
+            "rhetoric": (0.58, 0.70, 0.72, 0.006, "sinfonia_rhetorical_shape"),
+            "rhetoric_strong": (0.66, 0.80, 0.78, 0.008, "sinfonia_strong_rhetorical_shape"),
+            "flow": (0.74, 0.38, 0.86, 0.005, "sinfonia_flowing_texture"),
+            "clean_flat": (0.89, 0.64, 0.38, -0.010, "sinfonia_clean_but_flat"),
+            "safe_homog": (0.91, 0.76, 0.64, 0.42, -0.014, "sinfonia_safe_homogenized_texture"),
+            "bound": 0.035,
+        },
+        "invention": {
+            "tag": "invention",
+            "rhetoric": (0.55, 0.68, 0.70, 0.006, "invention_rhetorical_shape"),
+            "rhetoric_strong": (0.63, 0.78, 0.76, 0.008, "invention_strong_rhetorical_shape"),
+            "flow": (0.70, 0.36, 0.85, 0.004, "invention_flowing_texture"),
+            "clean_flat": (0.88, 0.62, 0.36, -0.010, "invention_clean_but_flat"),
+            "safe_homog": (0.90, 0.74, 0.62, 0.40, -0.014, "invention_safe_homogenized_texture"),
+            "bound": 0.035,
+        },
+        # Apply invention profile to legacy/alias 2-voice form.
+        "2-part": {
+            "tag": "invention",
+            "rhetoric": (0.55, 0.68, 0.70, 0.006, "invention_rhetorical_shape"),
+            "rhetoric_strong": (0.63, 0.78, 0.76, 0.008, "invention_strong_rhetorical_shape"),
+            "flow": (0.70, 0.36, 0.85, 0.004, "invention_flowing_texture"),
+            "clean_flat": (0.88, 0.62, 0.36, -0.010, "invention_clean_but_flat"),
+            "safe_homog": (0.90, 0.74, 0.62, 0.40, -0.014, "invention_safe_homogenized_texture"),
+            "bound": 0.035,
+        },
+    }
+    profile = profiles.get(form)
+    if profile is None:
+        return 0.0, []
+
+    delta = 0.0
+    flags: list[str] = []
+
+    cadence = float(structural_details.get("cadence", 0.0))
+    phrase = float(structural_details.get("phrase_structure", 0.0))
+    key_consistency = float(structural_details.get("key_consistency", 0.0))
+    onset_stagger = float(contrapuntal_details.get("onset_staggering", 0.0))
+    contrary = float(contrapuntal_details.get("contrary_at_cadences", 0.0))
+    melodic = float(contrapuntal_details.get("melodic_coherence", 0.0))
+    voice_indep = float(contrapuntal_details.get("voice_independence", 0.0))
+
+    cad_min, phr_min, key_min, boost, boost_flag = profile["rhetoric"]  # type: ignore[index]
+    if cadence >= cad_min and phrase >= phr_min and key_consistency >= key_min:
+        delta += boost
+        flags.append(str(boost_flag))
+
+    cad_s, phr_s, key_s, boost_s, boost_s_flag = profile["rhetoric_strong"]  # type: ignore[index]
+    if cadence >= cad_s and phrase >= phr_s and key_consistency >= key_s:
+        delta += boost_s
+        flags.append(str(boost_s_flag))
+
+    # Reward flowing independent texture near cadential rhetoric.
+    onset_min, contrary_min, melodic_min, flow_boost, flow_flag = profile["flow"]  # type: ignore[index]
+    if onset_stagger >= onset_min and contrary >= contrary_min and melodic >= melodic_min:
+        delta += flow_boost
+        flags.append(str(flow_flag))
+
+    # Penalize "clean but flat" outputs.
+    vl_floor, phrase_floor, contrary_floor, clean_penalty, clean_flag = profile["clean_flat"]  # type: ignore[index]
+    if voice_leading >= vl_floor and (phrase < phrase_floor or contrary < contrary_floor):
+        delta += clean_penalty
+        flags.append(str(clean_flag))
+
+    # Penalize safe-but-homogenized texture dressed up with clean voice-leading.
+    (
+        vl_safe_floor,
+        indep_floor,
+        onset_floor,
+        contrary_safe_floor,
+        safe_penalty,
+        safe_flag,
+    ) = profile["safe_homog"]  # type: ignore[index]
+    if (
+        voice_leading >= vl_safe_floor
+        and voice_indep < indep_floor
+        and onset_stagger < onset_floor
+        and contrary < contrary_safe_floor
+    ):
+        delta += safe_penalty
+        flags.append(str(safe_flag))
+
+    # Keep interaction effects bounded and interpretable.
+    bound = float(profile.get("bound", 0.04))
+    delta = max(-bound, min(bound, delta))
+    return delta, flags
 
 
 def score_voice_pair(

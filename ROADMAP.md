@@ -113,7 +113,7 @@ Not a gate for other phases — downloading, parsing, deduplicating, and validat
 
 ### Current sources
 - **music21 built-in corpus** — Bach chorales, some Bach keyboard works, miscellaneous. Reliable editorial quality, already integrated.
-- **KernScores** (kern.ccarh.org) — kern format. Broad coverage of Baroque and Classical repertoire. High editorial quality. Already integrated via `download_kernscores.sh`.
+- **KernScores** (kern.ccarh.org) — kern format. Broad coverage of Baroque and Classical repertoire. High editorial quality. Already integrated via `scripts/download_kernscores.sh`.
 
 ### New sources to add
 

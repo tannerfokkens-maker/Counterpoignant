@@ -100,12 +100,13 @@ Counterpoignant/
 ├── ROADMAP.md              # Detailed phased development plan
 ├── pyproject.toml          # Project metadata and dependencies
 ├── .python-version         # Pins Python 3.12
-├── download_kernscores.sh  # Corpus download scripts
-├── download_jrp.sh
-├── download_kunstderfuge.py
-├── download_openscore_quartets.sh
-├── convert_openscore.sh
-└── fix_fugue_labels.py
+├── scripts/
+│   ├── download_kernscores.sh  # Corpus download scripts
+│   ├── download_jrp.sh
+│   ├── download_kunstderfuge.py
+│   ├── download_openscore_quartets.sh
+│   ├── convert_openscore.sh
+│   └── fix_fugue_labels.py
 ```
 
 **Runtime directories (gitignored, created locally):**
@@ -250,7 +251,7 @@ Each dimension returns a float in [0, 1]; the composite score is a weighted aver
 
 ```bash
 # 1. Download and prepare corpus
-bash download_kernscores.sh
+bash scripts/download_kernscores.sh
 uv run bach-gen prepare-data --data-dir ./data
 
 # 2. Train

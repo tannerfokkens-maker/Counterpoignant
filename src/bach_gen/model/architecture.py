@@ -24,17 +24,20 @@ class KVCache:
     - K/V are post-GQA expansion (already num_heads, not num_kv_heads)
     - V is post-PoPE zero-expansion (already 2*head_dim when PoPE active)
 
-    This means cached K/V can be concatenated directly with new K/V
-    without re-expansion.
+    K/V buffers are allocated to max_seq_len once and written in-place
+    at each decoding step to avoid per-token reallocation.
     """
 
-    k: torch.Tensor  # (batch, num_heads, cached_len, effective_dim)
-    v: torch.Tensor  # (batch, num_heads, cached_len, effective_dim)
+    k: torch.Tensor  # (batch, num_heads, max_seq_len, effective_dim)
+    v: torch.Tensor  # (batch, num_heads, max_seq_len, effective_dim)
     pos_offset: int = 0  # absolute position of next token to be generated
+    active_len: int | None = None  # number of valid cached positions
 
     @property
     def seq_len(self) -> int:
         """Number of cached positions."""
+        if self.active_len is not None:
+            return self.active_len
         return self.k.shape[2]
 
 
@@ -389,6 +392,7 @@ class CausalSelfAttention(nn.Module):
         self.num_kv_heads = config.effective_num_kv_heads
         self.num_kv_groups = self.num_heads // self.num_kv_heads
         self.pos_encoding = config.pos_encoding
+        self.max_seq_len = config.max_seq_len
 
         kv_dim = self.num_kv_heads * self.head_dim
         self.q_proj = nn.Linear(config.embed_dim, self.num_heads * self.head_dim)
@@ -454,15 +458,61 @@ class CausalSelfAttention(nn.Module):
             v_out[..., 0::2] = v
             v = v_out
 
-        # --- KV cache: concatenate cached K/V with new K/V ---
-        if kv_cache is not None:
-            k = torch.cat([kv_cache.k, k], dim=2)
-            v = torch.cat([kv_cache.v, v], dim=2)
-
+        # --- KV cache: in-place append into fixed buffers (no per-step cat) ---
         new_cache: KVCache | None = None
         if use_cache:
-            pos_offset = (kv_cache.pos_offset if kv_cache is not None else 0) + T
-            new_cache = KVCache(k=k, v=v, pos_offset=pos_offset)
+            if kv_cache is None:
+                # Prefill path: allocate once at max_seq_len.
+                k_buf = torch.empty(
+                    B, k.shape[1], self.max_seq_len, k.shape[-1],
+                    dtype=k.dtype, device=k.device,
+                )
+                v_buf = torch.empty(
+                    B, v.shape[1], self.max_seq_len, v.shape[-1],
+                    dtype=v.dtype, device=v.device,
+                )
+                write_len = min(T, self.max_seq_len)
+                k_buf[:, :, :write_len, :] = k[:, :, -write_len:, :]
+                v_buf[:, :, :write_len, :] = v[:, :, -write_len:, :]
+                k_attn = k_buf[:, :, :write_len, :]
+                v_attn = v_buf[:, :, :write_len, :]
+                new_cache = KVCache(
+                    k=k_buf,
+                    v=v_buf,
+                    pos_offset=T,
+                    active_len=write_len,
+                )
+            else:
+                k_buf = kv_cache.k
+                v_buf = kv_cache.v
+                cached_len = kv_cache.seq_len
+                max_len = k_buf.shape[2]
+
+                # Sliding window if appending would overflow.
+                if cached_len + T > max_len:
+                    overflow = cached_len + T - max_len
+                    if overflow >= cached_len:
+                        cached_len = 0
+                    else:
+                        keep = cached_len - overflow
+                        k_buf[:, :, :keep, :] = k_buf[:, :, overflow:cached_len, :]
+                        v_buf[:, :, :keep, :] = v_buf[:, :, overflow:cached_len, :]
+                        cached_len = keep
+
+                end = cached_len + T
+                k_buf[:, :, cached_len:end, :] = k
+                v_buf[:, :, cached_len:end, :] = v
+                k_attn = k_buf[:, :, :end, :]
+                v_attn = v_buf[:, :, :end, :]
+                new_cache = KVCache(
+                    k=k_buf,
+                    v=v_buf,
+                    pos_offset=kv_cache.pos_offset + T,
+                    active_len=end,
+                )
+        else:
+            k_attn = k
+            v_attn = v
 
         # DroPE attention temperature scaling (Gelberg et al. 2025)
         # Scale Q before SDPA (equivalent to dividing attn logits by temperature)
@@ -488,7 +538,7 @@ class CausalSelfAttention(nn.Module):
         # Use PyTorch's scaled_dot_product_attention (Flash Attention when available)
         dropout_p = self.attn_dropout.p if self.training else 0.0
         out = F.scaled_dot_product_attention(
-            q, k, v,
+            q, k_attn, v_attn,
             attn_mask=attn_mask,
             dropout_p=dropout_p,
             is_causal=use_is_causal,
