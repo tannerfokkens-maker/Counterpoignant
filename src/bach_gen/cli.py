@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
@@ -239,7 +240,15 @@ def _build_token_category_map(tokenizer) -> tuple[list[int], list[str]]:
             name == "BAR"
             or name.startswith("BEAT_")
             or name.startswith("VOICE_")
-            or name in ("VOICE_SEP", "SUBJECT_START", "SUBJECT_END")
+            or name in (
+                "VOICE_SEP",
+                "SUBJECT_START",
+                "SUBJECT_END",
+                "CAD_PAC",
+                "CAD_IAC",
+                "CAD_HC",
+                "CAD_DC",
+            )
         ):
             cat_name = "structure"
         elif name.startswith(conditioning_prefixes):
@@ -257,19 +266,54 @@ def _tokenize_items(
     forms: list[str],
     tokenizer,
     no_sequential: bool,
+    conditioning_phase: str = "none",
+    subject_forms: set[str] | None = None,
+    cadence_min_confidence: float = 2.0,
+    subject_min_quality: float = 0.80,
+    subject_min_match_ratio: float = 0.70,
 ) -> tuple[list[list[int]], list[str]]:
     """Tokenize a batch of compositions with optional dual encoding."""
     from bach_gen.data.analysis import analyze_composition
+    from bach_gen.data.conditioning import (
+        cadence_token_ids_by_tick,
+        detect_cadence_events,
+        detect_subject_entries,
+        subject_boundary_note_indices,
+    )
 
     sequences: list[list[int]] = []
     piece_ids: list[str] = []
+    use_cadence = conditioning_phase in {"cadence", "cadence+subject"}
+    use_subject = conditioning_phase == "cadence+subject"
+    if subject_forms is None:
+        subject_forms = {"fugue", "invention", "sinfonia"}
+    subject_forms_normalized = {f.lower() for f in subject_forms}
 
     for i, item in enumerate(items):
         item_form = forms[i] if i < len(forms) else "chorale"
+        item_form_normalized = item_form.lower()
         time_sig = item.time_signature if hasattr(item, "time_signature") else (4, 4)
         num_bars = compute_measure_count(item.voices, time_sig)
 
         labels = analyze_composition(item, time_sig)
+        cadence_map: dict[int, int] | None = None
+        subject_start_markers: set[tuple[int, int]] | None = None
+        subject_end_markers: set[tuple[int, int]] | None = None
+
+        if use_cadence:
+            cadence_events = detect_cadence_events(
+                item,
+                min_confidence=cadence_min_confidence,
+            )
+            cadence_map = cadence_token_ids_by_tick(cadence_events, tokenizer.name_to_token)
+
+        if use_subject and item_form_normalized in subject_forms_normalized:
+            subject_entries = detect_subject_entries(
+                item,
+                min_quality=subject_min_quality,
+                min_match_ratio=subject_min_match_ratio,
+            )
+            subject_start_markers, subject_end_markers = subject_boundary_note_indices(subject_entries)
 
         tokens = tokenizer.encode(
             item, form=item_form, length_bars=num_bars,
@@ -277,6 +321,9 @@ def _tokenize_items(
             harmonic_rhythm=labels["harmonic_rhythm"],
             harmonic_tension=labels["harmonic_tension"],
             chromaticism=labels["chromaticism"],
+            cadence_tokens_by_tick=cadence_map,
+            subject_start_markers=subject_start_markers,
+            subject_end_markers=subject_end_markers,
         )
         if len(tokens) >= 20:
             sequences.append(tokens)
@@ -289,6 +336,9 @@ def _tokenize_items(
                 harmonic_rhythm=labels["harmonic_rhythm"],
                 harmonic_tension=labels["harmonic_tension"],
                 chromaticism=labels["chromaticism"],
+                cadence_tokens_by_tick=cadence_map,
+                subject_start_markers=subject_start_markers,
+                subject_end_markers=subject_end_markers,
             )
             if len(tokens_seq) >= 20:
                 sequences.append(tokens_seq)
@@ -297,9 +347,22 @@ def _tokenize_items(
     return sequences, piece_ids
 
 
-def _tokenize_batch_task(task: tuple[int, list, list[str], str, bool]) -> tuple[int, list[list[int]], list[str], int]:
+def _tokenize_batch_task(
+    task: tuple[int, list, list[str], str, bool, str, tuple[str, ...], float, float, float],
+) -> tuple[int, list[list[int]], list[str], int]:
     """Worker entrypoint for parallel Step-3 tokenization."""
-    batch_idx, items, forms, tokenizer_type, no_sequential = task
+    (
+        batch_idx,
+        items,
+        forms,
+        tokenizer_type,
+        no_sequential,
+        conditioning_phase,
+        subject_forms,
+        cadence_min_confidence,
+        subject_min_quality,
+        subject_min_match_ratio,
+    ) = task
 
     from bach_gen.data.tokenizer import BachTokenizer
 
@@ -309,8 +372,165 @@ def _tokenize_batch_task(task: tuple[int, list, list[str], str, bool]) -> tuple[
     else:
         tokenizer = BachTokenizer()
 
-    seqs, pids = _tokenize_items(items, forms, tokenizer, no_sequential)
+    seqs, pids = _tokenize_items(
+        items,
+        forms,
+        tokenizer,
+        no_sequential,
+        conditioning_phase=conditioning_phase,
+        subject_forms=set(subject_forms),
+        cadence_min_confidence=cadence_min_confidence,
+        subject_min_quality=subject_min_quality,
+        subject_min_match_ratio=subject_min_match_ratio,
+    )
     return batch_idx, seqs, pids, len(items)
+
+
+def _extract_form_from_prefix(seq: list[int], tokenizer) -> str:
+    for tok in seq[:64]:
+        name = tokenizer.token_to_name.get(tok, "")
+        if name.startswith("FORM_"):
+            return name[5:].lower()
+        if name.startswith("KEY_"):
+            break
+    return "unknown"
+
+
+def _is_interleaved_sequence(seq: list[int], tokenizer) -> bool:
+    for tok in seq[:64]:
+        name = tokenizer.token_to_name.get(tok, "")
+        if name == "ENCODE_SEQUENTIAL":
+            return False
+        if name == "ENCODE_INTERLEAVED":
+            return True
+        if name.startswith("KEY_"):
+            break
+    return True
+
+
+def _print_structural_conditioning_report(
+    sequences: list[list[int]],
+    tokenizer,
+) -> None:
+    """Report cadence/subject token statistics from interleaved sequences."""
+    from collections import Counter
+
+    cadence_names = {"CAD_PAC", "CAD_IAC", "CAD_HC", "CAD_DC"}
+    subject_start_names = {"SUBJECT_START"}
+
+    cadence_by_form: Counter = Counter()
+    bars_by_form: Counter = Counter()
+    cadence_types: Counter = Counter()
+
+    subj_entries_by_form: Counter = Counter()
+    subj_pieces_by_form: Counter = Counter()
+    subj_position_bins: Counter = Counter()
+
+    n_interleaved = 0
+    for seq in sequences:
+        if not _is_interleaved_sequence(seq, tokenizer):
+            continue
+        n_interleaved += 1
+        form = _extract_form_from_prefix(seq, tokenizer)
+
+        bars = 0
+        subj_positions: list[int] = []
+        for tok in seq:
+            name = tokenizer.token_to_name.get(tok, "")
+            if name == "BAR":
+                bars += 1
+            elif name in cadence_names:
+                cadence_by_form[form] += 1
+                cadence_types[name] += 1
+            elif name in subject_start_names:
+                subj_positions.append(bars)
+
+        if bars > 0:
+            bars_by_form[form] += bars
+        if subj_positions:
+            subj_entries_by_form[form] += len(subj_positions)
+            subj_pieces_by_form[form] += 1
+            for pos in subj_positions:
+                ratio = pos / max(bars, 1)
+                if ratio < 0.33:
+                    subj_position_bins["early"] += 1
+                elif ratio < 0.66:
+                    subj_position_bins["mid"] += 1
+                else:
+                    subj_position_bins["late"] += 1
+
+    if n_interleaved == 0:
+        console.print("  Structural conditioning report: no interleaved sequences found")
+        return
+
+    console.print("\n  [bold]Structural conditioning report (interleaved only):[/bold]")
+
+    if cadence_types:
+        total_cad = sum(cadence_types.values())
+        parts = [f"{name}={count}" for name, count in sorted(cadence_types.items())]
+        console.print(f"    Cadence type counts: {', '.join(parts)} (total={total_cad})")
+    else:
+        console.print("    Cadence type counts: (none)")
+
+    if bars_by_form:
+        density_parts = []
+        for form, bars in sorted(bars_by_form.items()):
+            cad = cadence_by_form.get(form, 0)
+            density = cad / max(bars, 1)
+            density_parts.append(f"{form}: {density:.3f}/bar ({cad}/{bars})")
+        console.print(f"    Cadence density by form: {'; '.join(density_parts)}")
+
+    if subj_entries_by_form:
+        entry_parts = []
+        for form in sorted(subj_entries_by_form.keys()):
+            entries = subj_entries_by_form[form]
+            pieces = max(1, subj_pieces_by_form.get(form, 1))
+            entry_parts.append(f"{form}: {entries / pieces:.2f} entries/piece")
+        console.print(f"    Subject entries by form: {'; '.join(entry_parts)}")
+        if subj_position_bins:
+            pos_parts = [f"{k}={v}" for k, v in sorted(subj_position_bins.items())]
+            console.print(f"    Subject entry positions: {', '.join(pos_parts)}")
+    else:
+        console.print("    Subject entries by form: (none)")
+
+
+def _apply_conditioning_dropout_to_sequences(
+    sequences: list[list[int]],
+    tokenizer,
+    dropout_prob: float,
+    seed: int,
+) -> list[list[int]]:
+    from bach_gen.data.conditioning import apply_conditioning_dropout
+
+    cadence_token_ids = {
+        tokenizer.name_to_token[name]
+        for name in ("CAD_PAC", "CAD_IAC", "CAD_HC", "CAD_DC")
+        if name in tokenizer.name_to_token
+    }
+    subject_start_token_ids = {
+        tokenizer.name_to_token[name]
+        for name in ("SUBJECT_START",)
+        if name in tokenizer.name_to_token
+    }
+    subject_end_token_ids = {
+        tokenizer.name_to_token[name]
+        for name in ("SUBJECT_END",)
+        if name in tokenizer.name_to_token
+    }
+
+    rng = random.Random(seed)
+    return [
+        apply_conditioning_dropout(
+            seq,
+            cadence_token_ids=cadence_token_ids,
+            subject_start_token_ids=subject_start_token_ids,
+            subject_end_token_ids=subject_end_token_ids,
+            dropout_prob=dropout_prob,
+            rng=rng,
+            keep_first_subject_entry=True,
+        )
+        for seq in sequences
+    ]
 
 
 @cli.command()
@@ -327,6 +547,15 @@ def _tokenize_batch_task(task: tuple[int, list, list[str], str, bool]) -> tuple[
               help="Drop long sequences instead of chunking them")
 @click.option("--data-dir", default=None, type=click.Path(),
               help="Output directory for prepared data (default: data/)")
+@click.option(
+    "--midi-dir",
+    default=None,
+    type=click.Path(),
+    help=(
+        "Local score root to ingest (default: auto — use data/midi/all when "
+        "present, else data/midi)"
+    ),
+)
 @click.option("--composer-filter", default=None, type=str,
               help=("Comma-separated composer/style names to include "
                     "(default: bach,baroque,renaissance,classical; use 'all' to disable filtering)"))
@@ -346,15 +575,33 @@ def _tokenize_batch_task(task: tuple[int, list, list[str], str, bool]) -> tuple[
               help="How to treat sonata data in broad training (default: counterpoint-safe)")
 @click.option("--workers", default=None, type=int,
               help="Number of parallel workers for file parsing (default: min(cpu_count, 8))")
+@click.option("--conditioning-phase", type=click.Choice(["none", "cadence", "cadence+subject"]),
+              default="cadence+subject",
+              help="Structural conditioning labels to add during tokenization")
+@click.option("--conditioning-dropout", default=0.40, type=float,
+              help="Drop probability applied to cadence/subject markers (default: 0.40)")
+@click.option("--conditioning-seed", default=1337, type=int,
+              help="Random seed for conditioning dropout (default: 1337)")
+@click.option("--subject-forms", default="fugue,invention,sinfonia", type=str,
+              help="Comma-separated forms that receive subject-entry labels")
+@click.option("--cadence-min-confidence", default=2.0, type=float,
+              help="Minimum cadence detector confidence (default: 2.0)")
+@click.option("--subject-min-quality", default=0.80, type=float,
+              help="Minimum subject interval-match quality (default: 0.80)")
+@click.option("--subject-min-match-ratio", default=0.70, type=float,
+              help="Minimum subject match length ratio (default: 0.70)")
 def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len: int,
-                 no_chunk: bool, data_dir: str | None, composer_filter: str | None,
+                 no_chunk: bool, data_dir: str | None, midi_dir: str | None, composer_filter: str | None,
                  no_sequential: bool, max_source_voices: int,
                  max_groups_per_work: int, pair_strategy: str,
                  max_pairs_per_work: int, sonata_policy: str,
-                 workers: int | None) -> None:
+                 workers: int | None, conditioning_phase: str,
+                 conditioning_dropout: float, conditioning_seed: int,
+                 subject_forms: str, cadence_min_confidence: float,
+                 subject_min_quality: float, subject_min_match_ratio: float) -> None:
     """Extract Bach corpus, tokenize, and cache statistics."""
     from collections import Counter, defaultdict
-    from bach_gen.data.corpus import get_all_works, _original_source
+    from bach_gen.data.corpus import get_all_works, _default_local_midi_dir, _original_source
     from bach_gen.data.extraction import (
         is_accompaniment_texture_like_comp,
         accompaniment_texture_severity_comp,
@@ -379,6 +626,22 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
     out_dir = Path(data_dir) if data_dir else DATA_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    if not (0.0 <= conditioning_dropout <= 1.0):
+        console.print("[red]--conditioning-dropout must be in [0, 1][/red]")
+        sys.exit(1)
+    if not (0.0 <= subject_min_match_ratio <= 1.0):
+        console.print("[red]--subject-min-match-ratio must be in [0, 1][/red]")
+        sys.exit(1)
+    if not (0.0 <= subject_min_quality <= 1.0):
+        console.print("[red]--subject-min-quality must be in [0, 1][/red]")
+        sys.exit(1)
+    parsed_subject_forms = {
+        f.strip().lower() for f in subject_forms.split(",") if f.strip()
+    }
+    if not parsed_subject_forms:
+        parsed_subject_forms = {"fugue", "invention", "sinfonia"}
+    local_midi_dir = Path(midi_dir) if midi_dir else _default_local_midi_dir()
+
     # Parse composer/era filter.
     # Default is a curated era set; pass --composer-filter all to disable.
     filter_list = None
@@ -391,8 +654,13 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
         else:
             filter_list = parsed
     else:
-        filter_list = list(DEFAULT_PREPARE_COMPOSER_FILTER)
-        filter_origin = "default"
+        if local_midi_dir.name.lower() == "all":
+            # Consolidated local corpus should be ingested in full by default.
+            filter_list = None
+            filter_origin = "auto-all"
+        else:
+            filter_list = list(DEFAULT_PREPARE_COMPOSER_FILTER)
+            filter_origin = "default"
 
     # Step 1: Load and extract works (parse + extract in workers)
     if filter_list:
@@ -400,6 +668,8 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
         filter_desc = f" (filter: {', '.join(filter_list)}{suffix})"
     else:
         filter_desc = " (filter: disabled)"
+        if filter_origin == "auto-all":
+            filter_desc = " (filter: disabled for consolidated all/ input)"
     console.print(f"[bold]Step 1:[/] Loading and extracting from corpus...{filter_desc}")
     if is_all_mode:
         console.print(f"  Mode: all (auto-detect form and voice count per piece)")
@@ -408,6 +678,19 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
     console.print(f"  Tokenizer: {tokenizer_type}")
     console.print(f"  Max source voices: {max_source_voices}")
     console.print(f"  Sonata policy: {sonata_policy}")
+    console.print(f"  Local score dir: {local_midi_dir}")
+    console.print(
+        f"  Conditioning: {conditioning_phase} "
+        f"(dropout={conditioning_dropout:.2f}, seed={conditioning_seed})"
+    )
+    if conditioning_phase == "cadence+subject":
+        console.print(f"  Subject forms: {sorted(parsed_subject_forms)}")
+        console.print(
+            "  Detector thresholds: "
+            f"cadence_conf>={cadence_min_confidence:.2f}, "
+            f"subject_quality>={subject_min_quality:.2f}, "
+            f"subject_match_ratio>={subject_min_match_ratio:.2f}"
+        )
     import os as _os
     effective_workers = workers if workers is not None else min(_os.cpu_count() or 1, 8)
     console.print(f"  Workers: {effective_workers}")
@@ -417,6 +700,7 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
             composer_filter=filter_list, max_workers=workers,
             max_source_voices=max_source_voices,
             max_groups_per_work=max_groups_per_work,
+            midi_dir=local_midi_dir,
             voices_override=voices_for_extraction,
         )
         progress.update(task, description=f"Extracted {len(works_with_forms)} voice groups")
@@ -513,7 +797,7 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
     tokenize_workers = max(1, effective_workers)
     target_batches = max(1, tokenize_workers * 8)
     batch_size = max(1, (len(items_to_tokenize) + target_batches - 1) // target_batches)
-    batch_tasks: list[tuple[int, list, list[str], str, bool]] = []
+    batch_tasks: list[tuple[int, list, list[str], str, bool, str, tuple[str, ...], float, float, float]] = []
     for batch_idx, start in enumerate(range(0, len(items_to_tokenize), batch_size)):
         end = start + batch_size
         batch_tasks.append(
@@ -523,6 +807,11 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
                 forms_to_tokenize[start:end],
                 tokenizer_type,
                 no_sequential,
+                conditioning_phase,
+                tuple(sorted(parsed_subject_forms)),
+                cadence_min_confidence,
+                subject_min_quality,
+                subject_min_match_ratio,
             )
         )
 
@@ -564,8 +853,18 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
             BarColumn(), TaskProgressColumn(), console=console,
         ) as progress:
             task = progress.add_task("Tokenizing", total=len(items_to_tokenize))
-            for _, batch_items, batch_forms, _, _ in batch_tasks:
-                batch_seqs, batch_ids = _tokenize_items(batch_items, batch_forms, tokenizer, no_sequential)
+            for _, batch_items, batch_forms, _, _, _, _, _, _, _ in batch_tasks:
+                batch_seqs, batch_ids = _tokenize_items(
+                    batch_items,
+                    batch_forms,
+                    tokenizer,
+                    no_sequential,
+                    conditioning_phase=conditioning_phase,
+                    subject_forms=parsed_subject_forms,
+                    cadence_min_confidence=cadence_min_confidence,
+                    subject_min_quality=subject_min_quality,
+                    subject_min_match_ratio=subject_min_match_ratio,
+                )
                 sequences.extend(batch_seqs)
                 piece_ids.extend(batch_ids)
                 progress.advance(task, len(batch_items))
@@ -575,6 +874,19 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
 
     # Conditioning token distribution histograms
     _print_conditioning_histograms(sequences, tokenizer)
+    _print_structural_conditioning_report(sequences, tokenizer)
+
+    if conditioning_phase != "none" and conditioning_dropout > 0.0:
+        console.print(
+            "  Applying conditioning dropout: "
+            f"p={conditioning_dropout:.2f} (seed={conditioning_seed})"
+        )
+        sequences = _apply_conditioning_dropout_to_sequences(
+            sequences,
+            tokenizer,
+            dropout_prob=conditioning_dropout,
+            seed=conditioning_seed,
+        )
 
     # Sequence length distribution (before filtering)
     lengths = [len(s) for s in sequences]
@@ -640,6 +952,13 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
             "tokenizer_type": tokenizer_type,
             "max_seq_len": max_seq_len,
             "sequential_enabled": not no_sequential,
+            "conditioning_phase": conditioning_phase,
+            "conditioning_dropout": conditioning_dropout,
+            "conditioning_seed": conditioning_seed,
+            "subject_forms": sorted(parsed_subject_forms),
+            "cadence_min_confidence": cadence_min_confidence,
+            "subject_min_quality": subject_min_quality,
+            "subject_min_match_ratio": subject_min_match_ratio,
         }, f, indent=2)
 
     # Compute and save corpus statistics
@@ -1258,6 +1577,12 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
               help="Use voice-by-voice (sequential) generation")
 @click.option("--provide-voice", default=None, type=click.Path(exists=True),
               help="Path to MIDI file for voice 1 (use with --voice-by-voice)")
+@click.option("--cadence-density", type=click.Choice(["low", "medium", "high"]),
+              default=None, help="Bias cadence marker injection frequency")
+@click.option("--min-subject-entries", default=0, type=int,
+              help="Minimum prompted subject re-entry markers after exposition")
+@click.option("--subject-spacing", default=8, type=int,
+              help="Minimum bars between prompted subject re-entry markers")
 def generate(
     key: str,
     subject: str | None,
@@ -1282,6 +1607,9 @@ def generate(
     candidate_batch_size: int | None,
     voice_by_voice: bool,
     provide_voice: str | None,
+    cadence_density: str | None,
+    min_subject_entries: int,
+    subject_spacing: int,
 ) -> None:
     """Generate Bach-style compositions."""
     from bach_gen.data.tokenizer import load_tokenizer
@@ -1306,6 +1634,13 @@ def generate(
         mode = "chorale"
 
     num_voices = voices or FORM_DEFAULTS.get(mode, (2, 768))[0]
+
+    if min_subject_entries < 0:
+        console.print("[red]--min-subject-entries must be >= 0[/red]")
+        sys.exit(1)
+    if subject_spacing < 1:
+        console.print("[red]--subject-spacing must be >= 1[/red]")
+        sys.exit(1)
 
     if max_length is None:
         max_length = FORM_DEFAULTS.get(mode, (2, 768))[1]
@@ -1354,6 +1689,13 @@ def generate(
         console.print(f"  Strategy: sampling ({candidates} candidates)")
         if candidate_batch_size is not None:
             console.print(f"  Candidate batch size: {candidate_batch_size}")
+    if cadence_density is not None:
+        console.print(f"  Cadence density control: {cadence_density}")
+    if min_subject_entries > 0:
+        console.print(
+            f"  Subject re-entry control: min_entries={min_subject_entries}, "
+            f"spacing={subject_spacing} bars"
+        )
     if subject:
         console.print(f"  Subject: {subject}")
 
@@ -1398,6 +1740,9 @@ def generate(
             harmonic_tension=tension,
             chromaticism=chromaticism,
             candidate_batch_size=candidate_batch_size,
+            cadence_density=cadence_density,
+            min_subject_entries=min_subject_entries,
+            subject_spacing_bars=subject_spacing,
         ) if not voice_by_voice else gen_vbv_fn(
             model=model,
             tokenizer=tokenizer,
@@ -1421,6 +1766,9 @@ def generate(
             chromaticism=chromaticism,
             provided_voice_midi=provide_voice,
             candidate_batch_size=candidate_batch_size,
+            cadence_density=cadence_density,
+            min_subject_entries=min_subject_entries,
+            subject_spacing_bars=subject_spacing,
         )
         progress.update(task, description="Done!")
 

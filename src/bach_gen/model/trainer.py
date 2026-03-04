@@ -134,6 +134,52 @@ class Trainer:
             f"val={len(val_dataset) if val_dataset else 0}"
         )
 
+    @staticmethod
+    def _resize_vocab_rows(
+        weight: torch.Tensor,
+        target_rows: int,
+    ) -> torch.Tensor:
+        """Resize embedding/head matrix rows while preserving shared prefix."""
+        if weight.size(0) == target_rows:
+            return weight
+
+        resized = weight.new_empty((target_rows, weight.size(1)))
+        keep_rows = min(weight.size(0), target_rows)
+        if keep_rows > 0:
+            resized[:keep_rows].copy_(weight[:keep_rows])
+
+        if target_rows > keep_rows:
+            std = float(weight.std().item()) if weight.numel() else 0.02
+            if not math.isfinite(std) or std <= 0.0:
+                std = 0.02
+            nn.init.normal_(resized[keep_rows:], mean=0.0, std=std)
+
+        return resized
+
+    @classmethod
+    def _maybe_resize_vocab_state_dict(
+        cls,
+        state_dict: dict[str, torch.Tensor],
+        target_vocab_size: int,
+    ) -> tuple[dict[str, torch.Tensor], bool]:
+        """Resize token embedding/head rows when checkpoint vocab differs."""
+        embed_key = "token_embed.weight"
+        if embed_key not in state_dict:
+            return state_dict, False
+
+        embed_weight = state_dict[embed_key]
+        if embed_weight.size(0) == target_vocab_size:
+            return state_dict, False
+
+        resized_embed = cls._resize_vocab_rows(embed_weight, target_vocab_size)
+        state_dict[embed_key] = resized_embed
+
+        head_key = "head.weight"
+        if head_key in state_dict:
+            state_dict[head_key] = cls._resize_vocab_rows(state_dict[head_key], target_vocab_size)
+
+        return state_dict, True
+
     def save_checkpoint(self, filename: str) -> None:
         """Public checkpoint save helper for phase transitions."""
         self._save_checkpoint(filename)
@@ -145,8 +191,22 @@ class Trainer:
             The epoch to resume from (next epoch after the saved one).
         """
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
-        self.model.load_state_dict(checkpoint["model_state_dict"])
-        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        state = checkpoint["model_state_dict"]
+        state, resized_vocab = self._maybe_resize_vocab_state_dict(
+            state,
+            target_vocab_size=self.model.config.vocab_size,
+        )
+        self.model.load_state_dict(state, strict=True)
+        if resized_vocab:
+            logger.info(
+                "Checkpoint vocab resized to %d rows; optimizer state reset.",
+                self.model.config.vocab_size,
+            )
+        else:
+            try:
+                self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            except Exception as e:
+                logger.warning(f"Could not load optimizer state from {path}: {e}")
         self.best_val_loss = checkpoint.get("best_val_loss", float("inf"))
         saved_epoch = checkpoint.get("epoch", 0)
         self.epoch = saved_epoch
@@ -660,7 +720,6 @@ class Trainer:
         state = checkpoint["model_state_dict"]
         qkv_keys = [k for k in state if ".attn.qkv." in k]
         if qkv_keys:
-            embed_dim = config.embed_dim
             for key in list(state.keys()):
                 if ".attn.qkv.weight" in key:
                     w = state.pop(key)  # (3*embed_dim, embed_dim)
@@ -677,6 +736,16 @@ class Trainer:
                     state[f"{prefix}.k_proj.bias"] = k_b
                     state[f"{prefix}.v_proj.bias"] = v_b
             logger.info("Migrated old QKV weights to separate Q/K/V projections")
+
+        state, resized_vocab = Trainer._maybe_resize_vocab_state_dict(
+            state,
+            target_vocab_size=config.vocab_size,
+        )
+        if resized_vocab:
+            logger.info(
+                "Resized checkpoint token embeddings/head to vocab_size=%d",
+                config.vocab_size,
+            )
 
         model.load_state_dict(state)
         model = model.to(device)

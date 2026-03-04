@@ -56,7 +56,7 @@ def test_prepare_data_composer_filter_all_disables_filter(tmp_path: Path):
     assert mock_get_all_works.call_args.kwargs["composer_filter"] is None
 
 
-def test_get_midi_files_prefers_curated_kunstderfuge_bucket(tmp_path: Path):
+def test_get_midi_files_treats_kunstderfuge_like_any_other_dataset(tmp_path: Path):
     from bach_gen.data.extraction import VoiceComposition
 
     midi_root = tmp_path / "midi"
@@ -83,8 +83,9 @@ def test_get_midi_files_prefers_curated_kunstderfuge_bucket(tmp_path: Path):
         works = get_midi_files(midi_root)
 
     sources = {comp.source for comp, _ in works}
-    assert "kunstderfuge/bach/raw" not in sources
-    assert "kunstderfuge/_voice_buckets/dataset_2to4/bach/curated" in sources
+    assert "kunstderfuge/bach/raw" in sources
+    # Helper dirs prefixed with "_" are skipped globally.
+    assert "kunstderfuge/_voice_buckets/dataset_2to4/bach/curated" not in sources
     assert "kernscores/bach/kernscores" in sources
 
 

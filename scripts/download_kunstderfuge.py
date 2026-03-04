@@ -20,9 +20,10 @@ import os
 import re
 import sys
 import time
+import threading
 import urllib.parse
 import copy
-import math
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from html.parser import HTMLParser
@@ -41,6 +42,10 @@ OUT = Path("data/midi/kunstderfuge")
 REPORT_FILE = OUT / "_triage_report.json"
 FAILED_FILE = OUT / "_failed.json"
 CACHE = Path("/tmp/kunstderfuge_cache")
+MIDI_DATA_ROOT = Path("data/midi")
+ALL_DATASET_DIR = MIDI_DATA_ROOT / "all"
+DERIVED_MIDI_SUFFIXES = (".separated.mid", ".reduced.mid", ".deperformed.mid")
+CONVERTED_FROM_SCORE_SUFFIX = ".fromscore.mid"
 
 # Composers relevant to tonal/diatonic training data.
 # (page_path, output_dirname, era)
@@ -380,93 +385,567 @@ def triage_midi(filepath: Path) -> dict:
 # De-perform: quantize + strip dynamics
 # ---------------------------------------------------------------------------
 
-def _repair_overlaps_in_stream(
-    events: list[tuple[float, float, "music21.note.NotRest"]],
-    grid_unit: float,
-) -> list[tuple[float, float, "music21.note.NotRest"]]:
-    """Quantize a stream and remove accidental self-overlap.
+DEPERFORM_PROTECT_ORNAMENTS = True
 
-    Overlap repair is only applied when a later onset would land before the
-    previous note's end (start > prev_start and start < prev_end). True
-    simultaneities (same onset) are preserved.
 
-    TODO: This overlap repair is still rhythm-centric and not ornament-aware.
-    Fast trill/turn passages can still be assigned in ways that sound wrong
-    (e.g., rapid alternation splitting across perceived voices). Add a
-    dedicated ornament pass that preserves local trill identity in one voice.
+@dataclass
+class DeperformNote:
+    """Raw MIDI note event used by deperform quantization."""
+
+    note_id: int
+    start_tick: int
+    end_tick: int
+    pitch: int
+    velocity: int
+    channel: int
+    track_index: int
+    new_start_tick: int = 0
+    new_end_tick: int = 0
+
+
+@dataclass
+class OrnamentGroup:
+    """A detected fast ornament group to quantize as a unit."""
+
+    note_ids: list[int]
+    onset_tick: int
+    end_tick: int
+    internal_ratios: list[float]
+
+
+def _grid_ticks(tpqn: int, grid: int) -> int:
+    return max(1, int(round(float(tpqn) * 4.0 / float(grid))))
+
+
+def _nearest_grid_tick(tick: int, grid_ticks: int) -> int:
+    return int(round(float(tick) / float(grid_ticks))) * grid_ticks
+
+
+def _measure_ticks(tpqn: int, numerator: int, denominator: int) -> int:
+    return max(1, int(round(float(tpqn) * 4.0 * float(numerator) / float(denominator))))
+
+
+def _is_close_tick(pos_tick: int, target_tick: float, tol_tick: int) -> bool:
+    return abs(float(pos_tick) - float(target_tick)) <= float(max(1, tol_tick))
+
+
+def metric_weight(
+    tick: int,
+    tpqn: int,
+    time_sig_numerator: int,
+    time_sig_denominator: int,
+) -> float:
+    """Return metric strength at absolute tick for weighted onset snapping."""
+    if tpqn <= 0:
+        return 0.2
+
+    num = max(1, int(time_sig_numerator))
+    den = max(1, int(time_sig_denominator))
+    measure = _measure_ticks(tpqn, num, den)
+    pos = int(tick) % measure
+    tol = max(1, tpqn // 64)
+
+    if num == 4 and den == 4:
+        beat_ticks = [0, tpqn, 2 * tpqn, 3 * tpqn]
+        beat_weights = [1.0, 0.7, 0.85, 0.7]
+        for bt, w in zip(beat_ticks, beat_weights):
+            if _is_close_tick(pos, bt, tol):
+                return w
+        half = tpqn / 2.0
+        if _is_close_tick(pos % tpqn, half, tol):
+            return 0.4
+        return 0.2
+
+    if num == 3 and den == 4:
+        beat_ticks = [0, tpqn, 2 * tpqn]
+        beat_weights = [1.0, 0.6, 0.6]
+        for bt, w in zip(beat_ticks, beat_weights):
+            if _is_close_tick(pos, bt, tol):
+                return w
+        half = tpqn / 2.0
+        if _is_close_tick(pos % tpqn, half, tol):
+            return 0.3
+        return 0.15
+
+    if num == 6 and den == 8:
+        main_beats = [0.0, 1.5 * tpqn]
+        main_weights = [1.0, 0.8]
+        for bt, w in zip(main_beats, main_weights):
+            if _is_close_tick(pos, bt, tol):
+                return w
+        third_positions = [1.0 * tpqn, 2.5 * tpqn]
+        if any(_is_close_tick(pos, bt, tol) for bt in third_positions):
+            return 0.4
+        return 0.2
+
+    beat_ticks = max(1, int(round(float(tpqn) * 4.0 / float(den))))
+    if _is_close_tick(pos, 0.0, tol):
+        return 1.0
+    if beat_ticks > 1 and _is_close_tick(pos % beat_ticks, 0.0, tol):
+        return 0.6
+    if beat_ticks > 2 and _is_close_tick(pos % beat_ticks, beat_ticks / 2.0, tol):
+        return 0.3
+    return 0.15
+
+
+def _snap_onset_metric(
+    raw_tick: int,
+    grid_ticks: int,
+    tpqn: int,
+    time_sig_numerator: int,
+    time_sig_denominator: int,
+) -> int:
+    floor_tick = (int(raw_tick) // grid_ticks) * grid_ticks
+    ceil_tick = floor_tick + grid_ticks
+
+    floor_dist = abs(int(raw_tick) - floor_tick)
+    ceil_dist = abs(int(raw_tick) - ceil_tick)
+
+    floor_weight = metric_weight(floor_tick, tpqn, time_sig_numerator, time_sig_denominator)
+    ceil_weight = metric_weight(ceil_tick, tpqn, time_sig_numerator, time_sig_denominator)
+
+    gravity = float(grid_ticks) * 0.3
+    floor_score = float(floor_dist) - (floor_weight * gravity)
+    ceil_score = float(ceil_dist) - (ceil_weight * gravity)
+    return floor_tick if floor_score <= ceil_score else ceil_tick
+
+
+def _nearest_duration_bin(duration_ticks: int, grid_ticks: int) -> int:
+    if duration_ticks <= grid_ticks:
+        return grid_ticks
+    bins = [grid_ticks * m for m in (1, 2, 3, 4, 6, 8, 12, 16, 24, 32)]
+    while bins[-1] < duration_ticks:
+        bins.append(bins[-1] + grid_ticks * 8)
+    return min(bins, key=lambda b: abs(b - duration_ticks))
+
+
+def _extract_first_time_signature(mid) -> tuple[int, int]:
+    for track in mid.tracks:
+        for msg in track:
+            if msg.is_meta and msg.type == "time_signature":
+                return int(msg.numerator), int(msg.denominator)
+    return 4, 4
+
+
+def _detect_trill_end(notes: list[DeperformNote], i: int, tpqn: int) -> int | None:
+    if i + 3 >= len(notes):
+        return None
+
+    seen = {notes[i].pitch}
+    j = i + 1
+    while j < len(notes):
+        ioi = notes[j].start_tick - notes[j - 1].start_tick
+        if ioi <= 0 or ioi >= tpqn / 3:
+            break
+        seen.add(notes[j].pitch)
+        if len(seen) > 2:
+            break
+        if len(seen) == 2 and abs(max(seen) - min(seen)) > 2:
+            break
+        if j >= i + 2 and notes[j].pitch != notes[j - 2].pitch:
+            break
+        j += 1
+
+    end = j - 1
+    if end - i + 1 >= 4 and len(seen) == 2:
+        return end
+    return None
+
+
+def _detect_turn_end(notes: list[DeperformNote], i: int, tpqn: int) -> int | None:
+    for length in (4, 3):
+        end = i + length - 1
+        if end >= len(notes):
+            continue
+        seq = notes[i : end + 1]
+        if any(
+            (seq[k + 1].start_tick - seq[k].start_tick) <= 0
+            or (seq[k + 1].start_tick - seq[k].start_tick) >= tpqn / 4
+            for k in range(len(seq) - 1)
+        ):
+            continue
+        center = seq[0].pitch
+        if any(abs(n.pitch - center) > 4 for n in seq):
+            continue
+        group_dur = max(n.end_tick for n in seq) - seq[0].start_tick
+        if group_dur < tpqn:
+            return end
+    return None
+
+
+def _detect_scale_end(notes: list[DeperformNote], i: int, tpqn: int) -> int | None:
+    if i + 3 >= len(notes):
+        return None
+    direction = 0
+    j = i + 1
+    while j < len(notes):
+        ioi = notes[j].start_tick - notes[j - 1].start_tick
+        if ioi <= 0 or ioi >= tpqn / 4:
+            break
+        interval = notes[j].pitch - notes[j - 1].pitch
+        if abs(interval) not in {1, 2}:
+            break
+        step_sign = 1 if interval > 0 else -1
+        if direction == 0:
+            direction = step_sign
+        elif step_sign != direction:
+            break
+        j += 1
+    end = j - 1
+    if end - i + 1 >= 4:
+        return end
+    return None
+
+
+def _detect_ornament_groups(notes: list[DeperformNote], tpqn: int) -> list[OrnamentGroup]:
+    groups: list[OrnamentGroup] = []
+    i = 0
+    while i < len(notes):
+        candidates: list[int] = []
+        trill_end = _detect_trill_end(notes, i, tpqn)
+        if trill_end is not None:
+            candidates.append(trill_end)
+        scale_end = _detect_scale_end(notes, i, tpqn)
+        if scale_end is not None:
+            candidates.append(scale_end)
+        turn_end = _detect_turn_end(notes, i, tpqn)
+        if turn_end is not None:
+            candidates.append(turn_end)
+
+        if not candidates:
+            i += 1
+            continue
+
+        end = max(candidates)
+        seq = notes[i : end + 1]
+        onset = seq[0].start_tick
+        group_end = max(n.end_tick for n in seq)
+        span = max(1, group_end - onset)
+        ratios = [(n.start_tick - onset) / span for n in seq]
+        groups.append(
+            OrnamentGroup(
+                note_ids=[n.note_id for n in seq],
+                onset_tick=onset,
+                end_tick=group_end,
+                internal_ratios=ratios,
+            )
+        )
+        i = end + 1
+    return groups
+
+
+def _detect_fast_runs(
+    notes: list[DeperformNote],
+    grid_ticks: int,
+    excluded_note_ids: set[int],
+) -> list[list[int]]:
+    """Detect rapid local melodic runs that should keep internal timing.
+
+    This fallback protects ornament-like motion that doesn't satisfy the
+    stricter trill/turn/scale detectors.
     """
-    events.sort(key=lambda e: (e[0], e[1]))
-    cleaned: list[tuple[float, float, "music21.note.NotRest"]] = []
+    runs: list[list[int]] = []
+    if len(notes) < 4:
+        return runs
 
-    for start, end, note_obj in events:
-        start = max(0.0, start)
-        if end <= start:
-            end = start + grid_unit
+    candidates = [
+        n for n in sorted(notes, key=lambda n: (n.start_tick, -n.pitch, n.note_id))
+        if n.note_id not in excluded_note_ids
+    ]
+    if len(candidates) < 4:
+        return runs
 
-        if cleaned:
-            prev_start, prev_end, prev_note = cleaned[-1]
-            if start > prev_start and start < prev_end:
-                # Prefer preserving the new attack and shorten the prior note.
-                min_prev_end = prev_start + grid_unit
-                trimmed_prev_end = max(min_prev_end, start)
-                if trimmed_prev_end <= start:
-                    cleaned[-1] = (prev_start, trimmed_prev_end, prev_note)
-                else:
-                    # Prior note is already at minimum duration; move this one.
-                    start = prev_end
-                    if end <= start:
-                        end = start + grid_unit
+    used: set[int] = set()
+    for i, start_note in enumerate(candidates):
+        if start_note.note_id in used:
+            continue
 
-        cleaned.append((start, end, note_obj))
+        run = [start_note]
+        prev = start_note
+        min_pitch = start_note.pitch
+        max_pitch = start_note.pitch
 
-    return cleaned
+        for cand in candidates[i + 1 :]:
+            if cand.note_id in used:
+                continue
+            if cand.start_tick <= prev.start_tick:
+                # Same-onset chord tones should not break run detection.
+                continue
+            ioi = cand.start_tick - prev.start_tick
+            if ioi >= grid_ticks:
+                # Sequence is no longer fast relative to grid.
+                break
+            if abs(cand.pitch - prev.pitch) > 7:
+                continue
+
+            next_min = min(min_pitch, cand.pitch)
+            next_max = max(max_pitch, cand.pitch)
+            if (next_max - next_min) > 12:
+                continue
+
+            run.append(cand)
+            prev = cand
+            min_pitch = next_min
+            max_pitch = next_max
+
+        run_span = run[-1].start_tick - run[0].start_tick
+        if len(run) >= 4 and run_span <= (12 * grid_ticks):
+            run_ids = [n.note_id for n in run]
+            runs.append(run_ids)
+            used.update(run_ids)
+
+    return runs
 
 
-def _snap_duration_to_musical_bins(duration_q: float, grid_unit: float) -> float:
-    """Snap duration to a conservative musical bin set.
+def _deperform_channel_notes(
+    notes: list[DeperformNote],
+    tpqn: int,
+    grid_ticks: int,
+    duration_grid_ticks: int,
+    time_sig_numerator: int,
+    time_sig_denominator: int,
+    protect_ornaments: bool,
+) -> None:
+    if not notes:
+        return
 
-    This avoids odd residual bins (e.g. 1.25q, 1.75q, 2.25q) that often arise
-    from de-perform rounding noise and sound irregular in contrapuntal voices.
-    """
-    if duration_q <= grid_unit:
-        return grid_unit
+    notes.sort(key=lambda n: (n.start_tick, n.pitch, n.note_id))
+    notes_by_id = {n.note_id: n for n in notes}
+    onset_map = {
+        n.note_id: _snap_onset_metric(
+            n.start_tick, grid_ticks, tpqn, time_sig_numerator, time_sig_denominator
+        )
+        for n in notes
+    }
 
-    multipliers = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32]
-    bins = [grid_unit * m for m in multipliers]
-    # Extend bins upward for unusually long notes.
-    while bins[-1] < duration_q:
-        bins.append(bins[-1] + grid_unit * 8)
-    return min(bins, key=lambda b: abs(b - duration_q))
+    groups = _detect_ornament_groups(notes, tpqn) if protect_ornaments else []
+    group_by_note: dict[int, int] = {}
+    group_note_order: dict[int, list[int]] = {}
+
+    for gid, group in enumerate(groups):
+        for nid in group.note_ids:
+            group_by_note[nid] = gid
+        group_note_order[gid] = list(group.note_ids)
+
+        snapped_onset = _snap_onset_metric(
+            group.onset_tick, grid_ticks, tpqn, time_sig_numerator, time_sig_denominator
+        )
+        snapped_end = _nearest_grid_tick(group.end_tick, grid_ticks)
+        if snapped_end <= snapped_onset:
+            snapped_end = snapped_onset + max(grid_ticks, len(group.note_ids))
+        snapped_span = max(1, snapped_end - snapped_onset)
+
+        prev_start = snapped_onset - 1
+        for nid, ratio in zip(group.note_ids, group.internal_ratios):
+            new_start = snapped_onset + int(round(ratio * snapped_span))
+            if new_start <= prev_start:
+                new_start = prev_start + 1
+            onset_map[nid] = new_start
+            prev_start = new_start
+
+    excluded = set(group_by_note.keys())
+    fast_runs = _detect_fast_runs(notes, grid_ticks=grid_ticks, excluded_note_ids=excluded)
+    fast_run_by_note: dict[int, tuple[int, int]] = {}
+    fast_run_note_order: dict[int, list[int]] = {}
+    for ridx, run_note_ids in enumerate(fast_runs):
+        run_notes = [notes_by_id[nid] for nid in run_note_ids if nid in notes_by_id]
+        if len(run_notes) < 4:
+            continue
+
+        run_notes.sort(key=lambda n: (n.start_tick, n.note_id))
+        base_raw = run_notes[0].start_tick
+        base_snap = _snap_onset_metric(
+            base_raw, grid_ticks, tpqn, time_sig_numerator, time_sig_denominator
+        )
+        prev_start = base_snap - 1
+        ordered_ids: list[int] = []
+        for pos, rn in enumerate(run_notes):
+            new_start = base_snap + (rn.start_tick - base_raw)
+            if new_start <= prev_start:
+                new_start = prev_start + 1
+            onset_map[rn.note_id] = new_start
+            prev_start = new_start
+            ordered_ids.append(rn.note_id)
+            fast_run_by_note[rn.note_id] = (ridx, pos)
+        fast_run_note_order[ridx] = ordered_ids
+
+    for i, note in enumerate(notes):
+        if note.note_id in group_by_note or note.note_id in fast_run_by_note:
+            continue
+        raw_dur = note.end_tick - note.start_tick
+        if raw_dur >= int(round(0.6 * grid_ticks)):
+            continue
+        next_note = None
+        for j in range(i + 1, len(notes)):
+            if notes[j].start_tick > note.start_tick:
+                next_note = notes[j]
+                break
+        if next_note is None:
+            continue
+        if (next_note.start_tick - note.start_tick) >= grid_ticks:
+            continue
+        main_snap = onset_map[next_note.note_id]
+        grace_start = max(0, main_snap - grid_ticks)
+        if grace_start >= main_snap:
+            grace_start = max(0, main_snap - 1)
+        onset_map[note.note_id] = grace_start
+
+    for note in notes:
+        note.new_start_tick = max(0, int(onset_map[note.note_id]))
+
+    sorted_by_new = sorted(notes, key=lambda n: (n.new_start_tick, n.pitch, n.note_id))
+
+    pos_in_group: dict[int, tuple[int, int]] = {}
+    for gid, note_ids in group_note_order.items():
+        ordered = sorted(note_ids, key=lambda nid: onset_map[nid])
+        group_note_order[gid] = ordered
+        for idx, nid in enumerate(ordered):
+            pos_in_group[nid] = (gid, idx)
+
+    for idx, note in enumerate(sorted_by_new):
+        group_pos = pos_in_group.get(note.note_id)
+        if group_pos is not None and protect_ornaments:
+            gid, npos = group_pos
+            ordered = group_note_order[gid]
+            if npos < len(ordered) - 1:
+                next_note = notes_by_id[ordered[npos + 1]]
+                dur = max(1, next_note.new_start_tick - note.new_start_tick)
+            else:
+                raw_dur = max(1, note.end_tick - note.start_tick)
+                dur = max(duration_grid_ticks, _nearest_duration_bin(raw_dur, duration_grid_ticks))
+        elif note.note_id in fast_run_by_note:
+            ridx, rpos = fast_run_by_note[note.note_id]
+            ordered = fast_run_note_order.get(ridx, [])
+            if rpos < len(ordered) - 1:
+                next_note = notes_by_id[ordered[rpos + 1]]
+                dur = max(1, next_note.new_start_tick - note.new_start_tick)
+            else:
+                raw_dur = max(1, note.end_tick - note.start_tick)
+                dur = max(duration_grid_ticks, _nearest_duration_bin(raw_dur, duration_grid_ticks))
+        else:
+            next_onset = None
+            for nxt in sorted_by_new[idx + 1 :]:
+                if nxt.new_start_tick <= note.new_start_tick:
+                    continue
+                if nxt.pitch != note.pitch:
+                    next_onset = nxt.new_start_tick
+                    break
+            if next_onset is not None:
+                ioi = max(1, next_onset - note.new_start_tick)
+                snapped = _nearest_duration_bin(ioi, duration_grid_ticks)
+                dur = max(duration_grid_ticks, min(snapped, ioi))
+            else:
+                raw_dur = max(1, note.end_tick - note.start_tick)
+                snapped = _nearest_duration_bin(raw_dur, duration_grid_ticks)
+                dur = max(duration_grid_ticks, snapped)
+        note.new_end_tick = note.new_start_tick + max(1, int(dur))
+
+    from collections import defaultdict
+
+    by_pitch: dict[int, list[DeperformNote]] = defaultdict(list)
+    for note in notes:
+        by_pitch[note.pitch].append(note)
+
+    for seq in by_pitch.values():
+        seq.sort(key=lambda n: (n.new_start_tick, n.note_id))
+        for prev, cur in zip(seq, seq[1:]):
+            if prev.new_end_tick > cur.new_start_tick:
+                prev.new_end_tick = max(prev.new_start_tick + 1, cur.new_start_tick)
+
+    for note in notes:
+        if note.new_end_tick <= note.new_start_tick:
+            note.new_end_tick = note.new_start_tick + 1
+
+
+def _extract_track_notes(track, track_index: int, grid_ticks: int) -> tuple[list[DeperformNote], list[tuple[int, object]], int]:
+    from collections import defaultdict, deque
+
+    current_tick = 0
+    next_note_id = 0
+    notes: list[DeperformNote] = []
+    passthrough: list[tuple[int, object]] = []
+    active = defaultdict(deque)
+
+    for msg in track:
+        current_tick += int(msg.time)
+        if msg.type == "note_on" and msg.velocity > 0:
+            channel = int(getattr(msg, "channel", 0))
+            key = (channel, int(msg.note))
+            active[key].append((current_tick, int(msg.velocity), next_note_id))
+            next_note_id += 1
+            continue
+
+        if msg.type == "note_off" or (msg.type == "note_on" and msg.velocity == 0):
+            channel = int(getattr(msg, "channel", 0))
+            key = (channel, int(msg.note))
+            if active[key]:
+                start_tick, velocity, note_id = active[key].popleft()
+                if not active[key]:
+                    del active[key]
+                end_tick = max(current_tick, start_tick + 1)
+                notes.append(
+                    DeperformNote(
+                        note_id=note_id,
+                        start_tick=start_tick,
+                        end_tick=end_tick,
+                        pitch=int(msg.note),
+                        velocity=velocity,
+                        channel=channel,
+                        track_index=track_index,
+                    )
+                )
+            continue
+
+        if msg.type in {"control_change", "pitchwheel"}:
+            continue
+        if msg.is_meta and msg.type == "end_of_track":
+            continue
+        passthrough.append((current_tick, msg.copy(time=0)))
+
+    for (channel, pitch), starts in active.items():
+        while starts:
+            start_tick, velocity, note_id = starts.popleft()
+            end_tick = max(current_tick + grid_ticks, start_tick + 1)
+            notes.append(
+                DeperformNote(
+                    note_id=note_id,
+                    start_tick=start_tick,
+                    end_tick=end_tick,
+                    pitch=pitch,
+                    velocity=velocity,
+                    channel=channel,
+                    track_index=track_index,
+                )
+            )
+
+    return notes, passthrough, current_tick
 
 
 def deperform_midi(
     src: Path,
     dest: Path,
-    grid: int = 24,
+    grid: int = 16,
     velocity: int = 64,
     duration_grid: int | None = None,
 ) -> bool:
-    """Quantize timing, normalize velocity, strip CCs from a MIDI file.
+    """Quantize a performed MIDI with metric-aware onset snapping.
 
     Args:
         src: Input MIDI path.
         dest: Output MIDI path.
         grid: Quantization grid as subdivision of a quarter note.
               16 = 16th notes, 12 = triplet 8ths, 24 = 16th triplets.
-        velocity: Fixed velocity for all notes.
+        velocity: Fixed velocity for all output note-on events.
         duration_grid: Optional separate duration grid subdivision. If None,
                        uses ``grid``. Example: onset grid=16, duration_grid=8.
-
-    TODO: Current deperform is not sufficient for all live/performed fugue
-    inputs. It still needs robust trill-aware voice assignment after
-    separation to avoid cross-voice ornament bleed.
 
     Returns:
         True if successful.
     """
     try:
-        import music21
-        score = music21.converter.parse(str(src))
+        import mido
+
+        mid = mido.MidiFile(str(src))
     except Exception:
         return False
 
@@ -476,72 +955,112 @@ def deperform_midi(
         duration_grid = grid
     if duration_grid <= 0:
         return False
-    onset_grid_unit = 4.0 / grid       # e.g. grid=16 -> 0.25 quarter notes
-    duration_grid_unit = 4.0 / duration_grid
+    tpqn = max(1, int(mid.ticks_per_beat))
+    grid_ticks = _grid_ticks(tpqn, grid)
+    duration_grid_ticks = _grid_ticks(tpqn, duration_grid)
+    ts_num, ts_den = _extract_first_time_signature(mid)
+    protect_ornaments = bool(DEPERFORM_PROTECT_ORNAMENTS)
 
-    out_score = music21.stream.Score()
+    out_mid = mido.MidiFile(ticks_per_beat=tpqn)
 
-    for part in score.parts:
-        out_part = music21.stream.Part(id=getattr(part, "id", None))
+    for track_idx, track in enumerate(mid.tracks):
+        notes, passthrough, track_end = _extract_track_notes(track, track_idx, grid_ticks)
+        if notes:
+            from collections import defaultdict
 
-        # Keep first instrument/time-signature/key-signature/clef context.
-        for cls in (
-            music21.instrument.Instrument,
-            music21.meter.TimeSignature,
-            music21.key.KeySignature,
-            music21.clef.Clef,
-        ):
-            first = next(iter(part.recurse().getElementsByClass(cls)), None)
-            if first is not None:
-                out_part.insert(0, copy.deepcopy(first))
+            by_channel: dict[int, list[DeperformNote]] = defaultdict(list)
+            for note in notes:
+                by_channel[note.channel].append(note)
+            for channel_notes in by_channel.values():
+                _deperform_channel_notes(
+                    notes=channel_notes,
+                    tpqn=tpqn,
+                    grid_ticks=grid_ticks,
+                    duration_grid_ticks=duration_grid_ticks,
+                    time_sig_numerator=ts_num,
+                    time_sig_denominator=ts_den,
+                    protect_ornaments=protect_ornaments,
+                )
 
-        # Quantize using absolute start/end and repair overlap per voice stream.
-        events_by_stream: dict[int, list[tuple[float, float, music21.note.NotRest]]] = {}
-        for n in part.recurse().notes:
-            try:
-                raw_start = float(n.getOffsetInHierarchy(part))
-            except Exception:
-                raw_start = float(n.offset)
-            raw_dur = float(n.duration.quarterLength)
-            if raw_dur <= 0:
-                continue
+        out_track = mido.MidiTrack()
+        out_mid.tracks.append(out_track)
 
-            q_start = round(raw_start / onset_grid_unit) * onset_grid_unit
-            q_dur = _snap_duration_to_musical_bins(raw_dur, duration_grid_unit)
-            q_end = q_start + q_dur
-            if q_end <= q_start:
-                q_end = q_start + duration_grid_unit
+        events: list[tuple[int, int, int, object]] = []
+        serial = 0
+        for abs_tick, msg in passthrough:
+            events.append((int(abs_tick), 1, serial, msg))
+            serial += 1
 
-            voice_ctx = n.getContextByClass(music21.stream.Voice)
-            stream_key = id(voice_ctx) if voice_ctx is not None else -1
-            events_by_stream.setdefault(stream_key, []).append((q_start, q_end, n))
+        for note in notes:
+            start = max(0, int(note.new_start_tick))
+            end = max(start + 1, int(note.new_end_tick))
+            note_on = mido.Message(
+                "note_on",
+                note=int(note.pitch),
+                velocity=int(velocity),
+                time=0,
+                channel=int(note.channel),
+            )
+            note_off = mido.Message(
+                "note_off",
+                note=int(note.pitch),
+                velocity=0,
+                time=0,
+                channel=int(note.channel),
+            )
+            events.append((end, 0, serial, note_off))
+            serial += 1
+            events.append((start, 2, serial, note_on))
+            serial += 1
 
-        repaired_events: list[tuple[float, float, music21.note.NotRest]] = []
-        for stream_events in events_by_stream.values():
-            repaired_events.extend(_repair_overlaps_in_stream(stream_events, onset_grid_unit))
-        repaired_events.sort(key=lambda e: (e[0], e[1]))
+        max_tick = max([track_end] + [e[0] for e in events], default=0)
+        events.append((max_tick, 3, serial, mido.MetaMessage("end_of_track", time=0)))
+        events.sort(key=lambda e: (e[0], e[1], e[2]))
 
-        for start, end, note_obj in repaired_events:
-            new_note = copy.deepcopy(note_obj)
-            raw_dur_q = max(duration_grid_unit, end - start)
-            new_note.duration.quarterLength = _snap_duration_to_musical_bins(raw_dur_q, duration_grid_unit)
-            if hasattr(new_note, "volume"):
-                new_note.volume.velocity = velocity
-            out_part.insert(start, new_note)
-
-        out_score.insert(0, out_part)
-
-    # Strip source tempo map; write one fixed tempo.
-    out_score.insert(0, music21.tempo.MetronomeMark(number=120))
+        current_tick = 0
+        for abs_tick, _, _, msg in events:
+            msg.time = max(0, int(abs_tick) - current_tick)
+            out_track.append(msg)
+            current_tick = int(abs_tick)
 
     try:
-        out_score.write("midi", fp=str(dest))
+        out_mid.save(str(dest))
         return True
     except Exception:
         return False
 
 
-def deperform_all(triage_results: dict, base_dir: Path, grid: int = 16) -> int:
+def _parallel_workers(workers: int) -> int:
+    """Clamp requested worker count to a safe positive value."""
+    try:
+        value = int(workers)
+    except Exception:
+        value = 1
+    if value < 1:
+        value = 1
+    return min(value, 32)
+
+
+def _deperform_one_file(
+    key: str,
+    src: Path,
+    dest: Path,
+    grid: int,
+) -> tuple[bool, str, dict | None]:
+    """Run deperform + re-triage for one file."""
+    ok = deperform_midi(src, dest, grid=grid)
+    if not ok:
+        return False, "deperform failed", None
+    result = triage_midi(dest)
+    return True, "ok", result
+
+
+def deperform_all(
+    triage_results: dict,
+    base_dir: Path,
+    grid: int = 16,
+    workers: int = 1,
+) -> int:
     """De-perform all files marked as needs_deperform.
 
     Processed files are written alongside originals with a .deperformed.mid
@@ -555,27 +1074,61 @@ def deperform_all(triage_results: dict, base_dir: Path, grid: int = 16) -> int:
         print("  No files need de-performing.")
         return 0
 
-    print(f"  De-performing {len(to_process)} files (grid=1/{grid})...")
+    print(
+        f"  De-performing {len(to_process)} files (grid=1/{grid},"
+        f" protect_ornaments={DEPERFORM_PROTECT_ORNAMENTS})..."
+    )
+    n_workers = _parallel_workers(workers)
+    if n_workers > 1:
+        print(f"    Using {n_workers} worker threads")
     processed = 0
 
-    for key, info in to_process:
-        src = base_dir / key
-        dest = src.with_suffix(".deperformed.mid")
-        if dest.exists():
-            processed += 1
-            continue
+    if n_workers == 1:
+        for key, _info in to_process:
+            src = base_dir / key
+            dest = src.with_suffix(".deperformed.mid")
+            if dest.exists():
+                processed += 1
+                continue
+            ok, _reason, result = _deperform_one_file(key=key, src=src, dest=dest, grid=grid)
+            if ok and result is not None:
+                processed += 1
+                new_key = key.replace(".mid", ".deperformed.mid")
+                triage_results[new_key] = result
+                status_icons = {"clean": "+", "needs_deperform": "~", "needs_voice_sep": "V", "needs_voice_reduce": "R", "bad": "x", "pending": "?"}
+                icon = status_icons.get(result["status"], "?")
+                print(f"    [{icon}] {dest.name}: {result['status']}")
+            else:
+                print(f"    FAILED: {src.name}")
+        return processed
 
-        if deperform_midi(src, dest, grid=grid):
-            processed += 1
-            # Re-triage the cleaned file
-            result = triage_midi(dest)
-            new_key = key.replace(".mid", ".deperformed.mid")
-            triage_results[new_key] = result
-            status_icons = {"clean": "+", "needs_deperform": "~", "needs_voice_sep": "V", "needs_voice_reduce": "R", "bad": "x", "pending": "?"}
-            icon = status_icons.get(result["status"], "?")
-            print(f"    [{icon}] {dest.name}: {result['status']}")
-        else:
-            print(f"    FAILED: {src.name}")
+    futures = {}
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        for key, _info in to_process:
+            src = base_dir / key
+            dest = src.with_suffix(".deperformed.mid")
+            if dest.exists():
+                processed += 1
+                continue
+            fut = pool.submit(_deperform_one_file, key, src, dest, grid)
+            futures[fut] = (key, src, dest)
+
+        for fut in as_completed(futures):
+            key, src, dest = futures[fut]
+            try:
+                ok, _reason, result = fut.result()
+            except Exception as e:
+                print(f"    FAILED: {src.name} ({e})")
+                continue
+            if ok and result is not None:
+                processed += 1
+                new_key = key.replace(".mid", ".deperformed.mid")
+                triage_results[new_key] = result
+                status_icons = {"clean": "+", "needs_deperform": "~", "needs_voice_sep": "V", "needs_voice_reduce": "R", "bad": "x", "pending": "?"}
+                icon = status_icons.get(result["status"], "?")
+                print(f"    [{icon}] {dest.name}: {result['status']}")
+            else:
+                print(f"    FAILED: {src.name}")
 
     return processed
 
@@ -711,14 +1264,6 @@ def _build_onset_clusters(
 
     flush_cluster()
     return clusters
-
-
-def _p90_cluster_size(values: list[int]) -> int:
-    if not values:
-        return 2
-    ordered = sorted(values)
-    idx = max(0, math.ceil(0.9 * len(ordered)) - 1)
-    return ordered[idx]
 
 
 def _assignment_crosses_neighbors(note_pitch: int, voice_idx: int, voices: list[VoiceStream]) -> bool:
@@ -859,6 +1404,69 @@ def _validate_voice_assignment(voices: list[VoiceStream]) -> tuple[bool, str | N
     return True, None
 
 
+def _run_voice_assignment(
+    clusters: list[tuple[int, list[SeparatedNote]]],
+    initial_cap: int,
+    on_cap: str,
+    tpqn: int,
+    safety_max: int = VOICE_SEP_SAFETY_MAX,
+) -> tuple[bool, list[VoiceStream] | None, str | None]:
+    """Run greedy voice assignment over onset clusters."""
+    cap = max(2, int(initial_cap))
+    voices: list[VoiceStream] = []
+
+    for canonical_onset, cluster_notes in clusters:
+        if len(cluster_notes) > cap:
+            if on_cap == "raise-cap":
+                if len(cluster_notes) > safety_max:
+                    return (
+                        False,
+                        None,
+                        f"cluster of size {len(cluster_notes)} exceeds safety cap {safety_max}",
+                    )
+                cap = min(safety_max, len(cluster_notes))
+            else:
+                return False, None, f"cluster of size {len(cluster_notes)} exceeds voice cap {cap}"
+
+        for note in sorted(cluster_notes, key=lambda n: n.pitch, reverse=True):
+            note.assign_start_tick = canonical_onset
+            best_idx = None
+            best_cost = None
+
+            for idx, voice in enumerate(voices):
+                if note.assign_start_tick < voice.last_end_tick_effective:
+                    continue
+                cost = _assignment_cost(note, idx, voices, tpqn)
+                if best_cost is None or cost < best_cost:
+                    best_cost = cost
+                    best_idx = idx
+
+            if best_idx is None:
+                if len(voices) < cap:
+                    voices.append(VoiceStream())
+                    best_idx = len(voices) - 1
+                else:
+                    return (
+                        False,
+                        None,
+                        f"no legal voice for note at tick {canonical_onset} under cap {cap}",
+                    )
+
+            _assign_note(voices[best_idx], note)
+
+    voices = [v for v in voices if v.notes]
+    if not voices:
+        return False, None, "no voices inferred"
+
+    voices.sort(key=_voice_ref_pitch, reverse=True)
+    _crossing_cleanup(voices)
+
+    ok, reason = _validate_voice_assignment(voices)
+    if not ok:
+        return False, None, reason
+    return True, voices, None
+
+
 def _extract_preserved_meta(mid) -> list[tuple[int, object]]:
     """Extract tempo/time-signature meta events to keep in separated output."""
     keep = []
@@ -916,13 +1524,15 @@ def _write_separated_midi(mid, voices: list[VoiceStream], dest: Path) -> None:
         out_mid.tracks.append(track)
 
         events = []
+        # Assign one MIDI channel per separated voice track so viewers that
+        # group by either track or channel still show independent voices.
+        voice_channel = int(voice_idx % 16)
         for note in sorted(voice.notes, key=lambda n: (n.start_tick, n.end_tick, -n.pitch)):
             start = max(0, int(note.start_tick))
             end = max(start + 1, int(note.end_tick))
-            channel = int(note.src_channel) if 0 <= int(note.src_channel) <= 15 else int(voice_idx % 16)
             velocity = int(note.velocity) if int(note.velocity) > 0 else 64
-            events.append((start, 1, int(note.pitch), velocity, channel))
-            events.append((end, 0, int(note.pitch), 0, channel))
+            events.append((start, 1, int(note.pitch), velocity, voice_channel))
+            events.append((end, 0, int(note.pitch), 0, voice_channel))
 
         events.sort(key=lambda e: (e[0], e[1], e[2]))  # note_off before note_on at same tick
 
@@ -952,7 +1562,7 @@ def voice_separate_midi(
     max_voices: int = 16,
     mode: str = "auto",
     jitter_ratio: float = 0.025,
-    on_cap: str = "fail",
+    on_cap: str = "raise-cap",
     ignore_pedal: bool = True,
 ) -> tuple[bool, str | None]:
     """Separate voices using direct MIDI event assignment (no MuseScore)."""
@@ -981,59 +1591,40 @@ def voice_separate_midi(
     if not clusters:
         return False, "no onset clusters"
 
-    cluster_sizes = [len(cnotes) for _, cnotes in clusters]
     if mode == "auto":
-        target_voices = max(2, min(max_voices, _p90_cluster_size(cluster_sizes)))
+        ok1, trial_voices, reason1 = _run_voice_assignment(
+            clusters=clusters,
+            initial_cap=max_voices,
+            on_cap=on_cap,
+            tpqn=tpqn,
+        )
+        if not ok1:
+            return False, reason1
+
+        discovered_count = len(trial_voices) if trial_voices is not None else 0
+        target_cap = max(2, min(max_voices, discovered_count))
+        print(f"    auto: discovered {discovered_count} voices, using cap={target_cap}")
+
+        ok2, voices, reason2 = _run_voice_assignment(
+            clusters=clusters,
+            initial_cap=target_cap,
+            on_cap=on_cap,
+            tpqn=tpqn,
+        )
+        if not ok2 or voices is None:
+            voices = trial_voices
     else:
-        target_voices = max_voices
-    cap = target_voices
+        ok, voices, reason = _run_voice_assignment(
+            clusters=clusters,
+            initial_cap=max_voices,
+            on_cap=on_cap,
+            tpqn=tpqn,
+        )
+        if not ok:
+            return False, reason
 
-    voices: list[VoiceStream] = []
-
-    for canonical_onset, cluster_notes in clusters:
-        if len(cluster_notes) > cap:
-            if on_cap == "raise-cap":
-                if len(cluster_notes) > VOICE_SEP_SAFETY_MAX:
-                    return False, (
-                        f"cluster of size {len(cluster_notes)} exceeds safety cap "
-                        f"{VOICE_SEP_SAFETY_MAX}"
-                    )
-                cap = min(VOICE_SEP_SAFETY_MAX, len(cluster_notes))
-            else:
-                return False, f"cluster of size {len(cluster_notes)} exceeds voice cap {cap}"
-
-        for note in sorted(cluster_notes, key=lambda n: n.pitch, reverse=True):
-            note.assign_start_tick = canonical_onset
-            best_idx = None
-            best_cost = None
-
-            for idx, voice in enumerate(voices):
-                if note.assign_start_tick < voice.last_end_tick_effective:
-                    continue
-                cost = _assignment_cost(note, idx, voices, tpqn)
-                if best_cost is None or cost < best_cost:
-                    best_cost = cost
-                    best_idx = idx
-
-            if best_idx is None:
-                if len(voices) < cap:
-                    voices.append(VoiceStream())
-                    best_idx = len(voices) - 1
-                else:
-                    return False, f"no legal voice for note at tick {canonical_onset} under cap {cap}"
-
-            _assign_note(voices[best_idx], note)
-
-    voices = [v for v in voices if v.notes]
     if not voices:
         return False, "no voices inferred"
-
-    voices.sort(key=_voice_ref_pitch, reverse=True)
-    _crossing_cleanup(voices)
-
-    ok, reason = _validate_voice_assignment(voices)
-    if not ok:
-        return False, reason
 
     try:
         _write_separated_midi(mid, voices, dest)
@@ -1042,16 +1633,52 @@ def voice_separate_midi(
     return True, None
 
 
+def _voice_separate_one_file(
+    src: Path,
+    dest: Path,
+    retry_attempts: list[dict],
+) -> tuple[bool, int, str | None, dict | None]:
+    """Run voice separation retry ladder for one file + re-triage."""
+    ok = False
+    reason: str | None = None
+    attempt_idx = 0
+    for attempt_idx, attempt in enumerate(retry_attempts, start=1):
+        ok, reason = voice_separate_midi(
+            src=src,
+            dest=dest,
+            max_voices=attempt["max_voices"],
+            mode=attempt["mode"],
+            jitter_ratio=attempt["jitter_ratio"],
+            on_cap=attempt["on_cap"],
+            ignore_pedal=attempt["ignore_pedal"],
+        )
+        if ok:
+            break
+
+    if not ok:
+        return False, attempt_idx, reason, None
+
+    result = triage_midi(dest)
+    return True, attempt_idx, None, result
+
+
 def voice_separate_all(
     triage_results: dict,
     base_dir: Path,
     max_voices: int = 16,
     mode: str = "auto",
     jitter_ratio: float = 0.025,
-    on_cap: str = "fail",
+    on_cap: str = "raise-cap",
     ignore_pedal: bool = True,
+    workers: int = 1,
 ) -> int:
-    """Run local voice separation on all files marked as needs_voice_sep."""
+    """Run local voice separation on all files marked as needs_voice_sep.
+
+    Uses a bounded retry ladder for hard files:
+      1) requested settings
+      2) fixed mode with larger cap
+      3) fixed mode at safety cap with slightly looser jitter
+    """
     to_process = [
         (k, v) for k, v in triage_results.items()
         if v.get("status") == "needs_voice_sep"
@@ -1068,36 +1695,132 @@ def voice_separate_all(
         f" (mode={mode}, cap={max_voices}, jitter_ratio={jitter_ratio:.4f},"
         f" on_cap={on_cap}, ignore_pedal={ignore_pedal})..."
     )
+    n_workers = _parallel_workers(workers)
+    if n_workers > 1:
+        print(f"    Using {n_workers} worker threads")
     processed = 0
 
-    for key, info in to_process:
-        src = base_dir / key
-        if not src.exists():
-            continue
+    retry_attempts = [
+        {
+            "label": "default",
+            "max_voices": max_voices,
+            "mode": mode,
+            "jitter_ratio": jitter_ratio,
+            "on_cap": on_cap,
+            "ignore_pedal": ignore_pedal,
+        }
+    ]
 
-        dest = src.with_suffix(".separated.mid")
-        if dest.exists():
-            processed += 1
-            continue
+    retry_cap = min(VOICE_SEP_SAFETY_MAX, max(max_voices * 2, max_voices + 4))
+    retry_attempts.append(
+        {
+            "label": "retry-cap",
+            "max_voices": retry_cap,
+            "mode": "fixed",
+            "jitter_ratio": jitter_ratio,
+            "on_cap": "raise-cap",
+            "ignore_pedal": ignore_pedal,
+        }
+    )
+    retry_attempts.append(
+        {
+            "label": "retry-cap-jitter",
+            "max_voices": VOICE_SEP_SAFETY_MAX,
+            "mode": "fixed",
+            "jitter_ratio": max(jitter_ratio, 0.04),
+            "on_cap": "raise-cap",
+            "ignore_pedal": ignore_pedal,
+        }
+    )
 
-        print(f"    Processing: {src.name}...", end=" ", flush=True)
-        ok, reason = voice_separate_midi(
-            src=src,
-            dest=dest,
-            max_voices=max_voices,
-            mode=mode,
-            jitter_ratio=jitter_ratio,
-            on_cap=on_cap,
-            ignore_pedal=ignore_pedal,
-        )
-        if ok:
-            processed += 1
-            result = triage_midi(dest)
-            new_key = key.replace(".mid", ".separated.mid")
-            triage_results[new_key] = result
-            print(f"→ {result['num_tracks']} tracks, {result['status']}")
-        else:
-            print(f"failed ({reason})")
+    if n_workers == 1:
+        for key, info in to_process:
+            src = base_dir / key
+            if not src.exists():
+                continue
+
+            dest = src.with_suffix(".separated.mid")
+            if dest.exists():
+                processed += 1
+                continue
+
+            print(f"    Processing: {src.name}...", end=" ", flush=True)
+            ok = False
+            reason = None
+            attempt_idx = 0
+            for attempt_idx, attempt in enumerate(retry_attempts, start=1):
+                if attempt_idx > 1:
+                    print(
+                        f"\n      retry {attempt_idx}: mode={attempt['mode']},"
+                        f" cap={attempt['max_voices']}, jitter={attempt['jitter_ratio']:.4f},"
+                        f" on_cap={attempt['on_cap']}...",
+                        end=" ",
+                        flush=True,
+                    )
+                ok, reason = voice_separate_midi(
+                    src=src,
+                    dest=dest,
+                    max_voices=attempt["max_voices"],
+                    mode=attempt["mode"],
+                    jitter_ratio=attempt["jitter_ratio"],
+                    on_cap=attempt["on_cap"],
+                    ignore_pedal=attempt["ignore_pedal"],
+                )
+                if ok:
+                    break
+
+            if ok:
+                processed += 1
+                result = triage_midi(dest)
+                new_key = key.replace(".mid", ".separated.mid")
+                triage_results[new_key] = result
+                if attempt_idx > 1:
+                    print(
+                        f"\n      succeeded on retry {attempt_idx}"
+                        f" ({retry_attempts[attempt_idx - 1]['label']})",
+                        end=" ",
+                    )
+                print(f"→ {result['num_tracks']} tracks, {result['status']}")
+            else:
+                print(f"failed ({reason})")
+        return processed
+
+    futures = {}
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        for key, info in to_process:
+            src = base_dir / key
+            if not src.exists():
+                continue
+
+            dest = src.with_suffix(".separated.mid")
+            if dest.exists():
+                processed += 1
+                continue
+
+            fut = pool.submit(_voice_separate_one_file, src, dest, retry_attempts)
+            futures[fut] = (key, src, dest)
+
+        for fut in as_completed(futures):
+            key, src, dest = futures[fut]
+            try:
+                ok, attempt_idx, reason, result = fut.result()
+            except Exception as e:
+                print(f"    {src.name}: failed ({e})")
+                continue
+
+            if ok and result is not None:
+                processed += 1
+                new_key = key.replace(".mid", ".separated.mid")
+                triage_results[new_key] = result
+                extra = ""
+                if attempt_idx > 1:
+                    extra = f" (retry {attempt_idx}: {retry_attempts[attempt_idx - 1]['label']})"
+                print(
+                    f"    {src.name}:{extra} → {result['num_tracks']} tracks,"
+                    f" {result['status']}"
+                )
+            else:
+                print(f"    {src.name}: failed ({reason})")
 
     return processed
 
@@ -1292,10 +2015,24 @@ def reduce_voices(
         return False
 
 
+def _reduce_one_file(
+    src: Path,
+    dest: Path,
+    max_voices: int,
+) -> tuple[bool, dict | None]:
+    """Run voice reduction + re-triage for one file."""
+    ok = reduce_voices(src, dest, max_voices=max_voices)
+    if not ok:
+        return False, None
+    result = triage_midi(dest)
+    return True, result
+
+
 def reduce_voices_all(
     triage_results: dict,
     base_dir: Path,
     max_voices: int = 4,
+    workers: int = 1,
 ) -> int:
     """Reduce all files with >max_voices to max_voices.
 
@@ -1317,32 +2054,66 @@ def reduce_voices_all(
         return 0
 
     print(f"  Reducing {len(to_process)} files to ≤{max_voices} voices...")
+    n_workers = _parallel_workers(workers)
+    if n_workers > 1:
+        print(f"    Using {n_workers} worker threads")
     processed = 0
 
-    for key, info in to_process:
-        src = base_dir / key
-        if not src.exists():
-            continue
+    if n_workers == 1:
+        for key, info in to_process:
+            src = base_dir / key
+            if not src.exists():
+                continue
 
-        dest = src.with_suffix(".reduced.mid")
-        if dest.exists():
-            processed += 1
-            continue
+            dest = src.with_suffix(".reduced.mid")
+            if dest.exists():
+                processed += 1
+                continue
 
-        original_tracks = info.get("tracks_with_notes", info.get("num_tracks", "?"))
-        print(f"    {src.name} ({original_tracks} voices)...", end=" ", flush=True)
+            original_tracks = info.get("tracks_with_notes", info.get("num_tracks", "?"))
+            print(f"    {src.name} ({original_tracks} voices)...", end=" ", flush=True)
 
-        if reduce_voices(src, dest, max_voices=max_voices):
-            processed += 1
-            result = triage_midi(dest)
-            new_key = key.replace(".mid", ".reduced.mid")
-            triage_results[new_key] = result
-            status_icons = {"clean": "+", "needs_deperform": "~", "needs_voice_sep": "V",
-                            "needs_voice_reduce": "R", "bad": "x", "pending": "?"}
-            icon = status_icons.get(result["status"], "?")
-            print(f"→ {result['num_tracks']} tracks, {result['status']}")
-        else:
-            print("skipped (already ≤4 or failed)")
+            ok, result = _reduce_one_file(src=src, dest=dest, max_voices=max_voices)
+            if ok and result is not None:
+                processed += 1
+                new_key = key.replace(".mid", ".reduced.mid")
+                triage_results[new_key] = result
+                status_icons = {"clean": "+", "needs_deperform": "~", "needs_voice_sep": "V",
+                                "needs_voice_reduce": "R", "bad": "x", "pending": "?"}
+                icon = status_icons.get(result["status"], "?")
+                print(f"→ {result['num_tracks']} tracks, {result['status']}")
+            else:
+                print("skipped (already ≤4 or failed)")
+        return processed
+
+    futures = {}
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        for key, info in to_process:
+            src = base_dir / key
+            if not src.exists():
+                continue
+            dest = src.with_suffix(".reduced.mid")
+            if dest.exists():
+                processed += 1
+                continue
+            fut = pool.submit(_reduce_one_file, src, dest, max_voices)
+            futures[fut] = (key, src, dest, info)
+
+        for fut in as_completed(futures):
+            key, src, dest, info = futures[fut]
+            try:
+                ok, result = fut.result()
+            except Exception as e:
+                print(f"    {src.name}: failed ({e})")
+                continue
+
+            if ok and result is not None:
+                processed += 1
+                new_key = key.replace(".mid", ".reduced.mid")
+                triage_results[new_key] = result
+                print(f"    {src.name}: → {result['num_tracks']} tracks, {result['status']}")
+            else:
+                print(f"    {src.name}: skipped (already ≤4 or failed)")
 
     return processed
 
@@ -1498,6 +2269,12 @@ FINGERPRINT_CACHE = OUT / "_fingerprints.json"
 
 def _parse_with_timeout(filepath: Path, timeout: int = 30):
     """Parse a music file with a timeout to avoid hanging on large/malformed files."""
+    # signal.alarm only works on the main thread. Worker threads fall back
+    # to plain parse to keep parallel triage/fix passes functional.
+    if threading.current_thread() is not threading.main_thread():
+        import music21
+        return music21.converter.parse(str(filepath))
+
     import signal
 
     class TimeoutError(Exception):
@@ -1812,8 +2589,333 @@ def filename_from_path(file_path: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Local dataset processing helpers
 # ---------------------------------------------------------------------------
+
+SUPPORTED_LOCAL_EXTENSIONS = {
+    ".mid",
+    ".midi",
+    ".krn",
+    ".mxl",
+    ".musicxml",
+    ".xml",
+    ".mscx",
+    ".mscz",
+}
+
+
+def _is_derived_key(key: str) -> bool:
+    return any(marker in key for marker in (".deperformed.", ".separated.", ".reduced."))
+
+
+def _is_derived_midi_name(name: str) -> bool:
+    lower = name.lower()
+    if lower.endswith(CONVERTED_FROM_SCORE_SUFFIX):
+        return True
+    return any(lower.endswith(suffix) for suffix in DERIVED_MIDI_SUFFIXES)
+
+
+def _derived_variant_key(key: str, suffix: str) -> str:
+    lower = key.lower()
+    if lower.endswith(".mid"):
+        return key[:-4] + suffix
+    if lower.endswith(".midi"):
+        return key[:-5] + suffix
+    return key + suffix
+
+
+def _dataset_report_file(dataset_dir: Path) -> Path:
+    return dataset_dir / "_triage_report.json"
+
+
+def _iter_dataset_source_files(base_dir: Path) -> list[Path]:
+    """List score files to process for local dataset triage/fixes."""
+    files: list[Path] = []
+    for f in sorted(base_dir.rglob("*")):
+        if not f.is_file():
+            continue
+        rel = f.relative_to(base_dir)
+        if any(part.startswith("_") for part in rel.parts[:-1]):
+            continue
+        suffix = f.suffix.lower()
+        if suffix not in SUPPORTED_LOCAL_EXTENSIONS:
+            continue
+        if suffix in {".mid", ".midi"} and _is_derived_midi_name(f.name):
+            continue
+        files.append(f)
+    return files
+
+
+def _converted_midi_path(src: Path) -> Path:
+    return src.with_name(f"{src.name}{CONVERTED_FROM_SCORE_SUFFIX}")
+
+
+def _convert_score_to_midi(src: Path, dest: Path, timeout: int = 90) -> tuple[bool, str | None]:
+    """Convert non-MIDI score files into MIDI so fix passes can run uniformly."""
+    try:
+        score = _parse_with_timeout(src, timeout=timeout)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        score.write("midi", fp=str(dest))
+        return True, None
+    except Exception as e:
+        dest.unlink(missing_ok=True)
+        return False, str(e)
+
+
+def _triage_local_source_file(
+    src: Path,
+    midi_path: Path,
+    base_dir: Path,
+) -> dict:
+    """Convert (if needed) and triage one local source file."""
+    converted = False
+    if src != midi_path and not midi_path.exists():
+        ok, reason = _convert_score_to_midi(src, midi_path)
+        if not ok:
+            return {
+                "ok": False,
+                "key": str(midi_path.relative_to(base_dir)),
+                "source_name": src.name,
+                "reason": reason or "conversion failed",
+                "converted": False,
+            }
+        converted = True
+
+    result = triage_midi(midi_path)
+    if src != midi_path:
+        result["converted_from"] = str(src.relative_to(base_dir))
+
+    return {
+        "ok": True,
+        "key": str(midi_path.relative_to(base_dir)),
+        "midi_name": midi_path.name,
+        "result": result,
+        "converted": converted,
+    }
+
+
+def triage_local_dataset(
+    triage_results: dict,
+    base_dir: Path,
+    workers: int = 1,
+) -> dict[str, int]:
+    """Triage all local dataset files, converting notation to MIDI when needed."""
+    source_files = _iter_dataset_source_files(base_dir)
+    print(f"  Triaging {len(source_files)} source files...")
+
+    stats = {
+        "sources": len(source_files),
+        "converted": 0,
+        "triaged": 0,
+        "failed_conversion": 0,
+        "skipped": 0,
+    }
+
+    to_process: list[tuple[Path, Path]] = []
+    for src in source_files:
+        src_suffix = src.suffix.lower()
+        if src_suffix in {".mid", ".midi"}:
+            midi_path = src
+            key = str(midi_path.relative_to(base_dir))
+            if key in triage_results and triage_results[key].get("status") != "pending":
+                stats["skipped"] += 1
+                continue
+            to_process.append((src, midi_path))
+            continue
+
+        midi_path = _converted_midi_path(src)
+        key = str(midi_path.relative_to(base_dir))
+        if (
+            key in triage_results
+            and triage_results[key].get("status") != "pending"
+            and midi_path.exists()
+        ):
+            stats["skipped"] += 1
+            continue
+        to_process.append((src, midi_path))
+
+    n_workers = _parallel_workers(workers)
+    if n_workers > 1:
+        print(f"    Using {n_workers} worker threads for triage")
+
+    def _handle_outcome(outcome: dict) -> None:
+        if outcome.get("ok"):
+            key = outcome["key"]
+            result = outcome["result"]
+            triage_results[key] = result
+            stats["triaged"] += 1
+            if outcome.get("converted"):
+                stats["converted"] += 1
+            status_icons = {
+                "clean": "+",
+                "needs_deperform": "~",
+                "needs_voice_sep": "V",
+                "needs_voice_reduce": "R",
+                "bad": "x",
+                "pending": "?",
+            }
+            icon = status_icons.get(result.get("status", "pending"), "?")
+            print(f"    [{icon}] {outcome['midi_name']}: {result.get('status', 'pending')}")
+            return
+
+        key = outcome["key"]
+        reason = outcome.get("reason", "conversion failed")
+        triage_results[key] = {
+            "status": "bad",
+            "num_tracks": 0,
+            "issues": [f"score->midi conversion failed: {reason}"],
+        }
+        stats["failed_conversion"] += 1
+        print(f"    [x] {outcome.get('source_name', key)}: conversion failed ({reason})")
+
+    if n_workers == 1:
+        for src, midi_path in to_process:
+            outcome = _triage_local_source_file(src=src, midi_path=midi_path, base_dir=base_dir)
+            _handle_outcome(outcome)
+    else:
+        futures = {}
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            for src, midi_path in to_process:
+                fut = pool.submit(_triage_local_source_file, src, midi_path, base_dir)
+                futures[fut] = (src, midi_path)
+            for fut in as_completed(futures):
+                src, midi_path = futures[fut]
+                try:
+                    outcome = fut.result()
+                except Exception as e:
+                    outcome = {
+                        "ok": False,
+                        "key": str(midi_path.relative_to(base_dir)),
+                        "source_name": src.name,
+                        "reason": str(e),
+                        "converted": False,
+                    }
+                _handle_outcome(outcome)
+
+    print(
+        "  Triage pass complete:"
+        f" triaged={stats['triaged']}, converted={stats['converted']},"
+        f" conversion_failures={stats['failed_conversion']}, skipped={stats['skipped']}"
+    )
+    return stats
+
+
+def _best_clean_candidate(
+    key: str,
+    info: dict,
+    triage_results: dict,
+    base_dir: Path,
+) -> tuple[Path, str] | None:
+    """Pick the best clean file variant for a given original triage key."""
+    if info.get("is_internal_dup") or info.get("is_trusted_dup"):
+        return None
+
+    candidates: list[tuple[Path, str]] = []
+    variants = [
+        (".reduced.mid", "reduced"),
+        (".deperformed.mid", "deperformed"),
+        (".separated.mid", "separated"),
+    ]
+    for suffix, label in variants:
+        variant_key = _derived_variant_key(key, suffix)
+        variant_info = triage_results.get(variant_key)
+        if not isinstance(variant_info, dict):
+            continue
+        if variant_info.get("status") != "clean":
+            continue
+        variant_path = base_dir / variant_key
+        if variant_path.exists():
+            candidates.append((variant_path, label))
+
+    src = base_dir / key
+    if info.get("status") == "clean" and src.exists():
+        candidates.append((src, "original"))
+
+    if not candidates:
+        return None
+
+    priority = {"reduced": 0, "deperformed": 1, "separated": 2, "original": 3}
+    candidates.sort(key=lambda c: priority.get(c[1], 99))
+    return candidates[0]
+
+
+def discover_dataset_dirs(data_root: Path = MIDI_DATA_ROOT) -> list[Path]:
+    """Discover dataset directories under data/midi."""
+    dirs = []
+    for p in sorted(data_root.iterdir()):
+        if not p.is_dir():
+            continue
+        if p.name == "all" or p.name.startswith("_"):
+            continue
+        dirs.append(p)
+    return dirs
+
+
+def fold_datasets_into_all(
+    dataset_triage_reports: dict[str, dict],
+    data_root: Path = MIDI_DATA_ROOT,
+    output_dir: Path = ALL_DATASET_DIR,
+) -> dict[str, int]:
+    """Fold all datasets into data/midi/all/<composer>/ using best clean variants."""
+    import shutil
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stats = {
+        "datasets": 0,
+        "written": 0,
+        "replaced": 0,
+        "skipped": 0,
+        "missing": 0,
+    }
+
+    for dataset_name, triage_results in sorted(dataset_triage_reports.items()):
+        base_dir = data_root / dataset_name
+        if not base_dir.exists():
+            continue
+        stats["datasets"] += 1
+
+        for key, info in sorted(triage_results.items()):
+            if _is_derived_key(key):
+                continue
+            if not isinstance(info, dict):
+                continue
+
+            selected = _best_clean_candidate(
+                key=key,
+                info=info,
+                triage_results=triage_results,
+                base_dir=base_dir,
+            )
+            if selected is None:
+                stats["skipped"] += 1
+                continue
+
+            source_path, _kind = selected
+            rel_parts = Path(key).parts
+            composer = rel_parts[0] if len(rel_parts) >= 2 else "misc"
+            within_composer = "__".join(rel_parts[1:]) if len(rel_parts) >= 2 else rel_parts[0]
+            dest_dir = output_dir / composer
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest = dest_dir / f"{dataset_name}__{within_composer}"
+
+            if not source_path.exists():
+                stats["missing"] += 1
+                continue
+
+            if dest.exists():
+                stats["replaced"] += 1
+            try:
+                shutil.copy2(source_path, dest)
+                stats["written"] += 1
+            except OSError:
+                stats["missing"] += 1
+
+    print(
+        f"  Folded datasets into {output_dir}/:"
+        f" datasets={stats['datasets']}, written={stats['written']},"
+        f" replaced={stats['replaced']}, skipped={stats['skipped']}, missing={stats['missing']}"
+    )
+    return stats
 
 # ---------------------------------------------------------------------------
 # Collect: gather training-ready files into a clean output directory
@@ -1969,11 +3071,117 @@ def purge_derived_midis(base_dir: Path, triage_results: dict) -> dict[str, int]:
     return counts
 
 
+def run_fix_pipeline_for_dataset(
+    dataset_dir: Path,
+    triage_results: dict,
+    *,
+    do_purge_derived: bool,
+    do_deperform: bool,
+    deperform_grid: int,
+    do_voice_sep: bool,
+    voice_sep_max_voices: int,
+    voice_sep_mode: str,
+    voice_sep_jitter_ratio: float,
+    voice_sep_on_cap: str,
+    voice_sep_ignore_pedal: bool,
+    do_voice_reduce: bool,
+    voice_reduce_max: int,
+    do_collect: bool,
+    process_workers: int,
+) -> dict[str, int]:
+    """Run local triage/fix pipeline for a dataset directory."""
+    stats = {
+        "triaged": 0,
+        "converted": 0,
+        "deperformed": 0,
+        "separated": 0,
+        "reduced": 0,
+        "collected": 0,
+    }
+
+    if do_purge_derived:
+        print()
+        print("=" * 60)
+        print("  PURGE DERIVED MIDIS")
+        print("=" * 60)
+        purge_derived_midis(dataset_dir, triage_results)
+
+    triage_stats = triage_local_dataset(
+        triage_results=triage_results,
+        base_dir=dataset_dir,
+        workers=process_workers,
+    )
+    stats["triaged"] = triage_stats["triaged"]
+    stats["converted"] = triage_stats["converted"]
+
+    if do_deperform:
+        print()
+        print("=" * 60)
+        print("  DE-PERFORMING")
+        print("=" * 60)
+        n_fixed = deperform_all(
+            triage_results,
+            dataset_dir,
+            grid=deperform_grid,
+            workers=process_workers,
+        )
+        stats["deperformed"] = n_fixed
+        print(f"  Processed {n_fixed} files")
+
+    if do_voice_sep:
+        print()
+        print("=" * 60)
+        print("  VOICE SEPARATION (local)")
+        print("=" * 60)
+        n_sep = voice_separate_all(
+            triage_results,
+            dataset_dir,
+            max_voices=voice_sep_max_voices,
+            mode=voice_sep_mode,
+            jitter_ratio=voice_sep_jitter_ratio,
+            on_cap=voice_sep_on_cap,
+            ignore_pedal=voice_sep_ignore_pedal,
+            workers=process_workers,
+        )
+        stats["separated"] = n_sep
+        print(f"  Successfully separated {n_sep} files")
+
+    if do_voice_reduce:
+        print()
+        print("=" * 60)
+        print(f"  VOICE REDUCTION (→ {voice_reduce_max} voices)")
+        print("=" * 60)
+        n_reduced = reduce_voices_all(
+            triage_results,
+            dataset_dir,
+            max_voices=voice_reduce_max,
+            workers=process_workers,
+        )
+        stats["reduced"] = n_reduced
+        print(f"  Reduced {n_reduced} files")
+
+    if do_collect:
+        print()
+        print("=" * 60)
+        print("  COLLECTING TRAINING DATA")
+        print("=" * 60)
+        out_dir = dataset_dir / "_training"
+        n_collected = collect_training_data(triage_results, dataset_dir, output_dir=out_dir)
+        stats["collected"] = n_collected
+
+    return stats
+
+
 def main():
+    process_all_datasets = "--all-datasets" in sys.argv
+    do_fold_all = "--fold-all" in sys.argv or process_all_datasets
+    if "--no-fold-all" in sys.argv:
+        do_fold_all = False
+
     # Credentials
     user = os.environ.get("KUNSTDERFUGE_USER")
     pwd = os.environ.get("KUNSTDERFUGE_PASS")
-    if not user:
+    if not user and not process_all_datasets:
         print("Tip: Set KUNSTDERFUGE_USER and KUNSTDERFUGE_PASS env vars for Pro access.")
         print("     Without Pro, downloads are limited to 5/day.\n")
 
@@ -1996,6 +3204,12 @@ def main():
         idx = sys.argv.index("--composer")
         composer_filter = sys.argv[idx + 1].lower().split(",")
 
+    # Filter dataset roots in --all-datasets mode (e.g. kunstderfuge,jrp)
+    dataset_filter = None
+    if "--datasets" in sys.argv:
+        idx = sys.argv.index("--datasets")
+        dataset_filter = {s.strip().lower() for s in sys.argv[idx + 1].split(",") if s.strip()}
+
     # Triage only mode
     triage_only = "--triage-only" in sys.argv
 
@@ -2005,6 +3219,12 @@ def main():
     if "--grid" in sys.argv:
         idx = sys.argv.index("--grid")
         deperform_grid = int(sys.argv[idx + 1])
+    deperform_protect_ornaments = True
+    if "--no-deperform-protect-ornaments" in sys.argv:
+        deperform_protect_ornaments = False
+    if "--deperform-protect-ornaments" in sys.argv:
+        deperform_protect_ornaments = True
+    globals()["DEPERFORM_PROTECT_ORNAMENTS"] = deperform_protect_ornaments
 
     # Voice separation mode
     do_voice_sep = "--voice-sep" in sys.argv
@@ -2031,7 +3251,7 @@ def main():
     if voice_sep_jitter_ratio <= 0:
         raise SystemExit("Invalid --voice-sep-jitter-ratio: must be > 0")
 
-    voice_sep_on_cap = "fail"
+    voice_sep_on_cap = "raise-cap"
     if "--voice-sep-on-cap" in sys.argv:
         idx = sys.argv.index("--voice-sep-on-cap")
         voice_sep_on_cap = sys.argv[idx + 1].strip().lower()
@@ -2060,6 +3280,130 @@ def main():
     # Collect training data mode
     do_collect = "--collect" in sys.argv
     do_purge_derived = "--purge-derived" in sys.argv
+    process_workers = min(os.cpu_count() or 1, 8)
+    if "--workers" in sys.argv:
+        idx = sys.argv.index("--workers")
+        process_workers = _parallel_workers(int(sys.argv[idx + 1]))
+
+    if process_all_datasets:
+        dataset_dirs = discover_dataset_dirs(MIDI_DATA_ROOT)
+        if dataset_filter:
+            dataset_dirs = [d for d in dataset_dirs if d.name.lower() in dataset_filter]
+
+        if not dataset_dirs:
+            print("No dataset directories found under data/midi.")
+            return
+
+        dataset_reports: dict[str, dict] = {}
+        total_stats = {
+            "triaged": 0,
+            "converted": 0,
+            "deperformed": 0,
+            "separated": 0,
+            "reduced": 0,
+            "collected": 0,
+        }
+
+        for dataset_dir in dataset_dirs:
+            dataset_name = dataset_dir.name
+            dataset_report_file = _dataset_report_file(dataset_dir)
+            triage_results = {}
+            if dataset_report_file.exists():
+                triage_results = json.loads(dataset_report_file.read_text())
+
+            print()
+            print("=" * 60)
+            print(f"  DATASET: {dataset_name}")
+            print("=" * 60)
+            print(f"  Base dir: {dataset_dir}")
+
+            stats = run_fix_pipeline_for_dataset(
+                dataset_dir=dataset_dir,
+                triage_results=triage_results,
+                do_purge_derived=do_purge_derived,
+                do_deperform=do_deperform,
+                deperform_grid=deperform_grid,
+                do_voice_sep=do_voice_sep,
+                voice_sep_max_voices=voice_sep_max_voices,
+                voice_sep_mode=voice_sep_mode,
+                voice_sep_jitter_ratio=voice_sep_jitter_ratio,
+                voice_sep_on_cap=voice_sep_on_cap,
+                voice_sep_ignore_pedal=voice_sep_ignore_pedal,
+                do_voice_reduce=do_voice_reduce,
+                voice_reduce_max=voice_reduce_max,
+                do_collect=do_collect,
+                process_workers=process_workers,
+            )
+
+            # Dedup modes remain specific to Kunstderfuge corpus.
+            if dataset_name == "kunstderfuge" and do_dedup_internal:
+                print()
+                print("=" * 60)
+                print("  INTERNAL DEDUP (pick best version per piece)")
+                print("=" * 60)
+                n_marked, _marked_list = dedup_internal(dataset_dir, triage_results)
+                print(f"  Marked {n_marked} inferior versions (originals preserved)")
+
+            if dataset_name == "kunstderfuge" and do_dedup:
+                print()
+                print("=" * 60)
+                print("  DEDUPLICATION (against trusted datasets)")
+                print("=" * 60)
+                n_marked, marked_list = dedup_against_trusted(dataset_dir, triage_results)
+                print(f"  Marked {n_marked} duplicates (originals preserved)")
+                for r in marked_list:
+                    print(f"    {r}")
+
+            dataset_report_file.write_text(json.dumps(triage_results, indent=2))
+            dataset_reports[dataset_name] = triage_results
+
+            for key in total_stats:
+                total_stats[key] += int(stats.get(key, 0))
+
+            clean = sum(1 for v in triage_results.values() if v.get("status") == "clean")
+            needs_deperform = sum(1 for v in triage_results.values() if v.get("status") == "needs_deperform")
+            needs_voice_sep = sum(1 for v in triage_results.values() if v.get("status") == "needs_voice_sep")
+            needs_voice_reduce = sum(1 for v in triage_results.values() if v.get("status") == "needs_voice_reduce")
+            bad = sum(1 for v in triage_results.values() if v.get("status") == "bad")
+            print(
+                "  Dataset summary:"
+                f" clean={clean}, needs_deperform={needs_deperform},"
+                f" needs_voice_sep={needs_voice_sep}, needs_voice_reduce={needs_voice_reduce},"
+                f" bad={bad}, total={len(triage_results)}"
+            )
+            print(f"  Report: {dataset_report_file}")
+
+        if do_fold_all:
+            print()
+            print("=" * 60)
+            print("  FOLD DATASETS -> data/midi/all")
+            print("=" * 60)
+            fold_datasets_into_all(
+                dataset_triage_reports=dataset_reports,
+                data_root=MIDI_DATA_ROOT,
+                output_dir=ALL_DATASET_DIR,
+            )
+
+        print()
+        print("=" * 60)
+        print("  ALL-DATASETS SUMMARY")
+        print("=" * 60)
+        print(f"  Triaged:      {total_stats['triaged']}")
+        print(f"  Converted:    {total_stats['converted']}")
+        print(f"  Deperformed:  {total_stats['deperformed']}")
+        print(f"  Separated:    {total_stats['separated']}")
+        print(f"  Reduced:      {total_stats['reduced']}")
+        if do_collect:
+            print(f"  Collected:    {total_stats['collected']}")
+        if do_fold_all:
+            print(f"  Folded dir:   {ALL_DATASET_DIR}/")
+        print()
+        print("  Command:")
+        print(
+            "    uv run python scripts/download_kunstderfuge.py"
+            " --all-datasets --triage-only --deperform --voice-sep --voice-reduce --workers 8"
+        )
+        return
 
     total_new = 0
     total_skip = 0
@@ -2194,7 +3538,12 @@ def main():
         print("=" * 60)
         print("  DE-PERFORMING")
         print("=" * 60)
-        n_fixed = deperform_all(triage_results, OUT, grid=deperform_grid)
+        n_fixed = deperform_all(
+            triage_results,
+            OUT,
+            grid=deperform_grid,
+            workers=process_workers,
+        )
         print(f"  Processed {n_fixed} files")
 
     # Voice separation (local MIDI)
@@ -2211,6 +3560,7 @@ def main():
             jitter_ratio=voice_sep_jitter_ratio,
             on_cap=voice_sep_on_cap,
             ignore_pedal=voice_sep_ignore_pedal,
+            workers=process_workers,
         )
         print(f"  Successfully separated {n_sep} files")
 
@@ -2220,7 +3570,12 @@ def main():
         print("=" * 60)
         print(f"  VOICE REDUCTION (→ {voice_reduce_max} voices)")
         print("=" * 60)
-        n_reduced = reduce_voices_all(triage_results, OUT, max_voices=voice_reduce_max)
+        n_reduced = reduce_voices_all(
+            triage_results,
+            OUT,
+            max_voices=voice_reduce_max,
+            workers=process_workers,
+        )
         print(f"  Reduced {n_reduced} files")
 
     # Internal dedup (pick best version of same piece)
@@ -2291,10 +3646,12 @@ def main():
     print("    uv run python scripts/download_kunstderfuge.py --triage-only          # re-triage without downloading")
     print("    uv run python scripts/download_kunstderfuge.py --deperform            # quantize + strip dynamics")
     print("    uv run python scripts/download_kunstderfuge.py --deperform --grid 12  # triplet-friendly grid")
+    print("    uv run python scripts/download_kunstderfuge.py --deperform --no-deperform-protect-ornaments")
+    print("    uv run python scripts/download_kunstderfuge.py --triage-only --deperform --voice-sep --voice-reduce --workers 8")
     print("    uv run python scripts/download_kunstderfuge.py --voice-sep            # local voice separation")
     print("    uv run python scripts/download_kunstderfuge.py --voice-fix            # separate then reduce")
     print("    uv run python scripts/download_kunstderfuge.py --voice-sep --voice-sep-max-voices 16 --voice-sep-mode auto")
-    print("    uv run python scripts/download_kunstderfuge.py --voice-sep --voice-sep-jitter-ratio 0.025 --voice-sep-on-cap fail")
+    print("    uv run python scripts/download_kunstderfuge.py --voice-sep --voice-sep-jitter-ratio 0.025 --voice-sep-on-cap raise-cap")
     print("    uv run python scripts/download_kunstderfuge.py --voice-sep --no-voice-sep-ignore-pedal")
     print("    uv run python scripts/download_kunstderfuge.py --voice-reduce         # reduce >4 voice files to 4")
     print("    uv run python scripts/download_kunstderfuge.py --voice-reduce --max-voices 3  # reduce to 3 voices")
@@ -2302,6 +3659,9 @@ def main():
     print("    uv run python scripts/download_kunstderfuge.py --dedup-internal        # pick best version of same piece")
     print("    uv run python scripts/download_kunstderfuge.py --dedup                # mark duplicates from trusted datasets")
     print("    uv run python scripts/download_kunstderfuge.py --collect              # copy training-ready files to _training/")
+    print("    uv run python scripts/download_kunstderfuge.py --all-datasets --triage-only --deperform --voice-sep --voice-reduce --workers 8")
+    print("    uv run python scripts/download_kunstderfuge.py --all-datasets --datasets kunstderfuge,jrp,kernscores,openscore_quartets")
+    print("    uv run python scripts/download_kunstderfuge.py --all-datasets --no-fold-all   # skip data/midi/all fold step")
     print()
     print("  [+] Clean files can go straight into prepare-data.")
     print("  [~] De-perform files are fixable (run --deperform).")

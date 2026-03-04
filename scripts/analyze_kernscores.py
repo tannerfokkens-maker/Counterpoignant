@@ -7,12 +7,23 @@ from pathlib import Path
 
 from music21 import converter
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
 from bach_gen.data.analysis import analyze_composition
 from bach_gen.data.extraction import VoiceComposition
 from bach_gen.utils.constants import TICKS_PER_QUARTER
+
+
+def _is_error_html(path: Path) -> bool:
+    """Detect common KernScores error pages saved as .krn files."""
+    try:
+        if not path.exists() or path.stat().st_size < 32:
+            return True
+        head = path.read_text(errors="replace")[:4096].lower()
+    except OSError:
+        return True
+    return ("<html" in head) or ("access unsuccessful" in head)
 
 
 def _compute_imitation_score(voices: list[list[tuple[int, int, int]]]) -> float:
@@ -119,7 +130,7 @@ def main() -> None:
     parser.add_argument(
         "--midi-dir",
         type=Path,
-        default=Path("/Users/tfokkens/Documents/Claude/2pt-bach/data/midi"),
+        default=ROOT / "data/midi",
     )
     parser.add_argument("--top-outliers", type=int, default=10)
     parser.add_argument("--max-voices", type=int, default=4)
@@ -161,6 +172,7 @@ def main() -> None:
     too_few_parts = 0
     too_many_parts = 0
     too_few_voices = 0
+    skipped_error_html = 0
     analyzed = 0
     errors = 0
     error_types = collections.Counter()
@@ -186,6 +198,9 @@ def main() -> None:
             ]
         ):
             skipped_name += 1
+            continue
+        if _is_error_html(krn):
+            skipped_error_html += 1
             continue
         composer = krn.parent.name
         try:
@@ -281,6 +296,7 @@ def main() -> None:
     print(f"  <2 parts              {too_few_parts}")
     print(f"  >max voices ({args.max_voices})   {too_many_parts}")
     print(f"  <2 non-empty voices   {too_few_voices}")
+    print(f"  skipped error HTML    {skipped_error_html}")
     print(f"  analyzed              {analyzed}")
     print()
 

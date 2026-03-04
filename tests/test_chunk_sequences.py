@@ -92,3 +92,59 @@ def test_build_token_category_map_groups_expected_token_types():
     assert cat_map[57] == idx["conditioning"]  # ENCODE_SEQUENTIAL
     assert cat_map[59] == idx["conditioning"]  # KEY_C_major
     assert cat_map[1] == idx["other"]  # BOS
+
+
+def test_subject_conditioning_is_gated_off_for_non_subject_forms():
+    tokenizer = ScaleDegreeTokenizer()
+    subject = [(0, 480, 60), (480, 480, 62), (960, 480, 61), (1440, 480, 63), (1920, 480, 64)]
+    transposed = [(3840, 480, 67), (4320, 480, 69), (4800, 480, 68), (5280, 480, 70), (5760, 480, 71)]
+    comp = VoiceComposition(
+        voices=[subject, transposed],
+        key_root=0,
+        key_mode="major",
+        source="unit-gated-off",
+        style="bach",
+        time_signature=(4, 4),
+    )
+
+    seqs, _ = _tokenize_items(
+        [comp],
+        ["chorale"],
+        tokenizer,
+        no_sequential=True,
+        conditioning_phase="cadence+subject",
+        subject_forms={"fugue", "invention", "sinfonia"},
+    )
+
+    assert len(seqs) == 1
+    names = [tokenizer.token_to_name[t] for t in seqs[0]]
+    assert "SUBJECT_START" not in names
+    assert "SUBJECT_END" not in names
+
+
+def test_subject_conditioning_is_enabled_for_fugue_like_forms():
+    tokenizer = ScaleDegreeTokenizer()
+    subject = [(0, 480, 60), (480, 480, 62), (960, 480, 61), (1440, 480, 63), (1920, 480, 64)]
+    transposed = [(3840, 480, 67), (4320, 480, 69), (4800, 480, 68), (5280, 480, 70), (5760, 480, 71)]
+    comp = VoiceComposition(
+        voices=[subject, transposed],
+        key_root=0,
+        key_mode="major",
+        source="unit-gated-on",
+        style="bach",
+        time_signature=(4, 4),
+    )
+
+    seqs, _ = _tokenize_items(
+        [comp],
+        ["fugue"],
+        tokenizer,
+        no_sequential=True,
+        conditioning_phase="cadence+subject",
+        subject_forms={"fugue", "invention", "sinfonia"},
+    )
+
+    assert len(seqs) == 1
+    names = [tokenizer.token_to_name[t] for t in seqs[0]]
+    assert "SUBJECT_START" in names
+    assert "SUBJECT_END" in names

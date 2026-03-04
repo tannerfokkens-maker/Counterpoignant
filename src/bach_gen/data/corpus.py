@@ -3,9 +3,12 @@
 Loads works from multiple sources:
 1. Broad music21 corpus search (Bach, Palestrina, Monteverdi, Mozart, etc.)
 2. Targeted BWV loading from constants.py lists
-3. User-supplied MIDI files in data/midi/
+3. User-supplied score files under a local directory (defaults to data/midi/all
+   when present, otherwise data/midi)
 
-All sources are deduplicated by sourcePath before returning.
+All sources are deduplicated once by normalized source key before returning.
+When duplicates occur across sources, first-seen entries win (music21 sources
+are loaded first, so they are preferred over local duplicates).
 
 File discovery is sequential (fast); file parsing **and voice extraction**
 are parallelized across CPU cores using ``concurrent.futures.ProcessPoolExecutor``.
@@ -349,6 +352,38 @@ def _original_source(source: str) -> str:
     return source[:idx] if idx >= 0 else source
 
 
+def _default_local_midi_dir() -> Path:
+    """Choose default local score directory for training data ingestion."""
+    root = Path("data/midi")
+    consolidated = root / "all"
+    if consolidated.exists():
+        return consolidated
+    return root
+
+
+def _deduplicate_works_by_source(works: list[tuple]) -> list[tuple]:
+    """Deduplicate works once by normalized source, preserving first-seen order."""
+    deduped: list[tuple] = []
+    seen_sources: set[str] = set()
+    dropped = 0
+
+    for comp, form in works:
+        source_key = _original_source(getattr(comp, "source", ""))
+        if source_key in seen_sources:
+            dropped += 1
+            continue
+        seen_sources.add(source_key)
+        deduped.append((comp, form))
+
+    if dropped:
+        logger.info(
+            "Global dedup by source removed %d duplicates; kept %d unique works",
+            dropped,
+            len(deduped),
+        )
+    return deduped
+
+
 # ---------------------------------------------------------------------------
 # User-supplied MIDI / score files (discovery + parallel parse+extract)
 # ---------------------------------------------------------------------------
@@ -362,7 +397,7 @@ def get_midi_files(
     max_groups: int = 1,
     voices_override: int | None = None,
 ) -> list[tuple]:
-    """Load additional score files from a directory.
+    """Load additional score files from a local directory.
 
     Supports all formats music21 can parse: MIDI, MusicXML, Humdrum kern,
     MuseScore, ABC, LilyPond, etc.  Scans recursively so you can organize
@@ -394,29 +429,6 @@ def get_midi_files(
 
     # Phase 1: discover and filter files (fast, sequential)
     files: dict[Path, str] = {}
-    kdf_root = midi_path / "kunstderfuge"
-    kdf_bucket = kdf_root / "_voice_buckets" / "dataset_2to4"
-    use_kdf_bucket = kdf_bucket.exists()
-    if use_kdf_bucket:
-        logger.info(
-            "Using curated Kunstderfuge bucket (2-4 voices only): %s",
-            kdf_bucket,
-        )
-
-    kdf_triage: dict[str, dict] = {}
-    if kdf_root.exists() and not use_kdf_bucket:
-        triage_path = kdf_root / "_triage_report.json"
-        if triage_path.exists():
-            try:
-                import json
-                kdf_triage = json.loads(triage_path.read_text())
-            except Exception as e:
-                logger.warning(f"Could not read {triage_path}: {e}")
-        else:
-            logger.warning(
-                "No Kunstderfuge triage report found at %s; raw Kunstderfuge files will be skipped.",
-                triage_path,
-            )
 
     for ext in extensions:
         for f in midi_path.rglob(ext):
@@ -425,23 +437,7 @@ def get_midi_files(
 
             # Ignore generated helper directories by default.
             if any(part.startswith("_") for part in rel_parts[:-1]):
-                if not (use_kdf_bucket and f.is_relative_to(kdf_bucket)):
-                    continue
-
-            # Kunstderfuge must be restricted to 2-4 voices:
-            # prefer curated bucket when present, otherwise consult triage.
-            if kdf_root.exists() and f.is_relative_to(kdf_root):
-                if use_kdf_bucket:
-                    if not f.is_relative_to(kdf_bucket):
-                        continue
-                else:
-                    triage_key = str(f.relative_to(kdf_root))
-                    info = kdf_triage.get(triage_key)
-                    if not isinstance(info, dict):
-                        continue
-                    num_tracks = int(info.get("num_tracks", 0))
-                    if not (2 <= num_tracks <= 4):
-                        continue
+                continue
 
             style_guess = _infer_style_from_rel_parts(rel_parts)
             desc_guess = str(rel).rsplit(".", 1)[0]
@@ -460,7 +456,7 @@ def get_midi_files(
             (str(f), desc, style, max_source_voices, max_groups, voices_override)
         )
 
-    logger.info(f"MIDI files: {len(parse_tasks)} candidates discovered in {midi_dir}")
+    logger.info(f"Local score files: {len(parse_tasks)} candidates discovered in {midi_dir}")
 
     results = _parallel_process(
         parse_tasks, _parse_and_extract_file_entry, max_workers, label="MIDI files"
@@ -484,6 +480,7 @@ def get_all_works(
     max_workers: int | None = None,
     max_source_voices: int = 4,
     max_groups_per_work: int = 1,
+    midi_dir: str | Path | None = None,
     voices_override: int | None = None,
 ) -> list[tuple]:
     """Load and extract works for training, optionally filtered by composer/style.
@@ -495,9 +492,9 @@ def get_all_works(
 
     1. Broad corpus search (composer + title)
     2. Targeted BWV loading from ALL_TARGETED_BWV
-    3. User-supplied MIDI files from data/midi/
+    3. User-supplied score files from local data directory
 
-    All sources deduplicated by sourcePath.
+    All sources deduplicated once by normalized source key.
 
     Args:
         composer_filter: If set, only include works whose style matches one
@@ -508,6 +505,8 @@ def get_all_works(
             ``min(os.cpu_count(), 8)`` when ``None``.
         max_source_voices: Skip works with more parts than this.
         max_groups_per_work: Cap extracted groups per work.
+        midi_dir: Local score root. Defaults to ``data/midi/all`` when present,
+            otherwise ``data/midi``.
         voices_override: Override the auto-detected voice count for extraction.
 
     Returns:
@@ -537,6 +536,8 @@ def get_all_works(
         max_groups=max_groups_per_work,
         voices_override=voices_override,
     )
+    local_midi_dir = Path(midi_dir) if midi_dir is not None else _default_local_midi_dir()
+    logger.info(f"Local score directory: {local_midi_dir}")
 
     # Phase 1: broad search
     works = _search_corpus_broad(max_workers=max_workers, **extraction_kwargs)
@@ -548,8 +549,9 @@ def get_all_works(
     )
     works.extend(bwv_works)
 
-    # Phase 3: user MIDI files (always additive, no dedup needed)
+    # Phase 3: user score files
     works.extend(get_midi_files(
+        midi_dir=local_midi_dir,
         accepted=accepted, max_workers=max_workers, **extraction_kwargs,
     ))
 
@@ -562,6 +564,7 @@ def get_all_works(
         ]
         logger.info(f"Composer filter kept {len(works)}/{before} voice groups")
 
+    works = _deduplicate_works_by_source(works)
     logger.info(f"Total voice groups loaded: {len(works)}")
     return works
 

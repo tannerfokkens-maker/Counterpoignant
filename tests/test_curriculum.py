@@ -28,14 +28,14 @@ from bach_gen.model.trainer import Trainer
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_fake_works(styles: list[str]):
+def _make_fake_works(styles: list[str], prefix: str = "work"):
     """Return list of (VoiceComposition, form) tuples."""
     results = []
     for i, style in enumerate(styles):
         comp = VoiceComposition(
             voices=[[(0, 480, 60)], [(0, 480, 48)]],
             key_root=0, key_mode="major",
-            source=f"work_{i}", style=style,
+            source=f"{prefix}_{i}", style=style,
         )
         results.append((comp, "chorale"))
     return results
@@ -77,9 +77,9 @@ class TestGetAllWorks:
     @patch("bach_gen.data.corpus._search_corpus_broad")
     def test_no_filter_returns_all(self, mock_broad, mock_bwv, mock_midi):
         """With no filter, all works are returned."""
-        mock_broad.return_value = _make_fake_works(["bach", "bach"])
-        mock_bwv.return_value = _make_fake_works(["bach"])
-        mock_midi.return_value = _make_fake_works(["baroque", "renaissance"])
+        mock_broad.return_value = _make_fake_works(["bach", "bach"], prefix="broad")
+        mock_bwv.return_value = _make_fake_works(["bach"], prefix="bwv")
+        mock_midi.return_value = _make_fake_works(["baroque", "renaissance"], prefix="midi")
 
         works = get_all_works(composer_filter=None)
         assert len(works) == 5
@@ -89,9 +89,12 @@ class TestGetAllWorks:
     @patch("bach_gen.data.corpus._search_corpus_broad")
     def test_filter_bach_only(self, mock_broad, mock_bwv, mock_midi):
         """Filter 'bach' should keep only works with style 'bach'."""
-        mock_broad.return_value = _make_fake_works(["bach", "bach"])
-        mock_bwv.return_value = _make_fake_works(["bach"])
-        mock_midi.return_value = _make_fake_works(["baroque", "renaissance", "classical"])
+        mock_broad.return_value = _make_fake_works(["bach", "bach"], prefix="broad")
+        mock_bwv.return_value = _make_fake_works(["bach"], prefix="bwv")
+        mock_midi.return_value = _make_fake_works(
+            ["baroque", "renaissance", "classical"],
+            prefix="midi",
+        )
 
         works = get_all_works(composer_filter=["bach"])
         styles = [comp.style for comp, _ in works]
@@ -103,9 +106,9 @@ class TestGetAllWorks:
     @patch("bach_gen.data.corpus._search_corpus_broad")
     def test_filter_baroque_includes_dir_names(self, mock_broad, mock_bwv, mock_midi):
         """Filter 'baroque' should match works with style 'baroque'."""
-        mock_broad.return_value = _make_fake_works(["bach"])
+        mock_broad.return_value = _make_fake_works(["bach"], prefix="broad")
         mock_bwv.return_value = []
-        mock_midi.return_value = _make_fake_works(["baroque", "renaissance"])
+        mock_midi.return_value = _make_fake_works(["baroque", "renaissance"], prefix="midi")
 
         works = get_all_works(composer_filter=["baroque"])
         assert len(works) == 1
@@ -116,9 +119,12 @@ class TestGetAllWorks:
     @patch("bach_gen.data.corpus._search_corpus_broad")
     def test_filter_multiple_styles(self, mock_broad, mock_bwv, mock_midi):
         """Multiple filter values should match any of them."""
-        mock_broad.return_value = _make_fake_works(["bach"])
+        mock_broad.return_value = _make_fake_works(["bach"], prefix="broad")
         mock_bwv.return_value = []
-        mock_midi.return_value = _make_fake_works(["baroque", "renaissance", "classical"])
+        mock_midi.return_value = _make_fake_works(
+            ["baroque", "renaissance", "classical"],
+            prefix="midi",
+        )
 
         works = get_all_works(composer_filter=["bach", "baroque"])
         styles = {comp.style for comp, _ in works}
@@ -130,7 +136,7 @@ class TestGetAllWorks:
     @patch("bach_gen.data.corpus._search_corpus_broad")
     def test_filter_case_insensitive(self, mock_broad, mock_bwv, mock_midi):
         """Filter should be case-insensitive."""
-        mock_broad.return_value = _make_fake_works(["bach"])
+        mock_broad.return_value = _make_fake_works(["bach"], prefix="broad")
         mock_bwv.return_value = []
         mock_midi.return_value = []
 
@@ -145,7 +151,10 @@ class TestGetAllWorks:
         other works with the same style ('baroque')."""
         mock_broad.return_value = []
         mock_bwv.return_value = []
-        mock_midi.return_value = _make_fake_works(["baroque", "baroque", "renaissance"])
+        mock_midi.return_value = _make_fake_works(
+            ["baroque", "baroque", "renaissance"],
+            prefix="midi",
+        )
 
         works = get_all_works(composer_filter=["buxtehude"])
         # buxtehude maps to 'baroque', so both baroque works should match
@@ -157,12 +166,50 @@ class TestGetAllWorks:
     @patch("bach_gen.data.corpus._search_corpus_broad")
     def test_filter_no_match_returns_empty(self, mock_broad, mock_bwv, mock_midi):
         """Filter with no matching styles returns empty list."""
-        mock_broad.return_value = _make_fake_works(["bach"])
+        mock_broad.return_value = _make_fake_works(["bach"], prefix="broad")
         mock_bwv.return_value = []
         mock_midi.return_value = []
 
         works = get_all_works(composer_filter=["nonexistent"])
         assert len(works) == 0
+
+    @patch("bach_gen.data.corpus.get_midi_files")
+    @patch("bach_gen.data.corpus._load_by_bwv")
+    @patch("bach_gen.data.corpus._search_corpus_broad")
+    def test_global_dedup_prefers_music21_entries(self, mock_broad, mock_bwv, mock_midi):
+        """Duplicate source keys should keep first-seen (music21) entries."""
+        shared_source = "bach/bwv999"
+        broad_comp = VoiceComposition(
+            voices=[[(0, 480, 60)], [(0, 480, 48)]],
+            key_root=0,
+            key_mode="major",
+            source=shared_source,
+            style="bach",
+        )
+        local_dup = VoiceComposition(
+            voices=[[(0, 480, 62)], [(0, 480, 50)]],
+            key_root=2,
+            key_mode="minor",
+            source=shared_source,
+            style="baroque",
+        )
+        local_unique = VoiceComposition(
+            voices=[[(0, 480, 65)], [(0, 480, 53)]],
+            key_root=5,
+            key_mode="major",
+            source="kernscores/froberger/froberger001",
+            style="baroque",
+        )
+
+        mock_broad.return_value = [(broad_comp, "chorale")]
+        mock_bwv.return_value = []
+        mock_midi.return_value = [(local_dup, "chorale"), (local_unique, "chorale")]
+
+        works = get_all_works(composer_filter=None)
+        assert len(works) == 2
+        kept = {comp.source: comp for comp, _ in works}
+        assert kept[shared_source].style == "bach"
+        assert "kernscores/froberger/froberger001" in kept
 
     @patch("bach_gen.data.corpus.get_all_works")
     def test_get_all_bach_works_delegates(self, mock_get_all):

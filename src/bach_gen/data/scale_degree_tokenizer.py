@@ -7,7 +7,7 @@ augmentation unnecessary.
 
 Token ordering per note: VOICE_N -> OCT_x -> [SHARP|FLAT] -> DEG_y -> DUR_z
 
-Vocabulary layout (120 tokens):
+Vocabulary layout (base 120 + appended conditioning tokens):
      0-9:   10 special tokens (PAD, BOS, EOS, VOICE_1-4, SUBJECT_*, BAR)
     10-15:   6 beat tokens (BEAT_1..BEAT_6)
     16-19:   4 voice-count tokens (MODE_2PART..MODE_FUGUE)
@@ -29,6 +29,7 @@ Vocabulary layout (120 tokens):
     96-97:   2 accidental tokens (SHARP, FLAT)
     98-108: 11 duration tokens
    109-119: 11 time shift tokens
+        end: FORM_SONATA and CAD_* conditioning markers
 """
 
 from __future__ import annotations
@@ -383,6 +384,12 @@ class ScaleDegreeTokenizer:
         self.name_to_token["FORM_SONATA"] = idx
         idx += 1
 
+        # Appended structural conditioning tokens (keeps legacy IDs stable).
+        for name in ["CAD_PAC", "CAD_IAC", "CAD_HC", "CAD_DC"]:
+            self.token_to_name[idx] = name
+            self.name_to_token[name] = idx
+            idx += 1
+
         self._vocab_size = idx
 
         # Verify hardcoded class-level constants match dynamic vocab
@@ -484,6 +491,9 @@ class ScaleDegreeTokenizer:
         texture: str | None = None, imitation: str | None = None,
         harmonic_rhythm: str | None = None, harmonic_tension: str | None = None,
         chromaticism: str | None = None,
+        cadence_tokens_by_tick: dict[int, int] | None = None,
+        subject_start_markers: set[tuple[int, int]] | None = None,
+        subject_end_markers: set[tuple[int, int]] | None = None,
     ) -> list[int]:
         """Encode a VoicePair or VoiceComposition into a scale-degree token sequence.
 
@@ -508,7 +518,13 @@ class ScaleDegreeTokenizer:
         self._encode_key_mode = comp.key_mode
 
         time_sig = comp.time_signature if hasattr(comp, "time_signature") else (4, 4)
-        events = self._interleave_n_voices(comp.voices, time_sig=time_sig)
+        events = self._interleave_n_voices(
+            comp.voices,
+            time_sig=time_sig,
+            cadence_tokens_by_tick=cadence_tokens_by_tick,
+            subject_start_markers=subject_start_markers,
+            subject_end_markers=subject_end_markers,
+        )
         tokens.extend(events)
         tokens.append(self.EOS)
         return tokens
@@ -523,6 +539,9 @@ class ScaleDegreeTokenizer:
         texture: str | None = None, imitation: str | None = None,
         harmonic_rhythm: str | None = None, harmonic_tension: str | None = None,
         chromaticism: str | None = None,
+        cadence_tokens_by_tick: dict[int, int] | None = None,
+        subject_start_markers: set[tuple[int, int]] | None = None,
+        subject_end_markers: set[tuple[int, int]] | None = None,
     ) -> list[int]:
         """Encode using sequential (voice-by-voice) format.
 
@@ -563,7 +582,15 @@ class ScaleDegreeTokenizer:
             tokens.append(voice_tok)
 
             # Serialize this voice's notes with its own timeline
-            voice_tokens = self._serialize_single_voice(voice_notes, time_sig)
+            voice_tokens = self._serialize_single_voice(
+                voice_notes,
+                time_sig=time_sig,
+                voice_num=voice_num,
+                cadence_tokens_by_tick=cadence_tokens_by_tick,
+                emit_cadence_tokens=(voice_num == 1),
+                subject_start_markers=subject_start_markers,
+                subject_end_markers=subject_end_markers,
+            )
             tokens.extend(voice_tokens)
 
             # VOICE_SEP between voices; EOS after last voice
@@ -584,6 +611,11 @@ class ScaleDegreeTokenizer:
         self,
         voice_notes: list[tuple[int, int, int]],
         time_sig: tuple[int, int] = (4, 4),
+        voice_num: int | None = None,
+        cadence_tokens_by_tick: dict[int, int] | None = None,
+        emit_cadence_tokens: bool = True,
+        subject_start_markers: set[tuple[int, int]] | None = None,
+        subject_end_markers: set[tuple[int, int]] | None = None,
     ) -> list[int]:
         """Serialize one voice's notes with its own timeline starting from tick 0.
 
@@ -612,7 +644,7 @@ class ScaleDegreeTokenizer:
         current_time = 0
         beat_ptr = 0
 
-        for start, dur, pitch in sorted_notes:
+        for note_idx, (start, dur, pitch) in enumerate(sorted_notes):
             # Emit BAR/BEAT tokens
             while beat_ptr < len(beat_boundaries) and beat_boundaries[beat_ptr][0] <= start:
                 b_tick, b_num = beat_boundaries[beat_ptr]
@@ -624,6 +656,14 @@ class ScaleDegreeTokenizer:
                         current_time = b_tick
 
                     if b_num == 1:
+                        if (
+                            emit_cadence_tokens
+                            and cadence_tokens_by_tick is not None
+                            and b_tick > 0
+                        ):
+                            cadence_tok = cadence_tokens_by_tick.get(b_tick)
+                            if cadence_tok is not None:
+                                tokens.append(cadence_tok)
                         tokens.append(self.BAR)
                     beat_tok_name = f"BEAT_{b_num}"
                     beat_tok = self.name_to_token.get(beat_tok_name)
@@ -639,6 +679,15 @@ class ScaleDegreeTokenizer:
                 tokens.extend(ts_tokens)
                 current_time = start
 
+            if (
+                voice_num is not None
+                and subject_start_markers is not None
+                and (voice_num, note_idx) in subject_start_markers
+            ):
+                subj_start_tok = self.name_to_token.get("SUBJECT_START")
+                if subj_start_tok is not None:
+                    tokens.append(subj_start_tok)
+
             # Emit OCT [SHARP|FLAT] DEG DUR
             degree_toks = self._pitch_to_degree_tokens(pitch)
             tokens.extend(degree_toks)
@@ -646,6 +695,15 @@ class ScaleDegreeTokenizer:
             dur_tok = self._duration_to_token(dur)
             if dur_tok is not None:
                 tokens.append(dur_tok)
+
+            if (
+                voice_num is not None
+                and subject_end_markers is not None
+                and (voice_num, note_idx) in subject_end_markers
+            ):
+                subj_end_tok = self.name_to_token.get("SUBJECT_END")
+                if subj_end_tok is not None:
+                    tokens.append(subj_end_tok)
 
         return tokens
 
@@ -656,13 +714,17 @@ class ScaleDegreeTokenizer:
     def _interleave_n_voices(
         self, voices: list[list[tuple[int, int, int]]],
         time_sig: tuple[int, int] = (4, 4),
+        cadence_tokens_by_tick: dict[int, int] | None = None,
+        subject_start_markers: set[tuple[int, int]] | None = None,
+        subject_end_markers: set[tuple[int, int]] | None = None,
     ) -> list[int]:
         tokens: list[int] = []
-        all_events: list[tuple[int, int, int, int]] = []
+        all_events: list[tuple[int, int, int, int, int]] = []
         for voice_idx, voice_notes in enumerate(voices):
             voice_num = voice_idx + 1
-            for start, dur, pitch in voice_notes:
-                all_events.append((start, voice_num, pitch, dur))
+            sorted_voice = sorted(voice_notes, key=lambda n: n[0])
+            for note_idx, (start, dur, pitch) in enumerate(sorted_voice):
+                all_events.append((start, voice_num, pitch, dur, note_idx))
         all_events.sort(key=lambda e: (e[0], e[1]))
 
         # Pre-compute beat boundaries for the entire piece span
@@ -682,7 +744,7 @@ class ScaleDegreeTokenizer:
         current_time = 0
         beat_ptr = 0  # pointer into beat_boundaries
 
-        for event_time, voice_num, pitch, duration in all_events:
+        for event_time, voice_num, pitch, duration, note_idx in all_events:
             # Emit BAR/BEAT tokens for any beat boundaries between current_time and event_time
             while beat_ptr < len(beat_boundaries) and beat_boundaries[beat_ptr][0] <= event_time:
                 b_tick, b_num = beat_boundaries[beat_ptr]
@@ -696,6 +758,10 @@ class ScaleDegreeTokenizer:
 
                     # Emit BAR if this is beat 1
                     if b_num == 1:
+                        if cadence_tokens_by_tick is not None and b_tick > 0:
+                            cadence_tok = cadence_tokens_by_tick.get(b_tick)
+                            if cadence_tok is not None:
+                                tokens.append(cadence_tok)
                         tokens.append(self.BAR)
                     # Emit BEAT_N
                     beat_tok_name = f"BEAT_{b_num}"
@@ -712,6 +778,14 @@ class ScaleDegreeTokenizer:
                 tokens.extend(ts_tokens)
                 current_time = event_time
 
+            if (
+                subject_start_markers is not None
+                and (voice_num, note_idx) in subject_start_markers
+            ):
+                subj_start_tok = self.name_to_token.get("SUBJECT_START")
+                if subj_start_tok is not None:
+                    tokens.append(subj_start_tok)
+
             voice_tok = self.VOICE_TOKENS[voice_num - 1] if voice_num <= 4 else self.VOICE_1
             tokens.append(voice_tok)
 
@@ -722,6 +796,14 @@ class ScaleDegreeTokenizer:
             dur_tok = self._duration_to_token(duration)
             if dur_tok is not None:
                 tokens.append(dur_tok)
+
+            if (
+                subject_end_markers is not None
+                and (voice_num, note_idx) in subject_end_markers
+            ):
+                subj_end_tok = self.name_to_token.get("SUBJECT_END")
+                if subj_end_tok is not None:
+                    tokens.append(subj_end_tok)
 
         return tokens
 
@@ -777,6 +859,7 @@ class ScaleDegreeTokenizer:
 
             if name in (
                 "PAD", "BOS", "EOS", "SUBJECT_START", "SUBJECT_END",
+                "CAD_PAC", "CAD_IAC", "CAD_HC", "CAD_DC",
                 "BAR", "BEAT_1", "BEAT_2", "BEAT_3", "BEAT_4", "BEAT_5", "BEAT_6",
                 "MODE_2PART", "MODE_3PART", "MODE_4PART", "MODE_FUGUE",
                 "STYLE_BACH", "STYLE_BAROQUE", "STYLE_RENAISSANCE", "STYLE_CLASSICAL",

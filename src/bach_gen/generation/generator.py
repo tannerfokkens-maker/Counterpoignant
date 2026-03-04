@@ -66,6 +66,108 @@ class GenerationResult:
         return self.composition.to_voice_pair()
 
 
+@dataclass
+class StructuralControlState:
+    """Runtime state for cadence/subject marker injection during sampling."""
+
+    cadence_interval_bars: int | None = None
+    cadence_cycle: tuple[int, ...] = ()
+    cadence_cycle_index: int = 0
+    next_cadence_bar: int = 0
+    cadence_waiting_for_bar: bool = False
+
+    subject_start_token: int | None = None
+    min_subject_entries: int = 0
+    subject_spacing_bars: int = 0
+    next_subject_bar: int = 0
+    injected_subject_entries: int = 0
+    subject_waiting_for_bar: bool = False
+
+    bar_count: int = 0
+
+    def update(self, token: int, tokenizer: BachTokenizer) -> None:
+        if token == tokenizer.BAR:
+            self.bar_count += 1
+            if self.cadence_waiting_for_bar:
+                self.cadence_waiting_for_bar = False
+            if self.subject_waiting_for_bar:
+                self.subject_waiting_for_bar = False
+
+    def maybe_force_token(self, tokenizer: BachTokenizer) -> int | None:
+        if (
+            self.cadence_interval_bars is not None
+            and self.cadence_cycle
+            and not self.cadence_waiting_for_bar
+            and self.bar_count >= max(0, self.next_cadence_bar - 1)
+        ):
+            tok = self.cadence_cycle[self.cadence_cycle_index % len(self.cadence_cycle)]
+            self.cadence_cycle_index += 1
+            self.next_cadence_bar += self.cadence_interval_bars
+            self.cadence_waiting_for_bar = True
+            return tok
+
+        if (
+            self.subject_start_token is not None
+            and self.min_subject_entries > 0
+            and self.injected_subject_entries < self.min_subject_entries
+            and not self.subject_waiting_for_bar
+            and self.bar_count >= self.next_subject_bar
+        ):
+            self.injected_subject_entries += 1
+            self.next_subject_bar += max(1, self.subject_spacing_bars)
+            self.subject_waiting_for_bar = True
+            return self.subject_start_token
+
+        return None
+
+
+def _build_structural_control_state(
+    tokenizer: BachTokenizer,
+    prompt_tokens: list[int],
+    cadence_density: str | None,
+    min_subject_entries: int,
+    subject_spacing_bars: int,
+) -> StructuralControlState | None:
+    cadence_interval = None
+    if cadence_density is not None:
+        cadence_interval = {
+            "low": 8,
+            "medium": 6,
+            "high": 4,
+        }.get(cadence_density)
+
+    cadence_cycle: list[int] = []
+    for name in ("CAD_HC", "CAD_IAC", "CAD_PAC", "CAD_HC", "CAD_IAC", "CAD_DC"):
+        tok = tokenizer.name_to_token.get(name)
+        if tok is not None:
+            cadence_cycle.append(tok)
+
+    subject_start_token = tokenizer.name_to_token.get("SUBJECT_START")
+
+    wants_cadence = cadence_interval is not None and bool(cadence_cycle)
+    wants_subject = min_subject_entries > 0 and subject_start_token is not None
+    if not wants_cadence and not wants_subject:
+        return None
+
+    bar_count = sum(1 for tok in prompt_tokens if tok == tokenizer.BAR)
+
+    state = StructuralControlState(
+        cadence_interval_bars=cadence_interval if wants_cadence else None,
+        cadence_cycle=tuple(cadence_cycle),
+        cadence_cycle_index=0,
+        next_cadence_bar=bar_count + (cadence_interval if cadence_interval is not None else 0),
+        cadence_waiting_for_bar=False,
+        subject_start_token=subject_start_token if wants_subject else None,
+        min_subject_entries=max(0, int(min_subject_entries)),
+        subject_spacing_bars=max(1, int(subject_spacing_bars)),
+        next_subject_bar=bar_count + max(1, int(subject_spacing_bars)),
+        injected_subject_entries=0,
+        subject_waiting_for_bar=False,
+        bar_count=bar_count,
+    )
+    return state
+
+
 def _push_top_result(
     candidates: list[GenerationResult],
     result: GenerationResult,
@@ -166,6 +268,9 @@ def generate(
     harmonic_tension: str | None = None,
     chromaticism: str | None = None,
     candidate_batch_size: int | None = None,
+    cadence_density: str | None = None,
+    min_subject_entries: int = 0,
+    subject_spacing_bars: int = 8,
 ) -> list[GenerationResult]:
     """Generate Bach-style compositions and return top results.
 
@@ -199,6 +304,9 @@ def generate(
         chromaticism: Chromaticism conditioning (low/moderate/high).
         candidate_batch_size: Number of candidates to decode in parallel
             during sampling mode. If None, auto-select per device.
+        cadence_density: Optional cadence control intensity (low/medium/high).
+        min_subject_entries: Minimum number of prompted subject re-entries.
+        subject_spacing_bars: Minimum bars between prompted subject entries.
 
     Returns:
         List of top GenerationResult, sorted by score.
@@ -256,10 +364,18 @@ def generate(
 
     # Form label for filenames
     form_label = form.replace("-", "")
+    structural_controls_requested = (
+        cadence_density is not None or min_subject_entries > 0
+    )
 
     if beam_width is not None and beam_width > 1:
         # --- Beam search mode ---
         logger.info(f"Using beam search (width={beam_width}, alpha={length_penalty_alpha})")
+        if structural_controls_requested:
+            logger.warning(
+                "Cadence/subject runtime controls are currently applied only in sampling mode; "
+                "ignoring them for beam search."
+            )
         beam_sequences = _beam_search_generate(
             model=model,
             tokenizer=tokenizer,
@@ -320,6 +436,9 @@ def generate(
                 device=device,
                 use_rope=use_rope,
                 batch_size=curr_batch,
+                cadence_density=cadence_density,
+                min_subject_entries=min_subject_entries,
+                subject_spacing_bars=subject_spacing_bars,
             )
 
             for batch_idx, tokens in enumerate(batch_tokens):
@@ -548,6 +667,9 @@ def generate_voice_by_voice(
     chromaticism: str | None = None,
     provided_voice_midi: str | None = None,
     candidate_batch_size: int | None = None,
+    cadence_density: str | None = None,
+    min_subject_entries: int = 0,
+    subject_spacing_bars: int = 8,
 ) -> list[GenerationResult]:
     """Generate compositions voice-by-voice using sequential encoding.
 
@@ -647,6 +769,9 @@ def generate_voice_by_voice(
             device=device,
             use_rope=use_rope,
             batch_size=curr_batch,
+            cadence_density=cadence_density,
+            min_subject_entries=min_subject_entries,
+            subject_spacing_bars=subject_spacing_bars,
         )
 
         for batch_idx, tokens in enumerate(batch_tokens):
@@ -714,6 +839,9 @@ def _generate_batch(
     device: torch.device,
     use_rope: bool = True,
     batch_size: int = 1,
+    cadence_density: str | None = None,
+    min_subject_entries: int = 0,
+    subject_spacing_bars: int = 8,
 ) -> list[list[int]]:
     """Generate multiple token sequences in parallel.
 
@@ -733,6 +861,9 @@ def _generate_batch(
                 max_length=max_length,
                 device=device,
                 use_rope=use_rope,
+                cadence_density=cadence_density,
+                min_subject_entries=min_subject_entries,
+                subject_spacing_bars=subject_spacing_bars,
             ),
         ]
 
@@ -742,6 +873,16 @@ def _generate_batch(
 
     tokens_batch = [list(prompt) for _ in range(batch_size)]
     states = [constraints.initial_state(tokens) for tokens in tokens_batch]
+    control_states = [
+        _build_structural_control_state(
+            tokenizer=tokenizer,
+            prompt_tokens=tokens,
+            cadence_density=cadence_density,
+            min_subject_entries=min_subject_entries,
+            subject_spacing_bars=subject_spacing_bars,
+        )
+        for tokens in tokens_batch
+    ]
     finished = [False] * batch_size
     next_tokens = [tokenizer.EOS] * batch_size
 
@@ -752,17 +893,25 @@ def _generate_batch(
     for i in range(batch_size):
         candidate_raw = raw_next_logits[i, :]
         candidate_logits = constraints.apply(candidate_raw, states[i])
-        tok = sample_next_token(
-            candidate_logits,
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-            min_p=min_p,
-            fallback_logits=candidate_raw,
-        )
+        forced_tok = None
+        if control_states[i] is not None:
+            forced_tok = control_states[i].maybe_force_token(tokenizer)
+        if forced_tok is not None:
+            tok = forced_tok
+        else:
+            tok = sample_next_token(
+                candidate_logits,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                min_p=min_p,
+                fallback_logits=candidate_raw,
+            )
         next_tokens[i] = tok
         tokens_batch[i].append(tok)
         states[i] = constraints.update_state(states[i], tok)
+        if control_states[i] is not None:
+            control_states[i].update(tok, tokenizer)
         if tok == tokenizer.EOS:
             finished[i] = True
 
@@ -785,18 +934,26 @@ def _generate_batch(
 
             candidate_raw = raw_next_logits[i, :]
             candidate_logits = constraints.apply(candidate_raw, states[i])
-            tok = sample_next_token(
-                candidate_logits,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                min_p=min_p,
-                fallback_logits=candidate_raw,
-            )
+            forced_tok = None
+            if control_states[i] is not None:
+                forced_tok = control_states[i].maybe_force_token(tokenizer)
+            if forced_tok is not None:
+                tok = forced_tok
+            else:
+                tok = sample_next_token(
+                    candidate_logits,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    min_p=min_p,
+                    fallback_logits=candidate_raw,
+                )
 
             next_tokens[i] = tok
             tokens_batch[i].append(tok)
             states[i] = constraints.update_state(states[i], tok)
+            if control_states[i] is not None:
+                control_states[i].update(tok, tokenizer)
             if tok == tokenizer.EOS:
                 finished[i] = True
             else:
@@ -822,6 +979,9 @@ def _generate_one(
     max_length: int,
     device: torch.device,
     use_rope: bool = True,
+    cadence_density: str | None = None,
+    min_subject_entries: int = 0,
+    subject_spacing_bars: int = 8,
 ) -> list[int]:
     """Generate a single token sequence using KV cache for O(N) decoding."""
     model.eval()
@@ -830,6 +990,13 @@ def _generate_one(
 
     # Initialise constraint state from prompt
     state = constraints.initial_state(tokens)
+    control_state = _build_structural_control_state(
+        tokenizer=tokenizer,
+        prompt_tokens=tokens,
+        cadence_density=cadence_density,
+        min_subject_entries=min_subject_entries,
+        subject_spacing_bars=subject_spacing_bars,
+    )
 
     # --- Prefill phase: process entire prompt with caching ---
     prompt_ids = torch.tensor([tokens[-max_seq_len:]], dtype=torch.long, device=device)
@@ -838,16 +1005,22 @@ def _generate_one(
 
     # Apply constraints and sample first token
     next_logits = constraints.apply(raw_next_logits, state)
-    next_token = sample_next_token(
-        next_logits,
-        temperature=temperature,
-        top_k=top_k,
-        top_p=top_p,
-        min_p=min_p,
-        fallback_logits=raw_next_logits,
-    )
+    forced_tok = control_state.maybe_force_token(tokenizer) if control_state is not None else None
+    if forced_tok is not None:
+        next_token = forced_tok
+    else:
+        next_token = sample_next_token(
+            next_logits,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            min_p=min_p,
+            fallback_logits=raw_next_logits,
+        )
     tokens.append(next_token)
     state = constraints.update_state(state, next_token)
+    if control_state is not None:
+        control_state.update(next_token, tokenizer)
 
     if next_token == tokenizer.EOS:
         del kv_cache
@@ -862,17 +1035,23 @@ def _generate_one(
         raw_next_logits = logits[0, -1, :]
 
         next_logits = constraints.apply(raw_next_logits, state)
-        next_token = sample_next_token(
-            next_logits,
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-            min_p=min_p,
-            fallback_logits=raw_next_logits,
-        )
+        forced_tok = control_state.maybe_force_token(tokenizer) if control_state is not None else None
+        if forced_tok is not None:
+            next_token = forced_tok
+        else:
+            next_token = sample_next_token(
+                next_logits,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                min_p=min_p,
+                fallback_logits=raw_next_logits,
+            )
 
         tokens.append(next_token)
         state = constraints.update_state(state, next_token)
+        if control_state is not None:
+            control_state.update(next_token, tokenizer)
 
         if next_token == tokenizer.EOS:
             break
