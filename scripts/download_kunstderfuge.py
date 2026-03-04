@@ -1069,6 +1069,9 @@ def deperform_all(
     to_process = [
         (k, v) for k, v in triage_results.items()
         if v.get("status") == "needs_deperform"
+        and ".separated." not in k
+        and ".reduced." not in k
+        and ".deperformed." not in k
     ]
     if not to_process:
         print("  No files need de-performing.")
@@ -2044,6 +2047,8 @@ def reduce_voices_all(
     """
     to_process = []
     for k, v in triage_results.items():
+        if ".separated." in k or ".reduced." in k or ".deperformed." in k:
+            continue
         if v.get("status") == "needs_voice_reduce":
             to_process.append((k, v))
         elif v.get("tracks_with_notes", v.get("num_tracks", 0)) > max_voices and v.get("status") == "clean":
@@ -2450,32 +2455,24 @@ def _do_parse(filepath: Path, timeout: int = 30):
 def _parse_with_timeout(filepath: Path, timeout: int = 30):
     """Parse a music file with a timeout to avoid hanging on large/malformed files.
 
-    For .krn (Humdrum) files, if the initial parse fails, applies preprocessing
-    to strip known-problematic elements and retries the parse from cleaned text.
+    For .krn (Humdrum) files, always preprocesses the text first to fix known
+    issues (corrupted accidentals, non-standard metadata, non-kern spines, etc.)
+    before parsing. Falls back to raw file parse if preprocessing causes issues.
     """
-    try:
-        return _do_parse(filepath, timeout)
-    except Exception as orig_err:
-        # Only attempt fallback for .krn files
-        suffix = Path(filepath).suffix.lower()
-        if suffix not in ('.krn', '.kern'):
-            raise
+    suffix = Path(filepath).suffix.lower()
 
-        # Read the file and preprocess
+    # For .krn files, preprocess first to avoid warnings and parse errors
+    if suffix in ('.krn', '.kern'):
         try:
             raw_text = Path(filepath).read_text(encoding='utf-8', errors='replace')
-        except Exception:
-            raise orig_err
-
-        cleaned = _preprocess_krn(raw_text)
-
-        # Re-parse from cleaned string
-        try:
+            cleaned = _preprocess_krn(raw_text)
             import music21
             return music21.converter.parse(cleaned, format='humdrum')
         except Exception:
-            # Fallback also failed — raise the original error for clarity
-            raise orig_err
+            # Preprocessing path failed — fall back to raw file parse
+            pass
+
+    return _do_parse(filepath, timeout)
 
 
 def compute_fingerprint(filepath: Path) -> dict | None:
