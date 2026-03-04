@@ -2267,10 +2267,159 @@ TRUSTED_DIRS = [
 FINGERPRINT_CACHE = OUT / "_fingerprints.json"
 
 
-def _parse_with_timeout(filepath: Path, timeout: int = 30):
-    """Parse a music file with a timeout to avoid hanging on large/malformed files."""
-    # signal.alarm only works on the main thread. Worker threads fall back
-    # to plain parse to keep parallel triage/fix passes functional.
+def _strip_non_kern_spines(lines: list[str]) -> list[str]:
+    """Remove non-**kern spine columns from Humdrum tab-delimited data.
+
+    Tracks column structure through spine-path changes (*^, *v, *-, *)
+    and drops columns belonging to non-**kern spines throughout the file.
+
+    Global comments (!! or !!!) and blank lines are passed through unchanged.
+    """
+    result: list[str] = []
+    # is_kern[i] = True if column i is a **kern spine
+    is_kern: list[bool] | None = None
+
+    for line in lines:
+        # Global comments / reference records / blank lines: pass through
+        if not line or line.startswith('!!'):
+            result.append(line)
+            continue
+
+        # Non-tab lines (single-spine or non-data): pass through
+        if '\t' not in line:
+            result.append(line)
+            continue
+
+        cols = line.split('\t')
+
+        # Exclusive interpretation line — initialize spine tracking
+        if is_kern is None and any(c.startswith('**') for c in cols):
+            is_kern = [c == '**kern' for c in cols]
+            # Output only kern columns
+            kept = [c for c, k in zip(cols, is_kern) if k]
+            if kept:
+                result.append('\t'.join(kept))
+            continue
+
+        # Before we've seen the ** line, pass through
+        if is_kern is None:
+            result.append(line)
+            continue
+
+        # Interpretation line — all columns start with * (but not **)
+        if all((c.startswith('*') and not c.startswith('**')) or c == ''
+               for c in cols):
+            # Output only kern columns
+            kept = [c for c, k in zip(cols, is_kern) if k]
+            if kept:
+                result.append('\t'.join(kept))
+
+            # Now update spine tracking based on path indicators
+            has_path = any(c in ('*^', '*v', '*-', '*+', '*x') for c in cols)
+            if has_path:
+                new_is_kern: list[bool] = []
+                i = 0
+                while i < len(cols):
+                    if cols[i] == '*^':
+                        # Split: one spine becomes two (same type)
+                        new_is_kern.append(is_kern[i])
+                        new_is_kern.append(is_kern[i])
+                        i += 1
+                    elif cols[i] == '*v':
+                        # Join: consume consecutive *v columns, merge into one
+                        # Keep as kern if any merged spine was kern
+                        any_kern = False
+                        while i < len(cols) and cols[i] == '*v':
+                            any_kern = any_kern or is_kern[i]
+                            i += 1
+                        new_is_kern.append(any_kern)
+                    elif cols[i] == '*-':
+                        # Terminate: remove this spine
+                        i += 1
+                    elif cols[i] == '*x':
+                        # Exchange: swap adjacent pair
+                        if i + 1 < len(cols) and cols[i + 1] == '*x':
+                            new_is_kern.append(is_kern[i + 1])
+                            new_is_kern.append(is_kern[i])
+                            i += 2
+                        else:
+                            new_is_kern.append(is_kern[i])
+                            i += 1
+                    else:
+                        # Null or tandem interpretation — no structural change
+                        new_is_kern.append(is_kern[i])
+                        i += 1
+                is_kern = new_is_kern
+            continue
+
+        # Regular data or interpretation line — filter columns
+        kept = [c for c, k in zip(cols, is_kern) if k]
+        if kept:
+            result.append('\t'.join(kept))
+
+    return result
+
+
+def _preprocess_krn(text: str) -> str:
+    """Preprocess raw .krn (Humdrum) text to fix known parse failures.
+
+    Applies the following fixes:
+    1. Strip all !!! reference record lines (fixes non-standard metadata errors)
+    2. Strip repeat expansion markers *>[...] (fixes repeat processing errors)
+    3. Normalize malformed measure marks (fixes int() parse errors)
+    4. Replace non-standard quarter-tone accidentals (fixes accidental errors)
+    5. Strip non-**kern spines (fixes humdrumPosition errors from **dynam etc.)
+    """
+    lines = text.split('\n')
+    result = []
+    for line in lines:
+        # 1. Strip all reference records (!!!key: value)
+        if line.startswith('!!!'):
+            continue
+        # 2. Strip repeat expansion markers (*>[A,A,B,...])
+        if line.startswith('*>') and '[' in line:
+            continue
+        # 3. Normalize malformed measure marks
+        #    =1-3 → =1, =3a → =3, bare = → =1
+        if line.startswith('='):
+            # Handle tab-delimited measure lines (multiple spines)
+            parts = line.split('\t')
+            fixed_parts = []
+            for part in parts:
+                if part.startswith('='):
+                    # Extract just the leading digits after =
+                    m = re.match(r'^(=+)(\d*)', part)
+                    if m:
+                        eq, num = m.group(1), m.group(2)
+                        if not num:
+                            num = '1'
+                        # Check for double barline markers
+                        if '==' in eq:
+                            fixed_parts.append('==' + num)
+                        else:
+                            fixed_parts.append('=' + num)
+                    else:
+                        fixed_parts.append(part)
+                else:
+                    fixed_parts.append(part)
+            line = '\t'.join(fixed_parts)
+        # 4. Replace non-standard quarter-tone accidentals
+        #    :a: (quarter-flat) → - (flat), :i: (quarter-sharp) → # (sharp)
+        line = line.replace(':a:', '-')
+        line = line.replace(':i:', '#')
+        result.append(line)
+
+    # 5. Strip non-kern spines
+    result = _strip_non_kern_spines(result)
+    return '\n'.join(result)
+
+
+def _do_parse(filepath: Path, timeout: int = 30):
+    """Parse a music file with optional timeout.
+
+    On the main thread, uses SIGALRM for timeout enforcement.
+    On worker threads, falls back to plain parse (no timeout).
+    """
     if threading.current_thread() is not threading.main_thread():
         import music21
         return music21.converter.parse(str(filepath))
@@ -2291,6 +2440,37 @@ def _parse_with_timeout(filepath: Path, timeout: int = 30):
     finally:
         signal.alarm(0)
         signal.signal(signal.SIGALRM, old)
+
+
+def _parse_with_timeout(filepath: Path, timeout: int = 30):
+    """Parse a music file with a timeout to avoid hanging on large/malformed files.
+
+    For .krn (Humdrum) files, if the initial parse fails, applies preprocessing
+    to strip known-problematic elements and retries the parse from cleaned text.
+    """
+    try:
+        return _do_parse(filepath, timeout)
+    except Exception as orig_err:
+        # Only attempt fallback for .krn files
+        suffix = Path(filepath).suffix.lower()
+        if suffix not in ('.krn', '.kern'):
+            raise
+
+        # Read the file and preprocess
+        try:
+            raw_text = Path(filepath).read_text(encoding='utf-8', errors='replace')
+        except Exception:
+            raise orig_err
+
+        cleaned = _preprocess_krn(raw_text)
+
+        # Re-parse from cleaned string
+        try:
+            import music21
+            return music21.converter.parse(cleaned, format='humdrum')
+        except Exception:
+            # Fallback also failed — raise the original error for clarity
+            raise orig_err
 
 
 def compute_fingerprint(filepath: Path) -> dict | None:
