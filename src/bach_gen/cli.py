@@ -1541,8 +1541,8 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
 @click.option("--subject", "-s", default=None, help="Subject notes (e.g., 'C4 D4 Eb4 F4')")
 @click.option("--candidates", "-n", default=100, help="Number of candidates to generate")
 @click.option("--top", "-t", default=3, help="Number of top results to return")
-@click.option("--temperature", default=0.9, type=float, help="Sampling temperature")
-@click.option("--min-p", default=0.03, type=float,
+@click.option("--temperature", default=1.15, type=float, help="Sampling temperature")
+@click.option("--min-p", default=0.015, type=float,
               help="Min-p sampling threshold (recommended primary control; 0 disables)")
 @click.option("--max-length", default=None, type=int,
               help="Max generation length (tokens; default: from mode)")
