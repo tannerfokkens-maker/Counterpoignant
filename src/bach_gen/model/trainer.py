@@ -10,7 +10,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from bach_gen.model.config import ModelConfig
 from bach_gen.model.architecture import BachTransformer
@@ -53,6 +53,7 @@ class Trainer:
         fp16: bool = False,
         token_category_map: list[int] | None = None,
         token_category_names: list[str] | None = None,
+        piece_balance: str = "none",
     ):
         self.device = device or get_device()
         self.model = model.to(self.device)
@@ -62,6 +63,7 @@ class Trainer:
         self.accumulation_steps = accumulation_steps
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        self.piece_balance = piece_balance
 
         # Mixed precision — only on CUDA
         self.fp16 = fp16 and self.device.type == "cuda"
@@ -213,6 +215,77 @@ class Trainer:
         logger.info(f"Resumed from {path} (epoch {saved_epoch}, best_val={self.best_val_loss:.4f})")
         return saved_epoch + 1
 
+    def _make_train_loader(self, dataset: BachDataset | None = None) -> DataLoader:
+        """Build a training DataLoader, optionally with piece-balanced sampling.
+
+        When ``self.piece_balance`` is ``"sqrt"`` or ``"inverse"`` and the
+        dataset has ``piece_ids``, a ``WeightedRandomSampler`` is used so that
+        heavily-chunked pieces are down-weighted.
+        """
+        from bach_gen.data.dataset import compute_piece_weights
+
+        ds = dataset or self.train_dataset
+        use_sampler = (
+            self.piece_balance != "none"
+            and hasattr(ds, "piece_ids")
+            and ds.piece_ids
+        )
+
+        if use_sampler:
+            weights = compute_piece_weights(ds.piece_ids, mode=self.piece_balance)
+            sampler = WeightedRandomSampler(
+                weights=weights,
+                num_samples=len(ds),
+                replacement=True,
+            )
+            # Log diagnostics
+            from collections import Counter
+            piece_counts = Counter(ds.piece_ids)
+            top = piece_counts.most_common(10)
+            logger.info(
+                f"Piece-balance sampler ({self.piece_balance}): "
+                f"{len(piece_counts)} unique pieces, "
+                f"top-10 chunks: {[(pid, cnt) for pid, cnt in top]}"
+            )
+            return DataLoader(
+                ds,
+                batch_size=self.batch_size,
+                sampler=sampler,
+                drop_last=True,
+                num_workers=0,
+            )
+
+        return DataLoader(
+            ds,
+            batch_size=self.batch_size,
+            shuffle=True,
+            drop_last=True,
+            num_workers=0,
+        )
+
+    def transition_seq_len(self, new_seq_len: int) -> None:
+        """Update the effective context length for training.
+
+        Adjusts the dataset ``seq_len`` (which controls cropping/padding in
+        ``__getitem__``), the model config, and the ``max_seq_len`` cached on
+        each attention layer (used only for KV-cache allocation during
+        generation, but kept consistent for correctness).  Positional-
+        embedding caches auto-extend on the next forward pass so no explicit
+        rebuild is needed.
+        """
+        old = self.train_dataset.seq_len
+        self.train_dataset.seq_len = new_seq_len
+        if self.val_dataset is not None:
+            self.val_dataset.seq_len = new_seq_len
+        self.model.config.max_seq_len = new_seq_len
+
+        # Update per-layer KV cache pre-allocation size.
+        for layer in self.model.layers:
+            if hasattr(layer, "attn") and hasattr(layer.attn, "max_seq_len"):
+                layer.attn.max_seq_len = new_seq_len
+
+        logger.info(f"Transitioned seq_len: {old} → {new_seq_len}")
+
     def train(
         self,
         epochs: int = DEFAULT_EPOCHS,
@@ -227,11 +300,14 @@ class Trainer:
         phase_name: str | None = None,
         checkpoint_prefix: str = "",
         use_rope: bool | None = None,
+        seq_len_stages: list[tuple[int, int]] | None = None,
     ) -> dict:
         """Run training loop.
 
         Args:
-            epochs: Total number of epochs (target epoch count).
+            epochs: Total number of epochs (target epoch count).  When
+                ``seq_len_stages`` is provided this is ignored and the total
+                is computed from the stage definitions.
             start_epoch: Epoch to start from (1 for fresh, >1 when resuming).
             log_interval: Log every N epochs.
             val_interval: Validate every N epochs.
@@ -244,60 +320,51 @@ class Trainer:
             checkpoint_prefix: Optional checkpoint name prefix per phase.
             use_rope: Whether to use positional embeddings. Defaults to
                 ``not model.config.drope_trained``.
+            seq_len_stages: Optional list of ``(seq_len, num_epochs)`` for
+                staged context-length training.  When provided, the training
+                loop is divided into consecutive stages, each with its own
+                context length, cosine-annealed LR schedule, and early-
+                stopping counter.
 
         Returns:
             Dict with training history.
         """
-        train_loader = DataLoader(
-            self.train_dataset,
-            batch_size=self.batch_size,
-            shuffle=True,
-            drop_last=True,
-            num_workers=0,
-        )
-
         if use_rope is None:
             use_rope = not getattr(self.model.config, "drope_trained", False)
         phase_tag = f"[{phase_name}] " if phase_name else ""
         ckpt_prefix = checkpoint_prefix or ""
 
-        val_loader = None
-        if self.val_dataset and len(self.val_dataset) > 0:
-            val_loader = DataLoader(
-                self.val_dataset,
-                batch_size=self.batch_size,
-                shuffle=False,
-                num_workers=0,
-            )
+        # --- Build stage schedule ---
+        if seq_len_stages:
+            stages = list(seq_len_stages)
+        else:
+            stages = [(self.train_dataset.seq_len, epochs)]
 
-        # Cosine annealing scheduler
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=epochs, eta_min=1e-6
-        )
+        total_epochs = sum(ep for _, ep in stages)
 
-        # Fast-forward scheduler to match resumed epoch
-        for _ in range(start_epoch - 1):
-            scheduler.step()
-
-        history = {"train_loss": [], "val_loss": [], "lr": []}
+        history: dict = {"train_loss": [], "val_loss": [], "lr": []}
         if self._token_category_map is not None:
             history["train_category_loss"] = []
             history["val_category_loss"] = []
 
         effective_batch = self.batch_size * self.accumulation_steps
         logger.info(
-            f"{phase_tag}Training on {self.device} for {epochs} epochs "
-            f"(starting at epoch {start_epoch})"
+            f"{phase_tag}Training on {self.device} for {total_epochs} epochs "
+            f"({len(stages)} stage{'s' if len(stages) > 1 else ''}, "
+            f"starting at epoch {start_epoch})"
         )
+        if len(stages) > 1:
+            stage_desc = ", ".join(f"{sl}@{ep}ep" for sl, ep in stages)
+            logger.info(f"{phase_tag}Seq-len stages: {stage_desc}")
         logger.info(f"{phase_tag}Model params: {self.model.count_parameters():,}")
         logger.info(
             f"{phase_tag}Batch size: {self.batch_size} x {self.accumulation_steps} accumulation"
             f" = {effective_batch} effective"
         )
 
-        if start_epoch > epochs:
+        if start_epoch > total_epochs:
             logger.warning(
-                f"Start epoch {start_epoch} exceeds target epochs {epochs}. Nothing to train."
+                f"Start epoch {start_epoch} exceeds target epochs {total_epochs}. Nothing to train."
             )
             return history
 
@@ -307,62 +374,110 @@ class Trainer:
                 f"min_delta={min_delta}, min_epochs={min_epochs}"
             )
 
-        bad_epochs = 0
+        global_epoch = 0  # 0-based counter across all stages
         stop_reason = "max_epochs_reached"
 
-        for epoch in range(start_epoch, epochs + 1):
-            self.epoch = epoch
-            train_loss, train_cat_losses = self._train_epoch(train_loader, use_rope=use_rope)
-            history["train_loss"].append(train_loss)
-            history["lr"].append(scheduler.get_last_lr()[0])
-            if "train_category_loss" in history:
-                history["train_category_loss"].append(train_cat_losses)
+        for stage_idx, (stage_seq_len, stage_epochs) in enumerate(stages):
+            # Transition context length
+            self.transition_seq_len(stage_seq_len)
 
-            scheduler.step()
-
-            val_loss = None
-            val_cat_losses: dict[str, float | None] = {}
-            if val_loader and epoch % val_interval == 0:
-                val_loss, val_cat_losses = self._validate(val_loader, use_rope=use_rope)
-                history["val_loss"].append(val_loss)
-                if "val_category_loss" in history:
-                    history["val_category_loss"].append(val_cat_losses)
-
-                if val_loss < (self.best_val_loss - min_delta):
-                    self.best_val_loss = val_loss
-                    bad_epochs = 0
-                    self._save_checkpoint(f"{ckpt_prefix}best.pt")
-                elif val_loss < self.best_val_loss:
-                    # Improved but below min_delta threshold
-                    self.best_val_loss = val_loss
-                    bad_epochs += 1
-                    self._save_checkpoint(f"{ckpt_prefix}best.pt")
-                else:
-                    bad_epochs += 1
-
-            if epoch % log_interval == 0:
-                msg = f"{phase_tag}Epoch {epoch}/{epochs} | train_loss={train_loss:.4f}"
-                if train_cat_losses:
-                    msg += self._format_category_losses(train_cat_losses, label="train_cat")
-                if val_loss is not None:
-                    msg += f" | val_loss={val_loss:.4f}"
-                    if val_cat_losses:
-                        msg += self._format_category_losses(val_cat_losses, label="val_cat")
-                msg += f" | lr={scheduler.get_last_lr()[0]:.6f}"
-                logger.info(msg)
-
-            if progress_callback:
-                progress_callback(epoch, train_loss, val_loss)
-
-            # Save after every epoch so training can be stopped at any time
-            self._save_checkpoint(f"{ckpt_prefix}latest.pt")
-
-            if early_stop and epoch >= min_epochs and bad_epochs >= patience:
-                stop_reason = (
-                    f"early_stop(patience={patience}, min_delta={min_delta})"
+            train_loader = self._make_train_loader()
+            val_loader = None
+            if self.val_dataset and len(self.val_dataset) > 0:
+                val_loader = DataLoader(
+                    self.val_dataset,
+                    batch_size=self.batch_size,
+                    shuffle=False,
+                    num_workers=0,
                 )
-                logger.info(f"{phase_tag}Early stop at epoch {epoch}: {stop_reason}")
-                break
+
+            # Per-stage cosine annealing from current LR
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer, T_max=stage_epochs, eta_min=1e-6,
+            )
+
+            # Fast-forward scheduler if resuming into this stage
+            stage_start_global = sum(ep for _, ep in stages[:stage_idx])
+            epochs_to_skip = max(0, (start_epoch - 1) - stage_start_global)
+            if epochs_to_skip >= stage_epochs:
+                global_epoch += stage_epochs
+                continue  # This entire stage was already completed
+            for _ in range(epochs_to_skip):
+                scheduler.step()
+
+            if len(stages) > 1:
+                logger.info(
+                    f"{phase_tag}Stage {stage_idx + 1}/{len(stages)}: "
+                    f"seq_len={stage_seq_len}, {stage_epochs} epochs"
+                )
+
+            bad_epochs = 0
+            stage_stopped_early = False
+
+            for stage_ep in range(1, stage_epochs + 1):
+                global_epoch = stage_start_global + stage_ep
+                if global_epoch < start_epoch:
+                    continue  # Skip already-completed epochs
+
+                self.epoch = global_epoch
+                train_loss, train_cat_losses = self._train_epoch(train_loader, use_rope=use_rope)
+                history["train_loss"].append(train_loss)
+                history["lr"].append(scheduler.get_last_lr()[0])
+                if "train_category_loss" in history:
+                    history["train_category_loss"].append(train_cat_losses)
+
+                scheduler.step()
+
+                val_loss = None
+                val_cat_losses: dict[str, float | None] = {}
+                if val_loader and global_epoch % val_interval == 0:
+                    val_loss, val_cat_losses = self._validate(val_loader, use_rope=use_rope)
+                    history["val_loss"].append(val_loss)
+                    if "val_category_loss" in history:
+                        history["val_category_loss"].append(val_cat_losses)
+
+                    if val_loss < (self.best_val_loss - min_delta):
+                        self.best_val_loss = val_loss
+                        bad_epochs = 0
+                        self._save_checkpoint(f"{ckpt_prefix}best.pt")
+                    elif val_loss < self.best_val_loss:
+                        # Improved but below min_delta threshold
+                        self.best_val_loss = val_loss
+                        bad_epochs += 1
+                        self._save_checkpoint(f"{ckpt_prefix}best.pt")
+                    else:
+                        bad_epochs += 1
+
+                if global_epoch % log_interval == 0:
+                    msg = f"{phase_tag}Epoch {global_epoch}/{total_epochs} | train_loss={train_loss:.4f}"
+                    if len(stages) > 1:
+                        msg += f" | seq_len={stage_seq_len}"
+                    if train_cat_losses:
+                        msg += self._format_category_losses(train_cat_losses, label="train_cat")
+                    if val_loss is not None:
+                        msg += f" | val_loss={val_loss:.4f}"
+                        if val_cat_losses:
+                            msg += self._format_category_losses(val_cat_losses, label="val_cat")
+                    msg += f" | lr={scheduler.get_last_lr()[0]:.6f}"
+                    logger.info(msg)
+
+                if progress_callback:
+                    progress_callback(global_epoch, train_loss, val_loss)
+
+                # Save after every epoch so training can be stopped at any time
+                self._save_checkpoint(f"{ckpt_prefix}latest.pt")
+
+                if early_stop and stage_ep >= min_epochs and bad_epochs >= patience:
+                    stop_reason = (
+                        f"early_stop(stage={stage_idx+1}, patience={patience}, min_delta={min_delta})"
+                    )
+                    logger.info(f"{phase_tag}Early stop at epoch {global_epoch}: {stop_reason}")
+                    stage_stopped_early = True
+                    break
+
+            # Save stage checkpoint
+            if len(stages) > 1:
+                self._save_checkpoint(f"{ckpt_prefix}stage{stage_idx+1}.pt")
 
         # Save final checkpoint
         self._save_checkpoint(f"{ckpt_prefix}final.pt")
@@ -495,13 +610,7 @@ class Trainer:
 
         self.best_val_loss = float("inf")
 
-        train_loader = DataLoader(
-            self.train_dataset,
-            batch_size=self.batch_size,
-            shuffle=True,
-            drop_last=True,
-            num_workers=0,
-        )
+        train_loader = self._make_train_loader()
 
         val_loader = None
         if self.val_dataset and len(self.val_dataset) > 0:
@@ -699,8 +808,17 @@ class Trainer:
     def load_checkpoint(
         path: str | Path,
         device: torch.device | None = None,
+        override_max_seq_len: int | None = None,
     ) -> tuple[BachTransformer, ModelConfig]:
         """Load model from checkpoint.
+
+        Args:
+            path: Path to the checkpoint file.
+            device: Device to load the model onto.
+            override_max_seq_len: When provided, override
+                ``config.max_seq_len`` before constructing the model so
+                positional embedding caches are built at the new size.
+                Useful for staged context-length training (e.g. 8k → 16k).
 
         Returns:
             (model, config)
@@ -714,6 +832,20 @@ class Trainer:
         # Backward compat: old checkpoints lack num_kv_heads
         if not hasattr(config, "num_kv_heads"):
             config.num_kv_heads = None
+
+        # Override max_seq_len for context-length extension.  Positional
+        # embedding caches are registered as non-persistent buffers so they
+        # won't conflict with the state dict — they are simply rebuilt at the
+        # new size during model construction.
+        if override_max_seq_len is not None:
+            old_len = config.max_seq_len
+            config.max_seq_len = override_max_seq_len
+            logger.info(
+                "Overriding max_seq_len: %d → %d",
+                old_len,
+                override_max_seq_len,
+            )
+
         model = BachTransformer(config)
 
         # Migrate old combined QKV weights to separate Q/K/V projections

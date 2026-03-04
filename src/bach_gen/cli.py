@@ -1001,6 +1001,9 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
 @click.option("--batch-size", default=8, type=int, help="Batch size")
 @click.option("--seq-len", default=None, type=int,
               help="Max sequence length (default: from mode)")
+@click.option("--seq-len-stages", default=None, type=str,
+              help="Staged context-length training: 'len:epochs,...' "
+                   "e.g. '4096:50,8192:30,16384:20'. Overrides --seq-len and --epochs.")
 @click.option("--mode", "-m", type=click.Choice(VALID_FORMS), default=None,
               help="Composition mode (auto-detected from data if not set)")
 @click.option("--accumulation-steps", default=1, type=int,
@@ -1063,7 +1066,11 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
               default="pope", help="Positional encoding for main training stage")
 @click.option("--num-kv-heads", default=None, type=int,
               help="Number of KV heads for GQA (default: same as num_heads = standard MHA)")
-def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: str | None,
+@click.option("--piece-balance", type=click.Choice(["none", "sqrt", "inverse"]),
+              default="sqrt",
+              help="Down-weight heavily-chunked pieces via WeightedRandomSampler (default: sqrt)")
+def train(epochs: int, lr: float, batch_size: int, seq_len: int | None,
+          seq_len_stages: str | None, mode: str | None,
           accumulation_steps: int, resume: str | None, data_dir: str | None,
           curriculum: bool, pretrain_epochs: int, finetune_data_dir: str,
           finetune_style: str | None,
@@ -1076,7 +1083,8 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
           finetune_es_min_epochs: int | None,
           log_interval: int,
           val_interval: int | None,
-          fp16: bool, pos_encoding: str, num_kv_heads: int | None) -> None:
+          fp16: bool, pos_encoding: str, num_kv_heads: int | None,
+          piece_balance: str) -> None:
     """Train the Bach Transformer model."""
     import torch
     from bach_gen.data.dataset import BachDataset, create_dataset
@@ -1119,6 +1127,31 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
     if drope_warmup_epochs < 0:
         console.print("[red]--drope-warmup-epochs must be >= 0[/red]")
         sys.exit(1)
+
+    # Parse staged context-length schedule
+    parsed_stages: list[tuple[int, int]] | None = None
+    if seq_len_stages:
+        try:
+            parsed_stages = []
+            for part in seq_len_stages.split(","):
+                sl_str, ep_str = part.strip().split(":")
+                sl, ep = int(sl_str), int(ep_str)
+                if sl < 1 or ep < 1:
+                    raise ValueError(f"seq_len and epochs must be >= 1, got {sl}:{ep}")
+                parsed_stages.append((sl, ep))
+            if not parsed_stages:
+                raise ValueError("empty stage list")
+        except Exception as e:
+            console.print(f"[red]Invalid --seq-len-stages format: {e}\n"
+                          f"Expected: 'len:epochs,len:epochs,...' e.g. '4096:50,8192:30,16384:20'[/red]")
+            sys.exit(1)
+
+        # Use the first stage's seq_len for initial dataset/model construction
+        seq_len = parsed_stages[0][0]
+        # Override total epochs
+        epochs = sum(ep for _, ep in parsed_stages)
+        console.print(f"  Staged context training: {' → '.join(f'{sl}@{ep}ep' for sl, ep in parsed_stages)}")
+        console.print(f"  Total epochs: {epochs}")
 
     console.print(f"[bold]Loading training data from {train_data_dir}...[/bold]")
     console.print(f"  Mode: {mode}, seq_len: {seq_len}")
@@ -1167,7 +1200,8 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
         return filtered_seqs, filtered_pids
 
     # Create datasets
-    train_ds, val_ds = create_dataset(sequences, seq_len=seq_len, piece_ids=piece_ids)
+    train_ds, val_ds = create_dataset(sequences, seq_len=seq_len, piece_ids=piece_ids,
+                                      tokenizer=tokenizer)
     console.print(f"Train: {len(train_ds)} sequences, Val: {len(val_ds)} sequences")
 
     # Create model
@@ -1204,6 +1238,7 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
         fp16=fp16,
         token_category_map=token_category_map,
         token_category_names=token_category_names,
+        piece_balance=piece_balance,
     )
 
     if curriculum:
@@ -1331,6 +1366,7 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
                     phase_name="PRETRAIN",
                     checkpoint_prefix="pretrain_",
                     use_rope=True,
+                    seq_len_stages=parsed_stages,
                 )
 
             if pt_history["train_loss"]:
@@ -1398,7 +1434,8 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
         # --- Phase 3: Fine-tune ---
         console.print(f"\n[bold]Phase 3: Preparing fine-tune data from {ft_source_desc}...[/bold]")
 
-        ft_train_ds, ft_val_ds = create_dataset(ft_sequences, seq_len=seq_len, piece_ids=ft_piece_ids)
+        ft_train_ds, ft_val_ds = create_dataset(ft_sequences, seq_len=seq_len, piece_ids=ft_piece_ids,
+                                                   tokenizer=tokenizer)
         console.print(f"  Fine-tune train: {len(ft_train_ds)}, val: {len(ft_val_ds)}")
 
         trainer.reset_for_finetuning(
@@ -1473,6 +1510,7 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None, mode: st
                 min_delta=es_min_delta,
                 min_epochs=es_min_epochs,
                 phase_name="TRAIN",
+                seq_len_stages=parsed_stages,
             )
         sequences_for_cal = sequences
 
