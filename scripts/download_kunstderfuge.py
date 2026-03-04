@@ -2367,8 +2367,9 @@ def _preprocess_krn(text: str) -> str:
     1. Strip all !!! reference record lines (fixes non-standard metadata errors)
     2. Strip repeat expansion markers *>[...] (fixes repeat processing errors)
     3. Normalize malformed measure marks (fixes int() parse errors)
-    4. Replace non-standard quarter-tone accidentals (fixes accidental errors)
-    5. Strip non-**kern spines (fixes humdrumPosition errors from **dynam etc.)
+    4. Fix corrupted multi-accidental runs (fixes unsupported accidental errors)
+    5. Normalize non-standard key interpretation qualifiers (fixes accidental parse errors)
+    6. Strip non-**kern spines (fixes humdrumPosition errors from **dynam etc.)
     """
     lines = text.split('\n')
     result = []
@@ -2403,13 +2404,17 @@ def _preprocess_krn(text: str) -> str:
                 else:
                     fixed_parts.append(part)
             line = '\t'.join(fixed_parts)
-        # 4. Replace non-standard quarter-tone accidentals
-        #    :a: (quarter-flat) → - (flat), :i: (quarter-sharp) → # (sharp)
-        line = line.replace(':a:', '-')
-        line = line.replace(':i:', '#')
+        # 4. Fix corrupted multi-accidental runs (e.g. E############### → E#)
+        #    Collapse 4+ consecutive sharps to single sharp, same for flats
+        line = re.sub(r'([a-gA-G])(#{4,})', r'\1#', line)
+        line = re.sub(r'([a-gA-G])(-{4,})', r'\1-', line)
+        # 5. Normalize non-standard key interpretation qualifiers
+        #    *G:a: → *G: (strip sub-mode qualifiers that music21 can't parse)
+        #    Standard key forms: *G:, *a:, *F#:, *b-: — keep these unchanged
+        line = re.sub(r'(\*[A-Ga-g][#-]?:)[a-g]:', r'\1', line)
         result.append(line)
 
-    # 5. Strip non-kern spines
+    # 6. Strip non-kern spines
     result = _strip_non_kern_spines(result)
     return '\n'.join(result)
 
