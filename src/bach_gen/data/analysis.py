@@ -204,19 +204,27 @@ def compute_harmonic_rhythm(
     if len(abs_beats) < 2:
         return "moderate"
 
-    # At each beat, compute the pitch-class set of sounding notes
-    def pc_set_at(tick: int) -> frozenset[int]:
+    changes = 0
+    sorted_voices = [sorted(voice, key=lambda n: n[0]) for voice in comp.voices]
+    voice_ptrs = [0] * len(sorted_voices)
+
+    def _pc_set_at_sorted_tick(tick: int) -> frozenset[int]:
         pcs: set[int] = set()
-        for voice in comp.voices:
-            for start, dur, pitch in voice:
-                if start <= tick < start + dur:
-                    pcs.add(pitch % 12)
+        for voice_idx, notes in enumerate(sorted_voices):
+            ptr = voice_ptrs[voice_idx]
+            while ptr < len(notes) and (notes[ptr][0] + notes[ptr][1]) <= tick:
+                ptr += 1
+            voice_ptrs[voice_idx] = ptr
+            if ptr >= len(notes):
+                continue
+            start, dur, pitch = notes[ptr]
+            if start <= tick < start + dur:
+                pcs.add(pitch % 12)
         return frozenset(pcs)
 
-    changes = 0
-    prev_pcs = pc_set_at(abs_beats[0])
+    prev_pcs = _pc_set_at_sorted_tick(abs_beats[0])
     for beat_tick in abs_beats[1:]:
-        cur_pcs = pc_set_at(beat_tick)
+        cur_pcs = _pc_set_at_sorted_tick(beat_tick)
         if cur_pcs != prev_pcs and cur_pcs:  # ignore empty beats
             changes += 1
         prev_pcs = cur_pcs
@@ -260,21 +268,34 @@ def compute_harmonic_tension(
         for vj in range(vi + 1, len(comp.voices)):
             notes_i = sorted(comp.voices[vi], key=lambda n: n[0])
             notes_j = sorted(comp.voices[vj], key=lambda n: n[0])
+            if not notes_i or not notes_j:
+                continue
 
             # Sample at the union of both voices' attack times
             attacks = sorted(
                 {n[0] for n in notes_i} | {n[0] for n in notes_j}
             )
-
-            def _pitch_at(notes: list, tick: int) -> int | None:
-                for start, dur, pitch in notes:
-                    if start <= tick < start + dur:
-                        return pitch
-                return None
+            idx_i = 0
+            idx_j = 0
 
             for tick in attacks:
-                pi = _pitch_at(notes_i, tick)
-                pj = _pitch_at(notes_j, tick)
+                while idx_i < len(notes_i) and (notes_i[idx_i][0] + notes_i[idx_i][1]) <= tick:
+                    idx_i += 1
+                while idx_j < len(notes_j) and (notes_j[idx_j][0] + notes_j[idx_j][1]) <= tick:
+                    idx_j += 1
+
+                pi = None
+                if idx_i < len(notes_i):
+                    start_i, dur_i, pitch_i = notes_i[idx_i]
+                    if start_i <= tick < start_i + dur_i:
+                        pi = pitch_i
+
+                pj = None
+                if idx_j < len(notes_j):
+                    start_j, dur_j, pitch_j = notes_j[idx_j]
+                    if start_j <= tick < start_j + dur_j:
+                        pj = pitch_j
+
                 if pi is not None and pj is not None:
                     interval = abs(pi - pj) % 12
                     interval_count += 1

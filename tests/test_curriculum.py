@@ -211,6 +211,19 @@ class TestGetAllWorks:
         assert kept[shared_source].style == "bach"
         assert "kernscores/froberger/froberger001" in kept
 
+    @patch("bach_gen.data.corpus.get_midi_files")
+    @patch("bach_gen.data.corpus._load_by_bwv")
+    @patch("bach_gen.data.corpus._search_corpus_broad")
+    def test_local_only_skips_music21_and_bwv_sources(self, mock_broad, mock_bwv, mock_midi):
+        mock_midi.return_value = _make_fake_works(["baroque"], prefix="midi")
+
+        works = get_all_works(composer_filter=None, local_only=True)
+
+        assert len(works) == 1
+        mock_broad.assert_not_called()
+        mock_bwv.assert_not_called()
+        mock_midi.assert_called_once()
+
     @patch("bach_gen.data.corpus.get_all_works")
     def test_get_all_bach_works_delegates(self, mock_get_all):
         """get_all_bach_works() should call get_all_works(composer_filter=None)."""
@@ -389,6 +402,16 @@ class TestCLIOptions:
         result = runner.invoke(cli, ["prepare-data", "--help"])
         assert result.exit_code == 0
         assert "--data-dir" in result.output
+
+    def test_prepare_data_has_local_only_and_skip_corpus_stats(self):
+        from click.testing import CliRunner
+        from bach_gen.cli import cli
+
+        runner = CliRunner()
+        result = runner.invoke(cli, ["prepare-data", "--help"])
+        assert result.exit_code == 0
+        assert "--local-only" in result.output
+        assert "--skip-corpus-stats" in result.output
 
     def test_train_has_curriculum_options(self):
         from click.testing import CliRunner

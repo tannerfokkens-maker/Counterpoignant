@@ -564,6 +564,7 @@ class BachTokenizer:
             tokens.append(self.name_to_token[key_token_name])
 
         time_sig = comp.time_signature if hasattr(comp, "time_signature") else (4, 4)
+        structure_horizon_tick = self._structural_horizon_tick(comp.voices, cadence_tokens_by_tick)
 
         # Serialize each voice sequentially
         emitted_voices = 0
@@ -583,6 +584,7 @@ class BachTokenizer:
                 voice_num=voice_num,
                 cadence_tokens_by_tick=cadence_tokens_by_tick,
                 emit_cadence_tokens=(voice_num == 1),
+                structure_horizon_tick=(structure_horizon_tick if voice_num == 1 else None),
                 subject_start_markers=subject_start_markers,
                 subject_end_markers=subject_end_markers,
             )
@@ -602,6 +604,53 @@ class BachTokenizer:
 
         return tokens
 
+    @staticmethod
+    def _structural_horizon_tick(
+        voices: list[list[tuple[int, int, int]]],
+        cadence_tokens_by_tick: dict[int, int] | None = None,
+    ) -> int:
+        """Return the latest tick that should receive structural markers."""
+        max_note_start = max((start for voice in voices for start, _dur, _pitch in voice), default=0)
+        max_cadence_tick = max(cadence_tokens_by_tick.keys(), default=0) if cadence_tokens_by_tick else 0
+        return max(max_note_start, max_cadence_tick)
+
+    def _emit_timeline_markers(
+        self,
+        tokens: list[int],
+        *,
+        current_time: int,
+        beat_ptr: int,
+        beat_boundaries: list[tuple[int, int]],
+        target_tick: int,
+        cadence_tokens_by_tick: dict[int, int] | None = None,
+        emit_cadence_tokens: bool = True,
+    ) -> tuple[int, int]:
+        """Emit BAR/BEAT markers (and optional cadence tokens) through target_tick."""
+        while beat_ptr < len(beat_boundaries) and beat_boundaries[beat_ptr][0] <= target_tick:
+            b_tick, b_num = beat_boundaries[beat_ptr]
+            if b_tick >= current_time:
+                gap = b_tick - current_time
+                if gap > 0:
+                    ts_tokens = self._quantize_time_shift(gap)
+                    tokens.extend(ts_tokens)
+                    current_time = b_tick
+
+                if b_num == 1:
+                    if emit_cadence_tokens and cadence_tokens_by_tick is not None and b_tick > 0:
+                        cadence_tok = cadence_tokens_by_tick.get(b_tick)
+                        if cadence_tok is not None:
+                            tokens.append(cadence_tok)
+                    tokens.append(self.BAR)
+
+                beat_tok_name = f"BEAT_{b_num}"
+                beat_tok = self.name_to_token.get(beat_tok_name)
+                if beat_tok is not None:
+                    tokens.append(beat_tok)
+
+            beat_ptr += 1
+
+        return current_time, beat_ptr
+
     def _serialize_single_voice(
         self,
         voice_notes: list[tuple[int, int, int]],
@@ -609,6 +658,7 @@ class BachTokenizer:
         voice_num: int | None = None,
         cadence_tokens_by_tick: dict[int, int] | None = None,
         emit_cadence_tokens: bool = True,
+        structure_horizon_tick: int | None = None,
         subject_start_markers: set[tuple[int, int]] | None = None,
         subject_end_markers: set[tuple[int, int]] | None = None,
     ) -> list[int]:
@@ -623,12 +673,13 @@ class BachTokenizer:
             return tokens
 
         sorted_notes = sorted(voice_notes, key=lambda n: n[0])
+        if structure_horizon_tick is None:
+            structure_horizon_tick = max((start for start, _dur, _pitch in sorted_notes), default=0)
 
         # Pre-compute beat boundaries
         measure_ticks = ticks_per_measure(time_sig)
         beat_offsets = beat_tick_positions(time_sig)
-        max_tick = max(n[0] + n[1] for n in sorted_notes)
-        n_measures = (max_tick // measure_ticks) + 2
+        n_measures = (max(structure_horizon_tick, 0) // measure_ticks) + 2
 
         beat_boundaries: list[tuple[int, int]] = []
         for m in range(n_measures):
@@ -640,32 +691,15 @@ class BachTokenizer:
         beat_ptr = 0
 
         for note_idx, (start, dur, pitch) in enumerate(sorted_notes):
-            # Emit BAR/BEAT tokens
-            while beat_ptr < len(beat_boundaries) and beat_boundaries[beat_ptr][0] <= start:
-                b_tick, b_num = beat_boundaries[beat_ptr]
-                if b_tick >= current_time:
-                    gap = b_tick - current_time
-                    if gap > 0:
-                        ts_tokens = self._quantize_time_shift(gap)
-                        tokens.extend(ts_tokens)
-                        current_time = b_tick
-
-                    if b_num == 1:
-                        if (
-                            emit_cadence_tokens
-                            and cadence_tokens_by_tick is not None
-                            and b_tick > 0
-                        ):
-                            cadence_tok = cadence_tokens_by_tick.get(b_tick)
-                            if cadence_tok is not None:
-                                tokens.append(cadence_tok)
-                        tokens.append(self.BAR)
-                    beat_tok_name = f"BEAT_{b_num}"
-                    beat_tok = self.name_to_token.get(beat_tok_name)
-                    if beat_tok is not None:
-                        tokens.append(beat_tok)
-
-                beat_ptr += 1
+            current_time, beat_ptr = self._emit_timeline_markers(
+                tokens,
+                current_time=current_time,
+                beat_ptr=beat_ptr,
+                beat_boundaries=beat_boundaries,
+                target_tick=start,
+                cadence_tokens_by_tick=cadence_tokens_by_tick,
+                emit_cadence_tokens=emit_cadence_tokens,
+            )
 
             # Time shift to event
             dt = start - current_time
@@ -700,6 +734,16 @@ class BachTokenizer:
                 subj_end_tok = self.name_to_token.get("SUBJECT_END")
                 if subj_end_tok is not None:
                     tokens.append(subj_end_tok)
+
+        current_time, beat_ptr = self._emit_timeline_markers(
+            tokens,
+            current_time=current_time,
+            beat_ptr=beat_ptr,
+            beat_boundaries=beat_boundaries,
+            target_tick=structure_horizon_tick,
+            cadence_tokens_by_tick=cadence_tokens_by_tick,
+            emit_cadence_tokens=emit_cadence_tokens,
+        )
 
         return tokens
 
@@ -840,8 +884,8 @@ class BachTokenizer:
         # Pre-compute beat boundaries for the entire piece span
         measure_ticks = ticks_per_measure(time_sig)
         beat_offsets = beat_tick_positions(time_sig)
-        max_tick = max((e[0] + e[3] for e in all_events), default=0)
-        n_measures = (max_tick // measure_ticks) + 2
+        structure_horizon_tick = self._structural_horizon_tick(voices, cadence_tokens_by_tick)
+        n_measures = (max(structure_horizon_tick, 0) // measure_ticks) + 2
 
         beat_boundaries: list[tuple[int, int]] = []
         for m in range(n_measures):
@@ -853,28 +897,15 @@ class BachTokenizer:
         beat_ptr = 0
 
         for event_time, voice_num, pitch, duration, note_idx in all_events:
-            # Emit BAR/BEAT tokens for any beat boundaries between current_time and event_time
-            while beat_ptr < len(beat_boundaries) and beat_boundaries[beat_ptr][0] <= event_time:
-                b_tick, b_num = beat_boundaries[beat_ptr]
-                if b_tick >= current_time:
-                    gap = b_tick - current_time
-                    if gap > 0:
-                        ts_tokens = self._quantize_time_shift(gap)
-                        tokens.extend(ts_tokens)
-                        current_time = b_tick
-
-                    if b_num == 1:
-                        if cadence_tokens_by_tick is not None and b_tick > 0:
-                            cadence_tok = cadence_tokens_by_tick.get(b_tick)
-                            if cadence_tok is not None:
-                                tokens.append(cadence_tok)
-                        tokens.append(self.BAR)
-                    beat_tok_name = f"BEAT_{b_num}"
-                    beat_tok = self.name_to_token.get(beat_tok_name)
-                    if beat_tok is not None:
-                        tokens.append(beat_tok)
-
-                beat_ptr += 1
+            current_time, beat_ptr = self._emit_timeline_markers(
+                tokens,
+                current_time=current_time,
+                beat_ptr=beat_ptr,
+                beat_boundaries=beat_boundaries,
+                target_tick=event_time,
+                cadence_tokens_by_tick=cadence_tokens_by_tick,
+                emit_cadence_tokens=True,
+            )
 
             # Emit time shift for remaining distance to the event
             dt = event_time - current_time
@@ -912,6 +943,16 @@ class BachTokenizer:
                 subj_end_tok = self.name_to_token.get("SUBJECT_END")
                 if subj_end_tok is not None:
                     tokens.append(subj_end_tok)
+
+        current_time, beat_ptr = self._emit_timeline_markers(
+            tokens,
+            current_time=current_time,
+            beat_ptr=beat_ptr,
+            beat_boundaries=beat_boundaries,
+            target_tick=structure_horizon_tick,
+            cadence_tokens_by_tick=cadence_tokens_by_tick,
+            emit_cadence_tokens=True,
+        )
 
         return tokens
 

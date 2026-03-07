@@ -22,11 +22,21 @@ def _two_part_score():
 
 def test_prepare_data_uses_default_curated_era_filter(tmp_path: Path):
     runner = CliRunner()
+    midi_root = tmp_path / "midi"
+    midi_root.mkdir()
     with patch("bach_gen.data.corpus.get_all_works") as mock_get_all_works:
         mock_get_all_works.return_value = []  # command exits early after load step
         result = runner.invoke(
             cli,
-            ["prepare-data", "--mode", "chorale", "--data-dir", str(tmp_path)],
+            [
+                "prepare-data",
+                "--mode",
+                "chorale",
+                "--midi-dir",
+                str(midi_root),
+                "--data-dir",
+                str(tmp_path),
+            ],
         )
 
     assert result.exit_code != 0

@@ -20,6 +20,7 @@ from bach_gen.utils.constants import (
     FORM_DEFAULTS, VALID_FORMS, DEFAULT_SEQ_LEN,
     METER_MAP, LENGTH_NAMES, METER_NAMES,
     compute_measure_count, length_bucket, DEFAULT_PREPARE_COMPOSER_FILTER,
+    DEFAULT_EMBED_DIM, DEFAULT_NUM_HEADS, DEFAULT_NUM_LAYERS,
 )
 
 console = Console()
@@ -69,6 +70,53 @@ def chunk_sequences(
     Returns:
         (chunked_sequences, chunked_piece_ids)
     """
+    def _lookup_token_id(tokenizer_obj, token_name: str) -> int | None:
+        name_to_token = getattr(tokenizer_obj, "name_to_token", None)
+        if isinstance(name_to_token, dict):
+            tok = name_to_token.get(token_name)
+            if tok is not None:
+                return tok
+        token_to_name = getattr(tokenizer_obj, "token_to_name", None)
+        if isinstance(token_to_name, dict):
+            for tok, name in token_to_name.items():
+                if name == token_name:
+                    return tok
+        return None
+
+    def _sanitize_subject_boundaries(chunk_tokens: list[int]) -> list[int]:
+        if tokenizer is None:
+            return chunk_tokens
+        subj_start = _lookup_token_id(tokenizer, "SUBJECT_START")
+        subj_end = _lookup_token_id(tokenizer, "SUBJECT_END")
+        if subj_start is None or subj_end is None:
+            return chunk_tokens
+
+        keep = [True] * len(chunk_tokens)
+        open_balance = 0
+        for idx, tok in enumerate(chunk_tokens):
+            if tok == subj_start:
+                open_balance += 1
+            elif tok == subj_end:
+                if open_balance == 0:
+                    keep[idx] = False
+                else:
+                    open_balance -= 1
+
+        close_balance = 0
+        for idx in range(len(chunk_tokens) - 1, -1, -1):
+            tok = chunk_tokens[idx]
+            if tok == subj_end:
+                close_balance += 1
+            elif tok == subj_start:
+                if close_balance == 0:
+                    keep[idx] = False
+                else:
+                    close_balance -= 1
+
+        if all(keep):
+            return chunk_tokens
+        return [tok for idx, tok in enumerate(chunk_tokens) if keep[idx]]
+
     stride = int(max_seq_len * stride_fraction)
     result = []
     result_ids = []
@@ -96,6 +144,7 @@ def chunk_sequences(
                 start = 0
                 while start < len(body):
                     chunk = prefix + body[start:start + body_window]
+                    chunk = _sanitize_subject_boundaries(chunk)
                     if len(chunk) >= max_seq_len // 4:
                         result.append(chunk)
                         result_ids.append(pid)
@@ -109,6 +158,7 @@ def chunk_sequences(
                 chunk = seq[start:end]
                 if start > 0:
                     chunk = [bos_token] + chunk[:max_seq_len - 1]
+                chunk = _sanitize_subject_boundaries(chunk)
                 if len(chunk) >= max_seq_len // 4:
                     result.append(chunk)
                     result_ids.append(pid)
@@ -575,6 +625,8 @@ def _apply_conditioning_dropout_to_sequences(
               help="How to treat sonata data in broad training (default: counterpoint-safe)")
 @click.option("--workers", default=None, type=int,
               help="Number of parallel workers for file parsing (default: min(cpu_count, 8))")
+@click.option("--local-only", is_flag=True, default=False,
+              help="Only ingest files under --midi-dir; skip music21 corpus and BWV loading")
 @click.option("--conditioning-phase", type=click.Choice(["none", "cadence", "cadence+subject"]),
               default="cadence+subject",
               help="Structural conditioning labels to add during tokenization")
@@ -590,15 +642,18 @@ def _apply_conditioning_dropout_to_sequences(
               help="Minimum subject interval-match quality (default: 0.80)")
 @click.option("--subject-min-match-ratio", default=0.70, type=float,
               help="Minimum subject match length ratio (default: 0.70)")
+@click.option("--skip-corpus-stats", is_flag=True, default=False,
+              help="Skip corpus_stats.json computation to speed up prepare-data")
 def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len: int,
                  no_chunk: bool, data_dir: str | None, midi_dir: str | None, composer_filter: str | None,
                  no_sequential: bool, max_source_voices: int,
                  max_groups_per_work: int, pair_strategy: str,
                  max_pairs_per_work: int, sonata_policy: str,
-                 workers: int | None, conditioning_phase: str,
+                 workers: int | None, local_only: bool, conditioning_phase: str,
                  conditioning_dropout: float, conditioning_seed: int,
                  subject_forms: str, cadence_min_confidence: float,
-                 subject_min_quality: float, subject_min_match_ratio: float) -> None:
+                 subject_min_quality: float, subject_min_match_ratio: float,
+                 skip_corpus_stats: bool) -> None:
     """Extract Bach corpus, tokenize, and cache statistics."""
     from collections import Counter, defaultdict
     from bach_gen.data.corpus import get_all_works, _default_local_midi_dir, _original_source
@@ -679,6 +734,8 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
     console.print(f"  Max source voices: {max_source_voices}")
     console.print(f"  Sonata policy: {sonata_policy}")
     console.print(f"  Local score dir: {local_midi_dir}")
+    if local_only:
+        console.print("  Source scope: local-only")
     console.print(
         f"  Conditioning: {conditioning_phase} "
         f"(dropout={conditioning_dropout:.2f}, seed={conditioning_seed})"
@@ -702,6 +759,7 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
             max_groups_per_work=max_groups_per_work,
             midi_dir=local_midi_dir,
             voices_override=voices_for_extraction,
+            local_only=local_only,
         )
         progress.update(task, description=f"Extracted {len(works_with_forms)} voice groups")
 
@@ -959,19 +1017,27 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
             "cadence_min_confidence": cadence_min_confidence,
             "subject_min_quality": subject_min_quality,
             "subject_min_match_ratio": subject_min_match_ratio,
+            "local_only": local_only,
+            "corpus_stats_skipped": skip_corpus_stats,
         }, f, indent=2)
 
     # Compute and save corpus statistics
-    console.print("  Computing corpus statistics...")
-    stats = compute_corpus_stats(sequences, tokenizer.vocab_size, tokenizer=tokenizer)
-    with open(out_dir / "corpus_stats.json", "w") as f:
-        json.dump(stats, f, indent=2)
+    if skip_corpus_stats:
+        console.print("  Skipping corpus statistics (--skip-corpus-stats)")
+    else:
+        console.print("  Computing corpus statistics...")
+        stats = compute_corpus_stats(sequences, tokenizer.vocab_size, tokenizer=tokenizer)
+        with open(out_dir / "corpus_stats.json", "w") as f:
+            json.dump(stats, f, indent=2)
 
     console.print(f"\n[green]Done![/green] Data saved to {out_dir}/")
     console.print(f"  - tokenizer.json")
     console.print(f"  - sequences.json ({len(sequences)} sequences)")
     console.print(f"  - piece_ids.json ({len(set(piece_ids))} unique pieces)")
-    console.print(f"  - corpus_stats.json")
+    if skip_corpus_stats:
+        console.print(f"  - corpus_stats.json (skipped)")
+    else:
+        console.print(f"  - corpus_stats.json")
     console.print(f"  - mode.json (mode={mode}, voices={num_voices})")
 
     # Round-trip verification
@@ -1003,7 +1069,8 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
               help="Max sequence length (default: from mode)")
 @click.option("--seq-len-stages", default=None, type=str,
               help="Staged context-length training: 'len:epochs,...' "
-                   "e.g. '4096:50,8192:30,16384:20'. Overrides --seq-len and --epochs.")
+                   "e.g. '4096:50,8192:30,16384:20'. Overrides --seq-len and --epochs. "
+                   "In curriculum mode the same schedule is reused for both pre-train and fine-tune.")
 @click.option("--mode", "-m", type=click.Choice(VALID_FORMS), default=None,
               help="Composition mode (auto-detected from data if not set)")
 @click.option("--accumulation-steps", default=1, type=int,
@@ -1015,7 +1082,7 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
 @click.option("--curriculum", is_flag=True, default=False,
               help="Three-phase training: pre-train on --data-dir, DroPE recalibrate, then fine-tune on --finetune-data-dir or --finetune style subset")
 @click.option("--pretrain-epochs", default=300, type=int,
-              help="Epochs for pre-training phase (curriculum mode, default: 300)")
+              help="Epochs for pre-training phase when not using --seq-len-stages in curriculum mode (default: 300)")
 @click.option("--finetune-data-dir", default="data/bach", type=click.Path(),
               help="Data directory for fine-tuning phase (default: data/bach)")
 @click.option("--finetune", "finetune_style",
@@ -1062,6 +1129,12 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
               help="Validation frequency in epochs (default: auto = epochs//20)")
 @click.option("--fp16", is_flag=True, default=False,
               help="Enable mixed precision (fp16) training — CUDA only")
+@click.option("--embed-dim", default=DEFAULT_EMBED_DIM, type=int,
+              help=f"Model embedding dimension (default: {DEFAULT_EMBED_DIM})")
+@click.option("--num-heads", default=DEFAULT_NUM_HEADS, type=int,
+              help=f"Attention heads (default: {DEFAULT_NUM_HEADS})")
+@click.option("--num-layers", default=DEFAULT_NUM_LAYERS, type=int,
+              help=f"Transformer layers (default: {DEFAULT_NUM_LAYERS})")
 @click.option("--pos-encoding", type=click.Choice(["rope", "pope"]),
               default="pope", help="Positional encoding for main training stage")
 @click.option("--num-kv-heads", default=None, type=int,
@@ -1083,7 +1156,8 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None,
           finetune_es_min_epochs: int | None,
           log_interval: int,
           val_interval: int | None,
-          fp16: bool, pos_encoding: str, num_kv_heads: int | None,
+          fp16: bool, embed_dim: int, num_heads: int, num_layers: int,
+          pos_encoding: str, num_kv_heads: int | None,
           piece_balance: str) -> None:
     """Train the Bach Transformer model."""
     import torch
@@ -1127,9 +1201,24 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None,
     if drope_warmup_epochs < 0:
         console.print("[red]--drope-warmup-epochs must be >= 0[/red]")
         sys.exit(1)
+    if embed_dim < 1:
+        console.print("[red]--embed-dim must be >= 1[/red]")
+        sys.exit(1)
+    if num_heads < 1:
+        console.print("[red]--num-heads must be >= 1[/red]")
+        sys.exit(1)
+    if num_layers < 1:
+        console.print("[red]--num-layers must be >= 1[/red]")
+        sys.exit(1)
+    if embed_dim % num_heads != 0:
+        console.print(
+            f"[red]--embed-dim ({embed_dim}) must be divisible by --num-heads ({num_heads})[/red]"
+        )
+        sys.exit(1)
 
     # Parse staged context-length schedule
     parsed_stages: list[tuple[int, int]] | None = None
+    stage_total_epochs: int | None = None
     if seq_len_stages:
         try:
             parsed_stages = []
@@ -1148,10 +1237,17 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None,
 
         # Use the first stage's seq_len for initial dataset/model construction
         seq_len = parsed_stages[0][0]
-        # Override total epochs
-        epochs = sum(ep for _, ep in parsed_stages)
-        console.print(f"  Staged context training: {' → '.join(f'{sl}@{ep}ep' for sl, ep in parsed_stages)}")
-        console.print(f"  Total epochs: {epochs}")
+        stage_total_epochs = sum(ep for _, ep in parsed_stages)
+        stage_desc = " → ".join(f"{sl}@{ep}ep" for sl, ep in parsed_stages)
+        if curriculum:
+            console.print(f"  Staged curriculum schedule: {stage_desc}")
+            console.print(f"  Epochs per train phase: {stage_total_epochs}")
+            console.print("  The staged schedule will be applied to both pre-train and fine-tune.")
+        else:
+            # Override total epochs
+            epochs = stage_total_epochs
+            console.print(f"  Staged context training: {stage_desc}")
+            console.print(f"  Total epochs: {epochs}")
 
     console.print(f"[bold]Loading training data from {train_data_dir}...[/bold]")
     console.print(f"  Mode: {mode}, seq_len: {seq_len}")
@@ -1207,6 +1303,9 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None,
     # Create model
     config = ModelConfig(
         vocab_size=tokenizer.vocab_size,
+        embed_dim=embed_dim,
+        num_heads=num_heads,
+        num_layers=num_layers,
         max_seq_len=seq_len,
         pos_encoding=pos_encoding,
         num_kv_heads=num_kv_heads,
@@ -1263,9 +1362,21 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None,
 
     if curriculum:
         # Validate curriculum parameters
-        if pretrain_epochs >= epochs:
-            console.print(f"[red]--pretrain-epochs ({pretrain_epochs}) must be less than "
-                          f"--epochs ({epochs})[/red]")
+        if parsed_stages:
+            pretrain_epochs = stage_total_epochs or 0
+            finetune_epochs = stage_total_epochs or 0
+        else:
+            if pretrain_epochs >= epochs:
+                console.print(f"[red]--pretrain-epochs ({pretrain_epochs}) must be less than "
+                              f"--epochs ({epochs})[/red]")
+                sys.exit(1)
+            finetune_epochs = epochs - pretrain_epochs
+
+        if pretrain_epochs < 1 or finetune_epochs < 1:
+            console.print(
+                f"[red]Curriculum phases must both be at least 1 epoch "
+                f"(pretrain={pretrain_epochs}, finetune={finetune_epochs}).[/red]"
+            )
             sys.exit(1)
 
         if finetune_style and "--finetune-data-dir" in sys.argv:
@@ -1300,7 +1411,6 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None,
                     ft_piece_ids = json.load(f)
             ft_source_desc = str(ft_data_dir)
 
-        finetune_epochs = epochs - pretrain_epochs
         skip_pretrain = pretrained_checkpoint is not None
         ft_es_patience = finetune_es_patience if finetune_es_patience is not None else es_patience
         ft_es_min_delta = finetune_es_min_delta if finetune_es_min_delta is not None else es_min_delta
@@ -1470,6 +1580,7 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None,
                 min_epochs=ft_es_min_epochs,
                 phase_name="FINETUNE",
                 checkpoint_prefix="finetune_",
+                seq_len_stages=parsed_stages,
             )
 
         # Merge histories for reporting

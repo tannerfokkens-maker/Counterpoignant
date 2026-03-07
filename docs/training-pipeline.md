@@ -2,6 +2,13 @@
 
 End-to-end guide for the next training run: data preparation, staged curriculum training with context-length extension, and generation.
 
+This version is updated for the new prepared corpus in `datamidiall/`:
+- `36,943` stored sequences
+- `317,823,112` stored training tokens
+- raw-token Chinchilla target: about `15.9M` parameters
+
+That `15.9M` target is based on the stored token stream you actually train on, not a de-duplicated estimate of unique musical content.
+
 ---
 
 ## 1. Prepare Data
@@ -10,8 +17,11 @@ Prepare once at the **maximum context length** you intend to reach. The training
 
 ```bash
 uv run bach-gen prepare-data \
-  --data-dir data \
-  --max-seq-len 16384
+  --midi-dir data/midi/all \
+  --data-dir datamidiall \
+  --max-seq-len 16384 \
+  --composer-filter all \
+  --sonata-policy all
 ```
 
 Current defaults:
@@ -72,17 +82,22 @@ The recommended training pipeline is a **three-phase curriculum with staged cont
 ```bash
 uv run bach-gen train \
   --curriculum \
-  --data-dir data \
+  --data-dir datamidiall \
   --finetune bach \
   --seq-len-stages "4096:40,8192:25,16384:15" \
-  --batch-size 8 \
+  --batch-size 4 \
+  --accumulation-steps 2 \
   --lr 3e-4 \
   --finetune-lr 1e-4 \
+  --embed-dim 384 \
+  --num-heads 8 \
+  --num-layers 9 \
   --pos-encoding pope \
-  --num-kv-heads 2 \
   --piece-balance sqrt \
   --fp16
 ```
+
+This command builds a model at about `15.99M` parameters on the current `datamidiall/tokenizer.json` vocab (`125` tokens), which is the closest clean architecture to the `15.9M` raw-token target.
 
 ### What `--seq-len-stages` Does
 
@@ -141,15 +156,16 @@ When sequences exceed the current stage's context length, `BachDataset.__getitem
 
 | Component | Setting |
 |---|---|
-| Type | Decoder-only Transformer, ~6.4M params |
-| Embedding | 256d |
-| Attention | 8 heads, GQA with `--num-kv-heads 2` recommended |
-| Layers | 8 |
+| Type | Decoder-only Transformer, ~16.0M params on `datamidiall/` |
+| Embedding | 384d |
+| Attention | 8 heads, standard MHA |
+| Layers | 9 |
 | FFN | SwiGLU (8/3 expansion) |
 | Normalization | RMSNorm, pre-norm |
 | Positional | PoPE (recommended) or RoPE |
 | Weight tying | Input embedding tied to output projection |
 | Precision | fp16 on CUDA, fp32 fallback |
+| Recommended optimizer batch | micro-batch `4`, accumulation `2` |
 
 ### Key Training Flags
 
@@ -157,6 +173,9 @@ When sequences exceed the current stage's context length, `BachDataset.__getitem
 |---|---|---|
 | `--seq-len-stages` | none | Staged context: `"len:epochs,..."` |
 | `--piece-balance` | `sqrt` | Down-weight heavily-chunked pieces |
+| `--embed-dim` | `256` | Embedding width |
+| `--num-heads` | `8` | Attention heads |
+| `--num-layers` | `8` | Transformer depth |
 | `--pos-encoding` | `pope` | Positional encoding (pope or rope) |
 | `--num-kv-heads` | none (=MHA) | GQA KV heads |
 | `--finetune` | none | Fine-tune target (style token or composer substring) |
@@ -176,33 +195,46 @@ cd Counterpoignant
 uv sync
 
 # 2. Prepare data at max context length
-uv run bach-gen prepare-data --data-dir data --max-seq-len 16384
+uv run bach-gen prepare-data \
+  --midi-dir data/midi/all \
+  --data-dir datamidiall \
+  --max-seq-len 16384 \
+  --composer-filter all \
+  --sonata-policy all
 
-# 3. Full curriculum training
+# 3. Full curriculum training at ~15.9M params
 uv run bach-gen train \
   --curriculum \
-  --data-dir data \
+  --data-dir datamidiall \
   --finetune bach \
   --seq-len-stages "4096:40,8192:25,16384:15" \
-  --batch-size 8 \
+  --batch-size 4 \
+  --accumulation-steps 2 \
   --lr 3e-4 \
   --finetune-lr 1e-4 \
+  --embed-dim 384 \
+  --num-heads 8 \
+  --num-layers 9 \
   --pos-encoding pope \
-  --num-kv-heads 2 \
   --piece-balance sqrt \
   --fp16
 
 # 4. Resume after preemption
 uv run bach-gen train \
   --curriculum \
-  --data-dir data \
+  --data-dir datamidiall \
   --finetune bach \
   --seq-len-stages "4096:40,8192:25,16384:15" \
+  --batch-size 4 \
+  --accumulation-steps 2 \
+  --embed-dim 384 \
+  --num-heads 8 \
+  --num-layers 9 \
   --resume models/latest.pt \
   --fp16
 ```
 
-Persist `data/`, `models/`, and `output/` to durable storage between sessions.
+Persist `datamidiall/`, `models/`, and `output/` to durable storage between sessions.
 
 ### Quick Smoke Test
 
@@ -211,12 +243,15 @@ Sanity-check the full pipeline after code/data changes:
 ```bash
 uv run bach-gen train \
   --curriculum \
+  --data-dir datamidiall \
   --finetune bach \
   --seq-len-stages "512:4,1024:3,2048:2" \
   --batch-size 16 \
   --lr 5e-4 \
   --finetune-lr 1e-4 \
-  --num-kv-heads 2 \
+  --embed-dim 384 \
+  --num-heads 8 \
+  --num-layers 9 \
   --drope-epochs 2 \
   --drope-min-epochs 1 \
   --drope-patience 1

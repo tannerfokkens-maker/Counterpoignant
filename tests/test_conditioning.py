@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import random
 
+import pytest
+
 from bach_gen.data.conditioning import (
     apply_conditioning_dropout,
     cadence_token_ids_by_tick,
@@ -12,6 +14,7 @@ from bach_gen.data.conditioning import (
     subject_boundary_note_indices,
 )
 from bach_gen.data.extraction import VoiceComposition
+from bach_gen.data.tokenizer import BachTokenizer
 from bach_gen.data.scale_degree_tokenizer import ScaleDegreeTokenizer
 from bach_gen.generation.generator import _build_structural_control_state
 
@@ -126,3 +129,36 @@ def test_structural_control_state_injects_subject_reentries():
     forced = state.maybe_force_token(tokenizer)
     subj_tok = tokenizer.name_to_token.get("SUBJECT_START")
     assert forced == subj_tok
+
+
+@pytest.mark.parametrize("tokenizer_cls", [ScaleDegreeTokenizer, BachTokenizer])
+def test_tokenizers_emit_cadence_markers_consistently_across_encodings(tokenizer_cls):
+    tokenizer = tokenizer_cls()
+    comp = VoiceComposition(
+        voices=[
+            [(0, 2400, 60)],                 # soprano sustains over the cadence boundary
+            [(0, 960, 55), (960, 1920, 48)],  # bass resolves G -> C without a note onset at bar 2
+        ],
+        key_root=0,
+        key_mode="major",
+        source="unit-cadence-parity",
+        time_signature=(4, 4),
+    )
+
+    cad_events = detect_cadence_events(comp, min_confidence=2.0)
+    assert any(e.token_name == "CAD_PAC" and e.tick == 1920 for e in cad_events)
+    cad_map = cadence_token_ids_by_tick(cad_events, tokenizer.name_to_token)
+
+    interleaved = tokenizer.encode(comp, form="fugue", cadence_tokens_by_tick=cad_map)
+    sequential = tokenizer.encode_sequential(comp, form="fugue", cadence_tokens_by_tick=cad_map)
+    inter_names = [tokenizer.token_to_name[t] for t in interleaved]
+    seq_names = [tokenizer.token_to_name[t] for t in sequential]
+
+    assert inter_names.count("CAD_PAC") == 1
+    assert seq_names.count("CAD_PAC") == 1
+    assert sum(name.startswith("CAD_") for name in inter_names) == sum(name.startswith("CAD_") for name in seq_names)
+
+    cad_idx = inter_names.index("CAD_PAC")
+    assert inter_names[cad_idx + 1] == "BAR"
+    cad_idx = seq_names.index("CAD_PAC")
+    assert seq_names[cad_idx + 1] == "BAR"

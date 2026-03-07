@@ -20,7 +20,8 @@ from __future__ import annotations
 
 import logging
 import os
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import time
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from pathlib import Path
 from typing import Optional
 
@@ -30,6 +31,9 @@ from music21 import corpus
 from bach_gen.utils.constants import ALL_TARGETED_BWV, DIR_TO_STYLE
 
 logger = logging.getLogger(__name__)
+
+SLOW_TASK_LOG_SECONDS = 10.0
+PENDING_TASK_HEARTBEAT_SECONDS = 15.0
 
 # ---------------------------------------------------------------------------
 # Top-level worker functions (must be module-level for pickling)
@@ -144,18 +148,60 @@ def _parallel_process(
     results: list = []
     try:
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(worker_fn, t): i for i, t in enumerate(tasks)}
+            futures = {
+                executor.submit(worker_fn, t): (t, time.perf_counter())
+                for t in tasks
+            }
+            pending = set(futures)
             done_count = 0
-            for future in as_completed(futures):
-                done_count += 1
-                if done_count % 50 == 0 or done_count == len(tasks):
-                    logger.info(f"{label}: {done_count}/{len(tasks)} files processed...")
-                try:
-                    r = future.result()
-                    if r:
-                        results.extend(r)
-                except Exception as e:
-                    logger.debug(f"{label} worker error: {e}")
+            last_pending_log = time.perf_counter()
+
+            while pending:
+                done, pending = wait(
+                    pending,
+                    timeout=1.0,
+                    return_when=FIRST_COMPLETED,
+                )
+                if not done:
+                    now = time.perf_counter()
+                    if now - last_pending_log >= PENDING_TASK_HEARTBEAT_SECONDS:
+                        slowest = sorted(
+                            pending,
+                            key=lambda future: futures[future][1],
+                        )[:3]
+                        samples = ", ".join(
+                            f"{_task_description(futures[future][0])} "
+                            f"({now - futures[future][1]:.1f}s)"
+                            for future in slowest
+                        )
+                        logger.info(
+                            "%s: waiting on %d slow task(s): %s",
+                            label,
+                            len(pending),
+                            samples,
+                        )
+                        last_pending_log = now
+                    continue
+
+                for future in done:
+                    done_count += 1
+                    task, started_at = futures[future]
+                    elapsed = time.perf_counter() - started_at
+                    if done_count % 50 == 0 or done_count == len(tasks):
+                        logger.info(f"{label}: {done_count}/{len(tasks)} files processed...")
+                    if elapsed >= SLOW_TASK_LOG_SECONDS:
+                        logger.info(
+                            "%s: slow task %s took %.1fs",
+                            label,
+                            _task_description(task),
+                            elapsed,
+                        )
+                    try:
+                        r = future.result()
+                        if r:
+                            results.extend(r)
+                    except Exception as e:
+                        logger.debug(f"{label} worker error: {e}")
     except Exception as e:
         # Pickling or other multiprocessing failure — fall back to sequential
         logger.warning(
@@ -172,6 +218,15 @@ def _parallel_process(
 
     logger.info(f"{label}: {len(results)} items from {len(tasks)} tasks")
     return results
+
+
+def _task_description(task: tuple | str | object) -> str:
+    """Return a short human-readable description for progress logging."""
+    if isinstance(task, tuple):
+        for item in task[:2]:
+            if isinstance(item, str) and item:
+                return item
+    return str(task)
 
 
 # ---------------------------------------------------------------------------
@@ -428,7 +483,7 @@ def get_midi_files(
     ]
 
     # Phase 1: discover and filter files (fast, sequential)
-    files: dict[Path, str] = {}
+    files: dict[Path, tuple[str, int]] = {}
 
     for ext in extensions:
         for f in midi_path.rglob(ext):
@@ -443,14 +498,22 @@ def get_midi_files(
             desc_guess = str(rel).rsplit(".", 1)[0]
             if accepted is not None and not _work_matches_filter(desc_guess, style_guess, accepted):
                 continue
-            files[f] = style_guess
+            try:
+                file_size = f.stat().st_size
+            except OSError:
+                file_size = 0
+            files[f] = (style_guess, file_size)
 
-    sorted_files = sorted(files)
+    # Schedule larger files first to reduce end-of-run stragglers.
+    sorted_files = sorted(
+        files,
+        key=lambda path: (-files[path][1], str(path)),
+    )
 
     # Phase 2: build tasks and run parse+extract in parallel
     parse_tasks: list[tuple] = []
     for f in sorted_files:
-        style = files[f]
+        style, _file_size = files[f]
         desc = str(f.relative_to(midi_path)).rsplit(".", 1)[0]
         parse_tasks.append(
             (str(f), desc, style, max_source_voices, max_groups, voices_override)
@@ -482,6 +545,7 @@ def get_all_works(
     max_groups_per_work: int = 1,
     midi_dir: str | Path | None = None,
     voices_override: int | None = None,
+    local_only: bool = False,
 ) -> list[tuple]:
     """Load and extract works for training, optionally filtered by composer/style.
 
@@ -508,6 +572,8 @@ def get_all_works(
         midi_dir: Local score root. Defaults to ``data/midi/all`` when present,
             otherwise ``data/midi``.
         voices_override: Override the auto-detected voice count for extraction.
+        local_only: When true, skip music21 corpus search and BWV-targeted
+            loading; only parse files under ``midi_dir``.
 
     Returns:
         List of (VoiceComposition, form_str) tuples.
@@ -539,15 +605,20 @@ def get_all_works(
     local_midi_dir = Path(midi_dir) if midi_dir is not None else _default_local_midi_dir()
     logger.info(f"Local score directory: {local_midi_dir}")
 
-    # Phase 1: broad search
-    works = _search_corpus_broad(max_workers=max_workers, **extraction_kwargs)
-    loaded_paths = {_original_source(comp.source) for comp, _ in works}
+    works: list[tuple] = []
 
-    # Phase 2: targeted BWV loading
-    bwv_works = _load_by_bwv(
-        ALL_TARGETED_BWV, loaded_paths, max_workers=max_workers, **extraction_kwargs,
-    )
-    works.extend(bwv_works)
+    if not local_only:
+        # Phase 1: broad search
+        works = _search_corpus_broad(max_workers=max_workers, **extraction_kwargs)
+        loaded_paths = {_original_source(comp.source) for comp, _ in works}
+
+        # Phase 2: targeted BWV loading
+        bwv_works = _load_by_bwv(
+            ALL_TARGETED_BWV, loaded_paths, max_workers=max_workers, **extraction_kwargs,
+        )
+        works.extend(bwv_works)
+    else:
+        logger.info("Local-only mode enabled — skipping music21 corpus and BWV loading")
 
     # Phase 3: user score files
     works.extend(get_midi_files(

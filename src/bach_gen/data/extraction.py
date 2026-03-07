@@ -308,9 +308,19 @@ def extract_voice_pairs(
 def _detect_key(score: music21.stream.Score) -> tuple[int, str]:
     """Detect the key of a score."""
     try:
-        key = score.analyze("key")
-        root_pc = key.tonic.pitchClass
-        mode = "minor" if key.mode == "minor" else "major"
+        # Many exported scores already carry explicit key objects.
+        # Reuse that metadata instead of invoking a fresh analysis pass.
+        for explicit_key in score.recurse().getElementsByClass(music21.key.Key):
+            root_pc = explicit_key.tonic.pitchClass
+            mode = "minor" if explicit_key.mode == "minor" else "major"
+            return root_pc, mode
+    except Exception:
+        pass
+
+    try:
+        analyzed_key = score.analyze("key")
+        root_pc = analyzed_key.tonic.pitchClass
+        mode = "minor" if analyzed_key.mode == "minor" else "major"
         return root_pc, mode
     except Exception:
         return 0, "major"  # default to C major
@@ -340,17 +350,15 @@ def _part_to_notes(
     """
     notes_list: list[tuple[int, int, int]] = []
 
-    for element in part.recurse().notesAndRests:
+    # Flatten once so element offsets are already absolute within the part.
+    # This is much cheaper than resolving hierarchy offsets per note.
+    flat_part = part.flatten()
+
+    for element in flat_part.notesAndRests:
         if isinstance(element, note.Rest):
             continue
 
         offset_quarters = float(element.offset)
-        # Get the absolute offset in the context of the score
-        try:
-            offset_quarters = float(element.getOffsetInHierarchy(part))
-        except Exception:
-            pass
-
         start_tick = int(round(offset_quarters * TICKS_PER_QUARTER))
         dur_tick = int(round(float(element.quarterLength) * TICKS_PER_QUARTER))
 

@@ -18,9 +18,12 @@ class _DummyTokenizer:
         57: "ENCODE_SEQUENTIAL",
         59: "KEY_C_major",
         60: "KEY_D_minor",
+        61: "SUBJECT_START",
+        62: "SUBJECT_END",
         2: "EOS",
     }
-    vocab_size = 61
+    name_to_token = {name: tok for tok, name in token_to_name.items()}
+    vocab_size = max(token_to_name) + 1
 
 
 def test_chunk_sequences_preserves_conditioning_prefix_on_continuations():
@@ -148,3 +151,28 @@ def test_subject_conditioning_is_enabled_for_fugue_like_forms():
     names = [tokenizer.token_to_name[t] for t in seqs[0]]
     assert "SUBJECT_START" in names
     assert "SUBJECT_END" in names
+
+
+def test_chunk_sequences_strips_unbalanced_subject_markers_from_chunks():
+    tokenizer = _DummyTokenizer()
+    prefix = [1, 20, 24, 18, 56, 59]
+    subj_start = tokenizer.name_to_token["SUBJECT_START"]
+    subj_end = tokenizer.name_to_token["SUBJECT_END"]
+    seq = prefix + [
+        100, 101, subj_start, 102, 103, 104, subj_end,
+        105, subj_start, 106, 107, 108, subj_end, 109, 110,
+    ] + [2]
+
+    chunks, _ = chunk_sequences(
+        [seq],
+        max_seq_len=12,
+        stride_fraction=0.75,
+        bos_token=1,
+        tokenizer=tokenizer,
+        piece_ids=["piece-a"],
+    )
+
+    assert len(chunks) > 1
+    assert any(subj_start in chunk and subj_end in chunk for chunk in chunks)
+    for chunk in chunks:
+        assert chunk.count(subj_start) == chunk.count(subj_end)

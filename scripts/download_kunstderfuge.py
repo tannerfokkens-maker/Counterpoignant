@@ -18,7 +18,10 @@ environment variables or prompted interactively:
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 import threading
 import urllib.parse
@@ -46,6 +49,7 @@ MIDI_DATA_ROOT = Path("data/midi")
 ALL_DATASET_DIR = MIDI_DATA_ROOT / "all"
 DERIVED_MIDI_SUFFIXES = (".separated.mid", ".reduced.mid", ".deperformed.mid")
 CONVERTED_FROM_SCORE_SUFFIX = ".fromscore.mid"
+CASCADE_FIX_ROUNDS = 3
 
 # Composers relevant to tonal/diatonic training data.
 # (page_path, output_dirname, era)
@@ -1060,6 +1064,7 @@ def deperform_all(
     base_dir: Path,
     grid: int = 16,
     workers: int = 1,
+    include_derived: bool = False,
 ) -> int:
     """De-perform all files marked as needs_deperform.
 
@@ -1069,9 +1074,11 @@ def deperform_all(
     to_process = [
         (k, v) for k, v in triage_results.items()
         if v.get("status") == "needs_deperform"
-        and ".separated." not in k
-        and ".reduced." not in k
         and ".deperformed." not in k
+        and (
+            include_derived
+            or (".separated." not in k and ".reduced." not in k)
+        )
     ]
     if not to_process:
         print("  No files need de-performing.")
@@ -1091,12 +1098,17 @@ def deperform_all(
             src = base_dir / key
             dest = src.with_suffix(".deperformed.mid")
             if dest.exists():
-                processed += 1
+                _ensure_derived_triage_entry(
+                    triage_results=triage_results,
+                    key=key,
+                    suffix=".deperformed.mid",
+                    midi_path=dest,
+                )
                 continue
             ok, _reason, result = _deperform_one_file(key=key, src=src, dest=dest, grid=grid)
             if ok and result is not None:
                 processed += 1
-                new_key = key.replace(".mid", ".deperformed.mid")
+                new_key = _derived_variant_key(key, ".deperformed.mid")
                 triage_results[new_key] = result
                 status_icons = {"clean": "+", "needs_deperform": "~", "needs_voice_sep": "V", "needs_voice_reduce": "R", "bad": "x", "pending": "?"}
                 icon = status_icons.get(result["status"], "?")
@@ -1111,7 +1123,12 @@ def deperform_all(
             src = base_dir / key
             dest = src.with_suffix(".deperformed.mid")
             if dest.exists():
-                processed += 1
+                _ensure_derived_triage_entry(
+                    triage_results=triage_results,
+                    key=key,
+                    suffix=".deperformed.mid",
+                    midi_path=dest,
+                )
                 continue
             fut = pool.submit(_deperform_one_file, key, src, dest, grid)
             futures[fut] = (key, src, dest)
@@ -1125,7 +1142,7 @@ def deperform_all(
                 continue
             if ok and result is not None:
                 processed += 1
-                new_key = key.replace(".mid", ".deperformed.mid")
+                new_key = _derived_variant_key(key, ".deperformed.mid")
                 triage_results[new_key] = result
                 status_icons = {"clean": "+", "needs_deperform": "~", "needs_voice_sep": "V", "needs_voice_reduce": "R", "bad": "x", "pending": "?"}
                 icon = status_icons.get(result["status"], "?")
@@ -1674,6 +1691,7 @@ def voice_separate_all(
     on_cap: str = "raise-cap",
     ignore_pedal: bool = True,
     workers: int = 1,
+    include_derived: bool = False,
 ) -> int:
     """Run local voice separation on all files marked as needs_voice_sep.
 
@@ -1686,8 +1704,10 @@ def voice_separate_all(
         (k, v) for k, v in triage_results.items()
         if v.get("status") == "needs_voice_sep"
         and ".separated." not in k
-        and ".reduced." not in k
-        and ".deperformed." not in k
+        and (
+            include_derived
+            or (".reduced." not in k and ".deperformed." not in k)
+        )
     ]
     if not to_process:
         print("  No files need voice separation.")
@@ -1744,7 +1764,12 @@ def voice_separate_all(
 
             dest = src.with_suffix(".separated.mid")
             if dest.exists():
-                processed += 1
+                _ensure_derived_triage_entry(
+                    triage_results=triage_results,
+                    key=key,
+                    suffix=".separated.mid",
+                    midi_path=dest,
+                )
                 continue
 
             print(f"    Processing: {src.name}...", end=" ", flush=True)
@@ -1775,7 +1800,7 @@ def voice_separate_all(
             if ok:
                 processed += 1
                 result = triage_midi(dest)
-                new_key = key.replace(".mid", ".separated.mid")
+                new_key = _derived_variant_key(key, ".separated.mid")
                 triage_results[new_key] = result
                 if attempt_idx > 1:
                     print(
@@ -1797,7 +1822,12 @@ def voice_separate_all(
 
             dest = src.with_suffix(".separated.mid")
             if dest.exists():
-                processed += 1
+                _ensure_derived_triage_entry(
+                    triage_results=triage_results,
+                    key=key,
+                    suffix=".separated.mid",
+                    midi_path=dest,
+                )
                 continue
 
             fut = pool.submit(_voice_separate_one_file, src, dest, retry_attempts)
@@ -1813,7 +1843,7 @@ def voice_separate_all(
 
             if ok and result is not None:
                 processed += 1
-                new_key = key.replace(".mid", ".separated.mid")
+                new_key = _derived_variant_key(key, ".separated.mid")
                 triage_results[new_key] = result
                 extra = ""
                 if attempt_idx > 1:
@@ -2036,6 +2066,7 @@ def reduce_voices_all(
     base_dir: Path,
     max_voices: int = 4,
     workers: int = 1,
+    include_derived: bool = False,
 ) -> int:
     """Reduce all files with >max_voices to max_voices.
 
@@ -2047,7 +2078,9 @@ def reduce_voices_all(
     """
     to_process = []
     for k, v in triage_results.items():
-        if ".separated." in k or ".reduced." in k or ".deperformed." in k:
+        if ".reduced." in k:
+            continue
+        if not include_derived and (".separated." in k or ".deperformed." in k):
             continue
         if v.get("status") == "needs_voice_reduce":
             to_process.append((k, v))
@@ -2072,7 +2105,12 @@ def reduce_voices_all(
 
             dest = src.with_suffix(".reduced.mid")
             if dest.exists():
-                processed += 1
+                _ensure_derived_triage_entry(
+                    triage_results=triage_results,
+                    key=key,
+                    suffix=".reduced.mid",
+                    midi_path=dest,
+                )
                 continue
 
             original_tracks = info.get("tracks_with_notes", info.get("num_tracks", "?"))
@@ -2081,7 +2119,7 @@ def reduce_voices_all(
             ok, result = _reduce_one_file(src=src, dest=dest, max_voices=max_voices)
             if ok and result is not None:
                 processed += 1
-                new_key = key.replace(".mid", ".reduced.mid")
+                new_key = _derived_variant_key(key, ".reduced.mid")
                 triage_results[new_key] = result
                 status_icons = {"clean": "+", "needs_deperform": "~", "needs_voice_sep": "V",
                                 "needs_voice_reduce": "R", "bad": "x", "pending": "?"}
@@ -2099,7 +2137,12 @@ def reduce_voices_all(
                 continue
             dest = src.with_suffix(".reduced.mid")
             if dest.exists():
-                processed += 1
+                _ensure_derived_triage_entry(
+                    triage_results=triage_results,
+                    key=key,
+                    suffix=".reduced.mid",
+                    midi_path=dest,
+                )
                 continue
             fut = pool.submit(_reduce_one_file, src, dest, max_voices)
             futures[fut] = (key, src, dest, info)
@@ -2114,7 +2157,7 @@ def reduce_voices_all(
 
             if ok and result is not None:
                 processed += 1
-                new_key = key.replace(".mid", ".reduced.mid")
+                new_key = _derived_variant_key(key, ".reduced.mid")
                 triage_results[new_key] = result
                 print(f"    {src.name}: → {result['num_tracks']} tracks, {result['status']}")
             else:
@@ -2785,6 +2828,15 @@ SUPPORTED_LOCAL_EXTENSIONS = {
     ".mscz",
 }
 
+MUSESCORE_CLI_CANDIDATES = (
+    "/Applications/MuseScore 4.app/Contents/MacOS/mscore",
+    "/Applications/MuseScore.app/Contents/MacOS/mscore",
+    "mscore4",
+    "mscore",
+)
+_MUSESCORE_BIN_CACHE: str | None = None
+_MUSESCORE_BIN_PROBED = False
+
 
 def _is_derived_key(key: str) -> bool:
     return any(marker in key for marker in (".deperformed.", ".separated.", ".reduced."))
@@ -2806,6 +2858,60 @@ def _derived_variant_key(key: str, suffix: str) -> str:
     return key + suffix
 
 
+def _ensure_derived_triage_entry(
+    triage_results: dict,
+    key: str,
+    suffix: str,
+    midi_path: Path,
+) -> dict | None:
+    """Ensure triage metadata exists for a derived MIDI variant on disk."""
+    variant_key = _derived_variant_key(key, suffix)
+    return _ensure_midi_key_triage_entry(triage_results, variant_key, midi_path)
+
+
+def _ensure_midi_key_triage_entry(
+    triage_results: dict,
+    midi_key: str,
+    midi_path: Path,
+) -> dict | None:
+    """Ensure triage metadata exists for an arbitrary MIDI key on disk."""
+    variant_info = triage_results.get(midi_key)
+    if not isinstance(variant_info, dict) or variant_info.get("status") == "pending":
+        variant_info = triage_midi(midi_path)
+        triage_results[midi_key] = variant_info
+    if isinstance(variant_info, dict):
+        return variant_info
+    return None
+
+
+def _derived_ops_for_original_key(original_key: str, candidate_key: str) -> list[str] | None:
+    """Return derived operation chain if candidate is a variant of original."""
+    original_lower = original_key.lower()
+    if original_lower.endswith(".mid"):
+        base = original_key[:-4]
+    elif original_lower.endswith(".midi"):
+        base = original_key[:-5]
+    else:
+        return None
+
+    if not candidate_key.startswith(base + "."):
+        return None
+
+    suffix = candidate_key[len(base):]  # e.g. ".separated.reduced.mid"
+    parts = [p.lower() for p in suffix.split(".") if p]
+    if len(parts) < 2:
+        return None
+
+    if parts[-1] not in {"mid", "midi"}:
+        return None
+
+    ops = parts[:-1]
+    valid_ops = {"deperformed", "reduced", "separated"}
+    if not ops or any(op not in valid_ops for op in ops):
+        return None
+    return ops
+
+
 def _dataset_report_file(dataset_dir: Path) -> Path:
     return dataset_dir / "_triage_report.json"
 
@@ -2822,6 +2928,10 @@ def _iter_dataset_source_files(base_dir: Path) -> list[Path]:
         suffix = f.suffix.lower()
         if suffix not in SUPPORTED_LOCAL_EXTENSIONS:
             continue
+        if suffix in {".mscx", ".mscz"}:
+            stem = f.with_suffix("")
+            if any(stem.with_suffix(ext).exists() for ext in (".musicxml", ".xml", ".mxl")):
+                continue
         if suffix in {".mid", ".midi"} and _is_derived_midi_name(f.name):
             continue
         files.append(f)
@@ -2832,8 +2942,85 @@ def _converted_midi_path(src: Path) -> Path:
     return src.with_name(f"{src.name}{CONVERTED_FROM_SCORE_SUFFIX}")
 
 
+def _find_musescore_binary() -> str | None:
+    """Find a MuseScore CLI binary for converting .mscx/.mscz files."""
+    global _MUSESCORE_BIN_CACHE
+    global _MUSESCORE_BIN_PROBED
+
+    if _MUSESCORE_BIN_PROBED:
+        return _MUSESCORE_BIN_CACHE
+
+    candidates: list[str] = []
+    env_mscore = os.environ.get("MSCORE", "").strip()
+    if env_mscore:
+        candidates.append(env_mscore)
+    candidates.extend(MUSESCORE_CLI_CANDIDATES)
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+
+        resolved = shutil.which(candidate)
+        if resolved:
+            _MUSESCORE_BIN_CACHE = resolved
+            _MUSESCORE_BIN_PROBED = True
+            return _MUSESCORE_BIN_CACHE
+
+        candidate_path = Path(candidate)
+        if candidate_path.is_file() and os.access(candidate_path, os.X_OK):
+            _MUSESCORE_BIN_CACHE = str(candidate_path)
+            _MUSESCORE_BIN_PROBED = True
+            return _MUSESCORE_BIN_CACHE
+
+    _MUSESCORE_BIN_CACHE = None
+    _MUSESCORE_BIN_PROBED = True
+    return None
+
+
+def _convert_musescore_to_midi(src: Path, dest: Path, timeout: int = 180) -> tuple[bool, str | None]:
+    """Convert MuseScore source files using the MuseScore CLI."""
+    mscore_bin = _find_musescore_binary()
+    if not mscore_bin:
+        return (
+            False,
+            "MuseScore CLI not found (set MSCORE or install MuseScore with mscore binary)",
+        )
+
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="openscore_mscore_") as tmp_dir:
+            tmp_input = Path(tmp_dir) / f"input{src.suffix.lower()}"
+            shutil.copy2(src, tmp_input)
+            proc = subprocess.run(
+                [mscore_bin, "-o", str(dest), str(tmp_input)],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+        if proc.returncode != 0:
+            stderr = (proc.stderr or proc.stdout or "").strip()
+            if stderr:
+                stderr = re.sub(r"\s+", " ", stderr)
+                return False, f"MuseScore conversion failed (exit {proc.returncode}): {stderr[:240]}"
+            return False, f"MuseScore conversion failed (exit {proc.returncode})"
+        if not dest.exists() or dest.stat().st_size == 0:
+            dest.unlink(missing_ok=True)
+            return False, "MuseScore conversion produced empty MIDI output"
+        return True, None
+    except subprocess.TimeoutExpired:
+        dest.unlink(missing_ok=True)
+        return False, f"MuseScore conversion timed out after {timeout}s"
+    except Exception as e:
+        dest.unlink(missing_ok=True)
+        return False, str(e)
+
+
 def _convert_score_to_midi(src: Path, dest: Path, timeout: int = 90) -> tuple[bool, str | None]:
     """Convert non-MIDI score files into MIDI so fix passes can run uniformly."""
+    if src.suffix.lower() in {".mscx", ".mscz"}:
+        return _convert_musescore_to_midi(src, dest, timeout=max(180, timeout))
+
     try:
         score = _parse_with_timeout(src, timeout=timeout)
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -2988,30 +3175,48 @@ def _best_clean_candidate(
     triage_results: dict,
     base_dir: Path,
 ) -> tuple[Path, str] | None:
-    """Pick the best clean file variant for a given original triage key."""
+    """Pick a clean variant for a given original triage key.
+
+    Policy:
+      1) If the original is already clean, keep the original.
+      2) Otherwise, fall back to the best clean repaired variant.
+    """
     if info.get("is_internal_dup") or info.get("is_trusted_dup"):
         return None
 
-    candidates: list[tuple[Path, str]] = []
-    variants = [
-        (".reduced.mid", "reduced"),
-        (".deperformed.mid", "deperformed"),
-        (".separated.mid", "separated"),
-    ]
-    for suffix, label in variants:
-        variant_key = _derived_variant_key(key, suffix)
-        variant_info = triage_results.get(variant_key)
-        if not isinstance(variant_info, dict):
-            continue
-        if variant_info.get("status") != "clean":
-            continue
-        variant_path = base_dir / variant_key
-        if variant_path.exists():
-            candidates.append((variant_path, label))
-
     src = base_dir / key
     if info.get("status") == "clean" and src.exists():
-        candidates.append((src, "original"))
+        return (src, "original")
+
+    candidates: list[tuple[Path, str]] = []
+    for variant_key, _variant_info in triage_results.items():
+        if not isinstance(_variant_info, dict):
+            continue
+        if not _is_derived_key(variant_key):
+            continue
+        ops = _derived_ops_for_original_key(key, variant_key)
+        if ops is None:
+            continue
+
+        variant_path = base_dir / variant_key
+        if not variant_path.exists():
+            continue
+
+        variant_info = _ensure_midi_key_triage_entry(
+            triage_results=triage_results,
+            midi_key=variant_key,
+            midi_path=variant_path,
+        )
+        if not isinstance(variant_info, dict) or variant_info.get("status") != "clean":
+            continue
+
+        if "reduced" in ops:
+            label = "reduced"
+        elif "deperformed" in ops:
+            label = "deperformed"
+        else:
+            label = "separated"
+        candidates.append((variant_path, label))
 
     if not candidates:
         return None
@@ -3148,44 +3353,16 @@ def collect_training_data(
             skipped_dup += 1
             continue
 
-        src = base_dir / key
-
-        # Find best available version (prefer processed over original)
-        candidates = []
-
-        # Check for reduced version
-        reduced_key = key.replace(".mid", ".reduced.mid")
-        if reduced_key in triage_results:
-            reduced_info = triage_results[reduced_key]
-            if reduced_info.get("status") == "clean":
-                candidates.append((base_dir / reduced_key, "reduced"))
-
-        # Check for deperformed version
-        deperformed_key = key.replace(".mid", ".deperformed.mid")
-        if deperformed_key in triage_results:
-            dep_info = triage_results[deperformed_key]
-            if dep_info.get("status") == "clean":
-                candidates.append((base_dir / deperformed_key, "deperformed"))
-
-        # Check for separated version
-        separated_key = key.replace(".mid", ".separated.mid")
-        if separated_key in triage_results:
-            sep_info = triage_results[separated_key]
-            if sep_info.get("status") == "clean":
-                candidates.append((base_dir / separated_key, "separated"))
-
-        # Original itself
-        if info.get("status") == "clean":
-            candidates.append((src, "original"))
-
-        if not candidates:
+        selected = _best_clean_candidate(
+            key=key,
+            info=info,
+            triage_results=triage_results,
+            base_dir=base_dir,
+        )
+        if selected is None:
             skipped_bad += 1
             continue
-
-        # Priority: reduced > deperformed > separated > original
-        priority = {"reduced": 0, "deperformed": 1, "separated": 2, "original": 3}
-        candidates.sort(key=lambda c: priority.get(c[1], 99))
-        best_path, best_type = candidates[0]
+        best_path, _best_type = selected
 
         if not best_path.exists():
             skipped_bad += 1
@@ -3296,51 +3473,74 @@ def run_fix_pipeline_for_dataset(
     stats["triaged"] = triage_stats["triaged"]
     stats["converted"] = triage_stats["converted"]
 
-    if do_deperform:
-        print()
-        print("=" * 60)
-        print("  DE-PERFORMING")
-        print("=" * 60)
-        n_fixed = deperform_all(
-            triage_results,
-            dataset_dir,
-            grid=deperform_grid,
-            workers=process_workers,
-        )
-        stats["deperformed"] = n_fixed
-        print(f"  Processed {n_fixed} files")
+    if do_deperform or do_voice_sep or do_voice_reduce:
+        max_rounds = CASCADE_FIX_ROUNDS
+        for round_idx in range(1, max_rounds + 1):
+            include_derived = round_idx > 1
+            if round_idx == 1:
+                print()
+                print("=" * 60)
+                print("  FIX PASSES (round 1)")
+                print("=" * 60)
+            else:
+                print()
+                print("=" * 60)
+                print(f"  FIX PASSES (cascade round {round_idx}/{max_rounds})")
+                print("=" * 60)
 
-    if do_voice_sep:
-        print()
-        print("=" * 60)
-        print("  VOICE SEPARATION (local)")
-        print("=" * 60)
-        n_sep = voice_separate_all(
-            triage_results,
-            dataset_dir,
-            max_voices=voice_sep_max_voices,
-            mode=voice_sep_mode,
-            jitter_ratio=voice_sep_jitter_ratio,
-            on_cap=voice_sep_on_cap,
-            ignore_pedal=voice_sep_ignore_pedal,
-            workers=process_workers,
-        )
-        stats["separated"] = n_sep
-        print(f"  Successfully separated {n_sep} files")
+            round_total = 0
 
-    if do_voice_reduce:
-        print()
-        print("=" * 60)
-        print(f"  VOICE REDUCTION (→ {voice_reduce_max} voices)")
-        print("=" * 60)
-        n_reduced = reduce_voices_all(
-            triage_results,
-            dataset_dir,
-            max_voices=voice_reduce_max,
-            workers=process_workers,
-        )
-        stats["reduced"] = n_reduced
-        print(f"  Reduced {n_reduced} files")
+            # Order matters for cascading: separate -> reduce -> deperform.
+            if do_voice_sep:
+                n_sep = voice_separate_all(
+                    triage_results,
+                    dataset_dir,
+                    max_voices=voice_sep_max_voices,
+                    mode=voice_sep_mode,
+                    jitter_ratio=voice_sep_jitter_ratio,
+                    on_cap=voice_sep_on_cap,
+                    ignore_pedal=voice_sep_ignore_pedal,
+                    workers=process_workers,
+                    include_derived=include_derived,
+                )
+                stats["separated"] += n_sep
+                round_total += n_sep
+                print(f"  Round {round_idx}: separated {n_sep}")
+
+            if do_voice_reduce:
+                n_reduced = reduce_voices_all(
+                    triage_results,
+                    dataset_dir,
+                    max_voices=voice_reduce_max,
+                    workers=process_workers,
+                    include_derived=include_derived,
+                )
+                stats["reduced"] += n_reduced
+                round_total += n_reduced
+                print(f"  Round {round_idx}: reduced {n_reduced}")
+
+            if do_deperform:
+                n_fixed = deperform_all(
+                    triage_results,
+                    dataset_dir,
+                    grid=deperform_grid,
+                    workers=process_workers,
+                    include_derived=include_derived,
+                )
+                stats["deperformed"] += n_fixed
+                round_total += n_fixed
+                print(f"  Round {round_idx}: deperformed {n_fixed}")
+
+            unresolved = sum(
+                1
+                for v in triage_results.values()
+                if isinstance(v, dict)
+                and v.get("status") in {"needs_deperform", "needs_voice_sep", "needs_voice_reduce"}
+            )
+            print(f"  Round {round_idx}: unresolved fixable={unresolved}")
+
+            if round_total == 0:
+                break
 
     if do_collect:
         print()
@@ -3565,6 +3765,11 @@ def main():
                 data_root=MIDI_DATA_ROOT,
                 output_dir=ALL_DATASET_DIR,
             )
+            # Persist any triage entries rehydrated during fold (e.g. existing
+            # derived files that were missing from _triage_report.json).
+            for dataset_name, triage_results in dataset_reports.items():
+                dataset_report_file = _dataset_report_file(MIDI_DATA_ROOT / dataset_name)
+                dataset_report_file.write_text(json.dumps(triage_results, indent=2))
 
         print()
         print("=" * 60)
