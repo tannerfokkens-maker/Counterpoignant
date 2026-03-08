@@ -422,7 +422,24 @@ class Trainer:
                     num_workers=0,
                 )
 
-            # Per-stage cosine annealing from current LR
+            # Restart each stage from the phase base LR rather than inheriting
+            # the previous stage's annealed floor. Without this, later stages
+            # can end up training entirely at eta_min.
+            stage_base_lr = float(
+                self.optimizer.defaults.get("lr", self.optimizer.param_groups[0]["lr"])
+            )
+            current_lr = float(self.optimizer.param_groups[0]["lr"])
+            if len(stages) > 1 and not math.isclose(current_lr, stage_base_lr, rel_tol=1e-9):
+                logger.info(
+                    "%sRestarting stage LR: %.6f -> %.6f",
+                    phase_tag,
+                    current_lr,
+                    stage_base_lr,
+                )
+            for param_group in self.optimizer.param_groups:
+                param_group["lr"] = stage_base_lr
+
+            # Per-stage cosine annealing from the reset stage LR
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 self.optimizer, T_max=stage_epochs, eta_min=1e-6,
             )

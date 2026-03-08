@@ -460,6 +460,17 @@ class TestStagedTraining:
         )
         assert trainer.model.config.max_seq_len == 128
 
+    def test_stage_scheduler_restarts_from_phase_base_lr(self, tmp_path):
+        trainer = self._make_staged_trainer(tmp_path)
+        stages = [(32, 1), (64, 1)]
+        history = trainer.train(
+            log_interval=1, val_interval=999,
+            seq_len_stages=stages,
+        )
+
+        assert history["lr"][0] == pytest.approx(1e-4)
+        assert history["lr"][1] == pytest.approx(1e-4)
+
 
 # ===========================================================================
 # 10. CLI --seq-len-stages option
