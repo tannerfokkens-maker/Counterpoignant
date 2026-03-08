@@ -1146,6 +1146,20 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
 @click.option("--piece-balance", type=click.Choice(["none", "sqrt", "inverse"]),
               default="sqrt",
               help="Down-weight heavily-chunked pieces via WeightedRandomSampler (default: sqrt)")
+@click.option("--num-recurrent-steps", default=1, type=int,
+              help="LoopLM: number of times to loop through the layer stack (1 = standard transformer, default: 1)")
+@click.option("--looplm-sandwich-norm", is_flag=True, default=False,
+              help="LoopLM: enable sandwich normalization (RMSNorm after each sublayer) for recurrence stability")
+@click.option("--looplm-exit-gate", is_flag=True, default=False,
+              help="LoopLM: enable learned adaptive exit gate for variable-depth computation")
+@click.option("--looplm-kl-beta", default=0.1, type=float,
+              help="LoopLM: entropy regularization coefficient for exit gate (default: 0.1)")
+@click.option("--looplm-exit-threshold", default=0.5, type=float,
+              help="LoopLM: inference CDF threshold for early exit (default: 0.5)")
+@click.option("--looplm-gate-epochs", default=0, type=int,
+              help="LoopLM: Stage II gate-only training epochs after main training (0 = skip, default: 0)")
+@click.option("--looplm-gate-lr", default=1e-3, type=float,
+              help="LoopLM: learning rate for Stage II gate training (default: 1e-3)")
 def train(epochs: int, lr: float, batch_size: int, seq_len: int | None,
           seq_len_stages: str | None, mode: str | None,
           accumulation_steps: int, resume: str | None, data_dir: str | None,
@@ -1163,7 +1177,14 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None,
           fp16: bool, embed_dim: int, num_heads: int, num_layers: int,
           pos_encoding: str, num_kv_heads: int | None,
           rel_attn_bias: bool, rel_attn_max_distance: int,
-          piece_balance: str) -> None:
+          piece_balance: str,
+          num_recurrent_steps: int,
+          looplm_sandwich_norm: bool,
+          looplm_exit_gate: bool,
+          looplm_kl_beta: float,
+          looplm_exit_threshold: float,
+          looplm_gate_epochs: int,
+          looplm_gate_lr: float) -> None:
     """Train the Bach Transformer model."""
     import torch
     from bach_gen.data.dataset import BachDataset, create_dataset
@@ -1316,6 +1337,11 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None,
         num_kv_heads=num_kv_heads,
         rel_attn_bias=rel_attn_bias,
         rel_attn_max_distance=rel_attn_max_distance,
+        num_recurrent_steps=num_recurrent_steps,
+        looplm_sandwich_norm=looplm_sandwich_norm,
+        looplm_exit_gate=looplm_exit_gate,
+        looplm_kl_beta=looplm_kl_beta,
+        looplm_exit_threshold=looplm_exit_threshold,
     )
 
     model = BachTransformer(config)
@@ -1334,6 +1360,15 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None,
             "  Relative attention: "
             f"paper-style, max_distance={config.rel_attn_max_distance}"
         )
+    if config.num_recurrent_steps > 1:
+        loop_desc = (
+            f"  LoopLM: T={config.num_recurrent_steps} "
+            f"(effective depth {config.num_layers * config.num_recurrent_steps}), "
+            f"sandwich_norm={config.looplm_sandwich_norm}"
+        )
+        if config.looplm_exit_gate:
+            loop_desc += f", exit_gate(beta={config.looplm_kl_beta}, threshold={config.looplm_exit_threshold})"
+        console.print(loop_desc)
 
     # Train
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
@@ -1675,6 +1710,19 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None,
         console.print(f"  DroPE epochs ran: {drope_history.get('epochs_ran', drope_epochs)}")
         console.print(f"  DroPE stop reason: {drope_history.get('stop_reason', 'unknown')}")
         console.print(f"  Model marked as drope_trained=True")
+
+    if looplm_gate_epochs > 0:
+        console.print(
+            f"\n[bold]LoopLM Stage II: Gate-only training for {looplm_gate_epochs} epochs...[/bold]"
+        )
+        console.print(f"  Gate LR: {looplm_gate_lr}")
+        gate_history = trainer.train_exit_gate(
+            epochs=looplm_gate_epochs,
+            lr=looplm_gate_lr,
+        )
+        if gate_history.get("train_loss"):
+            console.print(f"  Gate final loss: {gate_history['train_loss'][-1]:.4f}")
+        console.print(f"  Gate epochs ran: {gate_history.get('epochs_ran', 0)}")
 
     console.print(f"\n[green]Training complete![/green]")
     console.print(f"  Final train loss: {history['train_loss'][-1]:.4f}")

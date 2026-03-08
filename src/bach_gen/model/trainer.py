@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from bach_gen.model.config import ModelConfig
-from bach_gen.model.architecture import BachTransformer
+from bach_gen.model.architecture import BachTransformer, LoopLMOutput, compute_exit_distribution
 from bach_gen.data.dataset import BachDataset
 from bach_gen.utils.constants import (
     DEFAULT_BATCH_SIZE,
@@ -207,6 +207,37 @@ class Trainer:
 
         return state_dict, updated
 
+    @staticmethod
+    def _reconcile_looplm_state_dict(
+        state_dict: dict[str, torch.Tensor],
+        target_state_dict: dict[str, torch.Tensor],
+    ) -> tuple[dict[str, torch.Tensor], bool]:
+        """Add/drop LoopLM-specific params so checkpoints load across configs.
+
+        Handles: exit_gate.{weight,bias}, layers.*.ln{1,2}_post.weight
+        (sandwich norm).  Missing keys are initialized from the freshly-
+        constructed model; extra keys are dropped.
+        """
+        updated = False
+        looplm_suffixes = (
+            "exit_gate.weight", "exit_gate.bias",
+            ".ln1_post.weight", ".ln2_post.weight",
+        )
+
+        # Drop keys present in checkpoint but absent in target model
+        for key in list(state_dict.keys()):
+            if any(key.endswith(s) for s in looplm_suffixes) and key not in target_state_dict:
+                state_dict.pop(key)
+                updated = True
+
+        # Add keys present in target model but absent in checkpoint
+        for key, value in target_state_dict.items():
+            if any(key.endswith(s) for s in looplm_suffixes) and key not in state_dict:
+                state_dict[key] = value.detach().clone()
+                updated = True
+
+        return state_dict, updated
+
     def save_checkpoint(self, filename: str) -> None:
         """Public checkpoint save helper for phase transitions."""
         self._save_checkpoint(filename)
@@ -227,6 +258,10 @@ class Trainer:
             state,
             self.model.state_dict(),
         )
+        state, reconciled_looplm = self._reconcile_looplm_state_dict(
+            state,
+            self.model.state_dict(),
+        )
         self.model.load_state_dict(state, strict=True)
         if resized_vocab:
             logger.info(
@@ -235,7 +270,9 @@ class Trainer:
             )
         if reconciled_optional:
             logger.info("Checkpoint optional relative-attention weights reconciled.")
-        if not (resized_vocab or reconciled_optional):
+        if reconciled_looplm:
+            logger.info("Checkpoint LoopLM weights reconciled (exit gate / sandwich norm).")
+        if not (resized_vocab or reconciled_optional or reconciled_looplm):
             try:
                 self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             except Exception as e:
@@ -412,6 +449,19 @@ class Trainer:
             # Transition context length
             self.transition_seq_len(stage_seq_len)
 
+            # Reset the stage-local best metric. Loss scales are not directly
+            # comparable across context lengths, so later stages must early-stop
+            # against their own validation baseline instead of a previous stage's.
+            if len(stages) > 1:
+                previous_best_val = self.best_val_loss
+                self.best_val_loss = float("inf")
+                if previous_best_val != float("inf"):
+                    logger.info(
+                        "%sResetting stage best val: %.4f -> inf",
+                        phase_tag,
+                        previous_best_val,
+                    )
+
             train_loader = self._make_train_loader()
             val_loader = None
             if self.val_dataset and len(self.val_dataset) > 0:
@@ -535,12 +585,85 @@ class Trainer:
 
         return history
 
+    @property
+    def _use_looplm_loss(self) -> bool:
+        """Whether to use multi-step LoopLM loss computation."""
+        return self.model.config.num_recurrent_steps > 1
+
+    def _compute_looplm_loss(
+        self,
+        output: LoopLMOutput,
+        labels: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute LoopLM training loss: expected CE weighted by exit distribution.
+
+        Args:
+            output: LoopLMOutput with per-step logits and optional exit lambdas.
+            labels: (batch, seq_len) ground-truth token IDs.
+
+        Returns:
+            (total_loss, final_logits) — total_loss includes entropy
+            regularization when the exit gate is active.
+        """
+        T = len(output.all_logits)
+        losses_stack, valid, n_valid = self._compute_looplm_per_step_losses(output, labels)
+
+        if output.exit_lambdas:
+            # Weighted by learned exit distribution
+            B, S = labels.shape
+            exit_dist = compute_exit_distribution(output.exit_lambdas)  # (T, B, S)
+            exit_flat = exit_dist.reshape(T, B * S)  # (T, B*S)
+
+            # Expected loss per token
+            expected = (exit_flat * losses_stack).sum(dim=0)  # (B*S,)
+            expected_loss = (expected * valid).sum() / n_valid
+
+            # Entropy regularization (encourage exploration across depths)
+            log_exit = torch.log(exit_flat + 1e-8)
+            entropy_per_token = -(exit_flat * log_exit).sum(dim=0)  # (B*S,)
+            entropy = (entropy_per_token * valid).sum() / n_valid
+
+            beta = self.model.config.looplm_kl_beta
+            total_loss = expected_loss - beta * entropy
+        else:
+            # Uniform weighting across steps (no exit gate)
+            mean_per_step = losses_stack.mean(dim=0)  # average across steps
+            total_loss = (mean_per_step * valid).sum() / n_valid
+
+        return total_loss, output.logits
+
+    def _compute_looplm_per_step_losses(
+        self,
+        output: LoopLMOutput,
+        labels: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return per-step token losses plus the valid-token mask."""
+        vocab_size = output.logits.size(-1)
+        flat_labels = labels.reshape(-1)
+        valid = (flat_labels != self.criterion.ignore_index).float()
+        n_valid = valid.sum().clamp(min=1)
+
+        per_step_losses = []
+        for step_logits in output.all_logits:
+            ce = F.cross_entropy(
+                step_logits.reshape(-1, vocab_size),
+                flat_labels,
+                ignore_index=self.criterion.ignore_index,
+                label_smoothing=self.criterion.label_smoothing,
+                reduction="none",
+            )
+            per_step_losses.append(ce)
+
+        losses_stack = torch.stack(per_step_losses, dim=0)  # (T, B*S)
+        return losses_stack, valid, n_valid
+
     def _train_epoch(self, loader: DataLoader, use_rope: bool = True) -> tuple[float, dict[str, float | None]]:
         """Train for one epoch."""
         self.model.train()
         total_loss = 0.0
         n_batches = 0
         category_sums, category_counts = self._init_category_accumulators()
+        use_looplm = self._use_looplm_loss
 
         self.optimizer.zero_grad()
 
@@ -552,12 +675,18 @@ class Trainer:
             attention_mask = (input_ids != 0).long()
 
             with torch.amp.autocast(self.device.type, enabled=self.fp16):
-                logits = self.model(input_ids, attention_mask=attention_mask, use_rope=use_rope)
-
-                loss = self.criterion(
-                    logits.reshape(-1, logits.size(-1)),
-                    labels.reshape(-1),
-                )
+                if use_looplm:
+                    output = self.model(
+                        input_ids, attention_mask=attention_mask,
+                        use_rope=use_rope, return_all_steps=True,
+                    )
+                    loss, logits = self._compute_looplm_loss(output, labels)
+                else:
+                    logits = self.model(input_ids, attention_mask=attention_mask, use_rope=use_rope)
+                    loss = self.criterion(
+                        logits.reshape(-1, logits.size(-1)),
+                        labels.reshape(-1),
+                    )
 
             self._accumulate_category_losses(logits, labels, category_sums, category_counts)
 
@@ -587,6 +716,7 @@ class Trainer:
         total_loss = 0.0
         n_batches = 0
         category_sums, category_counts = self._init_category_accumulators()
+        use_looplm = self._use_looplm_loss
 
         for batch in loader:
             input_ids = batch["input_ids"].to(self.device)
@@ -594,12 +724,18 @@ class Trainer:
             attention_mask = (input_ids != 0).long()
 
             with torch.amp.autocast(self.device.type, enabled=self.fp16):
-                logits = self.model(input_ids, attention_mask=attention_mask, use_rope=use_rope)
-
-                loss = self.criterion(
-                    logits.reshape(-1, logits.size(-1)),
-                    labels.reshape(-1),
-                )
+                if use_looplm:
+                    output = self.model(
+                        input_ids, attention_mask=attention_mask,
+                        use_rope=use_rope, return_all_steps=True,
+                    )
+                    loss, logits = self._compute_looplm_loss(output, labels)
+                else:
+                    logits = self.model(input_ids, attention_mask=attention_mask, use_rope=use_rope)
+                    loss = self.criterion(
+                        logits.reshape(-1, logits.size(-1)),
+                        labels.reshape(-1),
+                    )
 
             self._accumulate_category_losses(logits, labels, category_sums, category_counts)
 
@@ -774,6 +910,126 @@ class Trainer:
         )
         return history
 
+    def train_exit_gate(
+        self,
+        epochs: int,
+        lr: float = 1e-3,
+        use_rope: bool | None = None,
+    ) -> dict:
+        """Stage II gate training: freeze model, train only exit gate.
+
+        Per Ouro paper Section 4.2: after Stage I joint training, the LM
+        weights are frozen and the exit gate is further optimized to learn
+        when additional recurrent steps no longer improve the loss.  The
+        gate is trained to predict loss improvement across steps.
+
+        Args:
+            epochs: Number of Stage II training epochs.
+            lr: Learning rate for the gate optimizer.
+            use_rope: Whether to use positional embeddings.
+
+        Returns:
+            Dict with training history.
+        """
+        if self.model.exit_gate is None:
+            logger.warning("No exit gate to train (exit_gate is None). Skipping Stage II.")
+            return {"train_loss": [], "epochs_ran": 0}
+
+        if use_rope is None:
+            use_rope = not getattr(self.model.config, "drope_trained", False)
+
+        # Freeze everything except the exit gate
+        requires_grad_state = {
+            name: param.requires_grad for name, param in self.model.named_parameters()
+        }
+        for name, param in self.model.named_parameters():
+            param.requires_grad = "exit_gate" in name
+
+        prev_optimizer = self.optimizer
+        gate_optimizer = torch.optim.AdamW(
+            self.model.exit_gate.parameters(),
+            lr=lr,
+            weight_decay=0.0,
+        )
+        self.optimizer = gate_optimizer
+
+        train_loader = self._make_train_loader()
+        history: dict = {"train_loss": [], "lr": []}
+
+        logger.info(
+            f"[GATE-II] Stage II gate training: {epochs} epochs, lr={lr}, "
+            f"gate params={sum(p.numel() for p in self.model.exit_gate.parameters())}"
+        )
+
+        start_epoch = self.epoch
+
+        try:
+            for epoch in range(1, epochs + 1):
+                self.epoch = start_epoch + epoch
+                self.model.eval()
+                total_loss = 0.0
+                n_batches = 0
+
+                for batch in train_loader:
+                    input_ids = batch["input_ids"].to(self.device)
+                    labels = batch["labels"].to(self.device)
+                    attention_mask = (input_ids != 0).long()
+
+                    with torch.amp.autocast(self.device.type, enabled=self.fp16):
+                        output = self.model(
+                            input_ids, attention_mask=attention_mask,
+                            use_rope=use_rope, return_all_steps=True,
+                        )
+
+                        losses_stack, valid, n_valid = self._compute_looplm_per_step_losses(
+                            output, labels,
+                        )
+                        if not output.exit_lambdas:
+                            loss = losses_stack.new_zeros(())
+                        else:
+                            gate_losses = []
+                            for step_idx, lam in enumerate(output.exit_lambdas):
+                                curr_loss = losses_stack[step_idx]
+                                next_loss = losses_stack[step_idx + 1]
+                                exit_target = (next_loss >= curr_loss).to(lam.dtype)
+                                bce = F.binary_cross_entropy(
+                                    lam.reshape(-1),
+                                    exit_target,
+                                    reduction="none",
+                                )
+                                gate_losses.append(bce)
+
+                            gate_stack = torch.stack(gate_losses, dim=0)  # (T-1, B*S)
+                            loss = (gate_stack * valid.unsqueeze(0)).sum() / (
+                                n_valid * gate_stack.size(0)
+                            )
+
+                    gate_optimizer.zero_grad()
+                    self.scaler.scale(loss).backward()
+                    self.scaler.unscale_(gate_optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.exit_gate.parameters(), 1.0)
+                    self.scaler.step(gate_optimizer)
+                    self.scaler.update()
+
+                    total_loss += loss.item()
+                    n_batches += 1
+
+                avg_loss = total_loss / max(n_batches, 1)
+                history["train_loss"].append(avg_loss)
+                history["lr"].append(lr)
+                logger.info(f"[GATE-II] Epoch {epoch}/{epochs} | loss={avg_loss:.4f}")
+
+                self._save_checkpoint("gate_latest.pt")
+
+            self._save_checkpoint("gate_final.pt")
+            history["epochs_ran"] = len(history["train_loss"])
+            logger.info(f"[GATE-II] Stage II complete ({history['epochs_ran']} epochs)")
+            return history
+        finally:
+            self.optimizer = prev_optimizer
+            for name, param in self.model.named_parameters():
+                param.requires_grad = requires_grad_state[name]
+
     def _init_category_accumulators(self):
         if self._token_category_map is None or not self.token_category_names:
             return None, None
@@ -884,6 +1140,17 @@ class Trainer:
             config.rel_attn_bias = False
         if not hasattr(config, "rel_attn_max_distance"):
             config.rel_attn_max_distance = 2048
+        # Backward compat: old checkpoints lack LoopLM fields
+        if not hasattr(config, "num_recurrent_steps"):
+            config.num_recurrent_steps = 1
+        if not hasattr(config, "looplm_sandwich_norm"):
+            config.looplm_sandwich_norm = False
+        if not hasattr(config, "looplm_exit_gate"):
+            config.looplm_exit_gate = False
+        if not hasattr(config, "looplm_kl_beta"):
+            config.looplm_kl_beta = 0.1
+        if not hasattr(config, "looplm_exit_threshold"):
+            config.looplm_exit_threshold = 0.5
 
         # Override max_seq_len for context-length extension.  Positional
         # embedding caches are registered as non-persistent buffers so they
@@ -937,6 +1204,13 @@ class Trainer:
         )
         if reconciled_optional:
             logger.info("Reconciled optional relative-attention weights during checkpoint load.")
+
+        state, reconciled_looplm = Trainer._reconcile_looplm_state_dict(
+            state,
+            model.state_dict(),
+        )
+        if reconciled_looplm:
+            logger.info("Reconciled LoopLM weights (exit gate / sandwich norm) during checkpoint load.")
 
         model.load_state_dict(state)
         model = model.to(device)

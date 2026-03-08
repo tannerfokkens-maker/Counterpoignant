@@ -1,12 +1,13 @@
-"""Decoder-only Transformer for Bach invention generation (~6M params).
+"""Decoder-only Transformer for Bach invention generation.
 
-Architecture: RoPE + RMSNorm + SwiGLU + pre-norm + weight tying (mini-LLaMA).
+Architecture: RoPE/PoPE + RMSNorm + SwiGLU + pre-norm + weight tying (mini-LLaMA).
+Supports LoopLM (weight-tied recurrence) for parameter-efficient depth scaling.
 """
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 import torch.nn as nn
@@ -14,6 +15,23 @@ import torch.nn.functional as F
 
 from bach_gen.model.config import ModelConfig
 
+
+# ---------------------------------------------------------------------------
+# LoopLM output container
+# ---------------------------------------------------------------------------
+
+@dataclass
+class LoopLMOutput:
+    """Return type when ``return_all_steps=True`` during LoopLM training."""
+
+    logits: torch.Tensor  # Final-step logits (batch, seq_len, vocab_size)
+    all_logits: list[torch.Tensor] = field(default_factory=list)
+    exit_lambdas: list[torch.Tensor] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# KV cache
+# ---------------------------------------------------------------------------
 
 @dataclass
 class KVCache:
@@ -40,6 +58,10 @@ class KVCache:
             return self.active_len
         return self.k.shape[2]
 
+
+# ---------------------------------------------------------------------------
+# Positional embeddings
+# ---------------------------------------------------------------------------
 
 class RotaryEmbedding(nn.Module):
     """Rotary Position Embedding (RoPE).
@@ -157,7 +179,7 @@ class PoPEEmbedding(nn.Module):
 def apply_pope_emb(
     x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
 ) -> torch.Tensor:
-    """Apply PoPE to x: softplus → rotate → interleave to 2*D.
+    """Apply PoPE to x: softplus -> rotate -> interleave to 2*D.
 
     Args:
         x: (B, H, T, D) query or key tensor.
@@ -181,7 +203,7 @@ def apply_pope_emb(
 
 
 def apply_pope_no_pos(x: torch.Tensor) -> torch.Tensor:
-    """Apply PoPE without position: softplus → expand to 2*D with zero angles.
+    """Apply PoPE without position: softplus -> expand to 2*D with zero angles.
 
     Used during DroPE recalibration to maintain the attention dimension
     and nonlinearity while removing all positional information.
@@ -194,6 +216,10 @@ def apply_pope_no_pos(x: torch.Tensor) -> torch.Tensor:
     out = torch.stack([mag, zeros], dim=-1)  # (B, H, T, D, 2)
     return out.reshape(*x.shape[:-1], 2 * x.shape[-1])
 
+
+# ---------------------------------------------------------------------------
+# Core modules
+# ---------------------------------------------------------------------------
 
 class RMSNorm(nn.Module):
     """Root Mean Square Layer Normalization.
@@ -212,8 +238,68 @@ class RMSNorm(nn.Module):
         return x * norm * self.weight
 
 
+# ---------------------------------------------------------------------------
+# LoopLM exit-distribution helpers
+# ---------------------------------------------------------------------------
+
+def compute_exit_distribution(
+    exit_lambdas: list[torch.Tensor],
+    num_steps: int | None = None,
+) -> torch.Tensor:
+    """Build a valid exit-step distribution from per-step exit probabilities.
+
+    Args:
+        exit_lambdas: ``T-1`` tensors each shaped ``(batch, seq_len)``
+            giving the instantaneous exit probability at steps ``0..T-2``.
+            The final step's mass is implicit (remaining survival).
+        num_steps: Total number of recurrent steps ``T``.  When ``None``,
+            inferred as ``len(exit_lambdas) + 1``.
+
+    Returns:
+        ``(T, batch, seq_len)`` tensor that sums to 1 along dim-0.
+        Steps ``0..T-2`` use ``lambda_t * S_{t-1}``; step ``T-1`` gets the
+        remaining survival mass ``S_{T-1}``.
+    """
+    T_minus_1 = len(exit_lambdas)
+    T = num_steps if num_steps is not None else T_minus_1 + 1
+
+    if T_minus_1 == 0:
+        # Single step — all mass on step 0
+        shape = exit_lambdas[0].shape if exit_lambdas else (1, 1)
+        device = exit_lambdas[0].device if exit_lambdas else torch.device("cpu")
+        return torch.ones(1, *shape, device=device)
+
+    # (T-1, B, S)
+    lambdas = torch.stack(exit_lambdas, dim=0)
+
+    # Survival S_t = prod_{j=0}^{t-1} (1 - lambda_j)
+    one_minus = (1.0 - lambdas).clamp(min=1e-8)  # (T-1, B, S)
+    log_surv = torch.cumsum(torch.log(one_minus), dim=0)  # (T-1, B, S)
+    surv = torch.exp(log_surv)
+
+    # S_prev: S_0=1, S_1, S_2, ...  (length T)
+    S_prev = torch.cat([torch.ones_like(surv[:1]), surv], dim=0)  # (T, B, S)
+
+    # p_exit for steps 0..T-2
+    p_non_final = lambdas * S_prev[:T_minus_1]  # (T-1, B, S)
+
+    # Final step collects remaining mass: S_{T-1}
+    p_final = S_prev[T_minus_1:T]  # (1, B, S)
+
+    return torch.cat([p_non_final, p_final], dim=0)  # (T, B, S)
+
+
+# ---------------------------------------------------------------------------
+# Transformer
+# ---------------------------------------------------------------------------
+
 class BachTransformer(nn.Module):
-    """Small decoder-only Transformer for music generation."""
+    """Small decoder-only Transformer for music generation.
+
+    When ``config.num_recurrent_steps > 1``, the same layer stack is applied
+    multiple times (LoopLM / Ouro architecture), trading unique parameters
+    for effective depth.
+    """
 
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -254,6 +340,12 @@ class BachTransformer(nn.Module):
         if config.weight_tying:
             self.head.weight = self.token_embed.weight
 
+        # LoopLM exit gate (only when recurrence > 1 and gate enabled)
+        if config.looplm_exit_gate and config.num_recurrent_steps > 1:
+            self.exit_gate = nn.Linear(config.embed_dim, 1)
+        else:
+            self.exit_gate = None
+
         self.apply(self._init_weights)
 
     def _init_weights(self, module: nn.Module) -> None:
@@ -265,6 +357,10 @@ class BachTransformer(nn.Module):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
         # RMSNorm weight is already initialized to ones in __init__
 
+    # ------------------------------------------------------------------ #
+    #  Forward
+    # ------------------------------------------------------------------ #
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -273,7 +369,8 @@ class BachTransformer(nn.Module):
         attn_temperature: float | None = None,
         use_cache: bool = False,
         kv_cache: list[KVCache] | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, list[KVCache]]:
+        return_all_steps: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, list[KVCache]] | LoopLMOutput:
         """Forward pass.
 
         Args:
@@ -284,11 +381,16 @@ class BachTransformer(nn.Module):
                 softmax. Used at inference with DroPE models on extended contexts.
             use_cache: If True, return (logits, kv_caches) for incremental decoding.
             kv_cache: Per-layer KV caches from a previous forward pass.
+            return_all_steps: If True and num_recurrent_steps > 1, return a
+                ``LoopLMOutput`` with per-step logits and exit probabilities
+                for the LoopLM training loss.
 
         Returns:
-            logits: (batch, seq_len, vocab_size) — or (logits, kv_caches) when
-            use_cache is True.
+            logits: (batch, seq_len, vocab_size) — or (logits, kv_caches)
+            when use_cache is True — or LoopLMOutput when return_all_steps
+            is True.
         """
+        T_max = self.config.num_recurrent_steps
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
 
@@ -325,12 +427,39 @@ class BachTransformer(nn.Module):
         else:
             cos, sin = None, None
 
+        # ----- Standard path (no recurrence) -----
+        if T_max <= 1:
+            return self._forward_single(
+                x, causal_mask, pad_mask, cos, sin, use_rope,
+                attn_temperature, use_cache, kv_cache,
+            )
+
+        # ----- LoopLM recurrent path -----
+        return self._forward_looped(
+            x, causal_mask, pad_mask, cos, sin, use_rope,
+            attn_temperature, use_cache, kv_cache,
+            return_all_steps,
+        )
+
+    def _forward_single(
+        self,
+        x: torch.Tensor,
+        causal_mask: torch.Tensor | None,
+        pad_mask: torch.Tensor | None,
+        cos: torch.Tensor | None,
+        sin: torch.Tensor | None,
+        use_pos: bool,
+        attn_temperature: float | None,
+        use_cache: bool,
+        kv_cache: list[KVCache] | None,
+    ) -> torch.Tensor | tuple[torch.Tensor, list[KVCache]]:
+        """Standard single-pass forward (no recurrence)."""
         new_caches: list[KVCache] = []
         for i, layer in enumerate(self.layers):
             layer_cache = kv_cache[i] if kv_cache is not None else None
             layer_out = layer(
                 x, causal_mask=causal_mask, pad_mask=pad_mask,
-                cos=cos, sin=sin, use_pos=use_rope,
+                cos=cos, sin=sin, use_pos=use_pos,
                 attn_temperature=attn_temperature,
                 kv_cache=layer_cache, use_cache=use_cache,
             )
@@ -347,13 +476,156 @@ class BachTransformer(nn.Module):
             return logits, new_caches
         return logits
 
+    def _forward_looped(
+        self,
+        x: torch.Tensor,
+        causal_mask: torch.Tensor | None,
+        pad_mask: torch.Tensor | None,
+        cos: torch.Tensor | None,
+        sin: torch.Tensor | None,
+        use_pos: bool,
+        attn_temperature: float | None,
+        use_cache: bool,
+        kv_cache: list[KVCache] | None,
+        return_all_steps: bool,
+    ) -> torch.Tensor | tuple[torch.Tensor, list[KVCache]] | LoopLMOutput:
+        """LoopLM recurrent forward: apply layer stack T_max times.
+
+        KV-cache strategy (``last-step reuse`` from the Ouro paper):
+        - Non-final recurrent steps READ from the cache but do NOT write.
+        - The final recurrent step reads AND writes, updating the cache.
+        This keeps memory cost identical to a standard transformer while
+        allowing all recurrent steps to attend to previous positions.
+
+        Adaptive early exit (inference only):
+        When ``self.exit_gate`` is not None and the model is in eval mode,
+        the loop exits early once cumulative exit mass exceeds
+        ``config.looplm_exit_threshold`` for every token in the batch.
+        """
+        T_max = self.config.num_recurrent_steps
+
+        all_logits: list[torch.Tensor] = []
+        exit_lambdas: list[torch.Tensor] = []
+        new_caches: list[KVCache] = []
+
+        # Adaptive exit tracking (inference only)
+        adaptive_exit = (
+            not self.training
+            and self.exit_gate is not None
+            and not return_all_steps
+            and self.config.looplm_exit_threshold < 1.0
+        )
+        cumulative_mass: torch.Tensor | None = None  # (B, S)
+        exit_logits: torch.Tensor | None = None
+
+        def run_recurrent_step(
+            step_x: torch.Tensor,
+            write_cache: bool,
+        ) -> torch.Tensor:
+            """Run one recurrent pass, optionally materializing KV cache."""
+            for i, layer in enumerate(self.layers):
+                layer_cache = kv_cache[i] if kv_cache is not None else None
+
+                if write_cache:
+                    layer_out = layer(
+                        step_x, causal_mask=causal_mask, pad_mask=pad_mask,
+                        cos=cos, sin=sin, use_pos=use_pos,
+                        attn_temperature=attn_temperature,
+                        kv_cache=layer_cache, use_cache=True,
+                    )
+                    step_x, lc = layer_out
+                    if len(new_caches) <= i:
+                        new_caches.append(lc)
+                    else:
+                        new_caches[i] = lc
+                elif kv_cache is not None:
+                    step_x = layer(
+                        step_x, causal_mask=causal_mask, pad_mask=pad_mask,
+                        cos=cos, sin=sin, use_pos=use_pos,
+                        attn_temperature=attn_temperature,
+                        kv_cache=layer_cache, use_cache=False,
+                        cache_read_only=True,
+                    )
+                else:
+                    step_x = layer(
+                        step_x, causal_mask=causal_mask, pad_mask=pad_mask,
+                        cos=cos, sin=sin, use_pos=use_pos,
+                        attn_temperature=attn_temperature,
+                    )
+            return step_x
+
+        for t in range(T_max):
+            is_last = (t == T_max - 1)
+            step_input = x
+            x = run_recurrent_step(step_input, write_cache=use_cache and is_last)
+
+            # --- Per-step logits & gate ---
+            if return_all_steps:
+                step_logits = self.head(self.ln_final(x))
+                all_logits.append(step_logits)
+
+                # Only compute gate for steps 0..T-2; final step gets
+                # remaining survival mass — its lambda is unused.
+                if self.exit_gate is not None and not is_last:
+                    lam = torch.sigmoid(self.exit_gate(x)).squeeze(-1)  # (B, S)
+                    exit_lambdas.append(lam)
+
+            # --- Adaptive early exit at inference ---
+            if adaptive_exit and not is_last and exit_logits is None:
+                lam = torch.sigmoid(self.exit_gate(x)).squeeze(-1)  # (B, S)
+                if cumulative_mass is None:
+                    cumulative_mass = lam
+                else:
+                    # p(exit at t) = lam_t * S_{t-1};  cumulative CDF
+                    cumulative_mass = cumulative_mass + lam * (1.0 - cumulative_mass)
+
+                if (cumulative_mass >= self.config.looplm_exit_threshold).all():
+                    exit_logits = self.head(self.ln_final(x))
+                    if use_cache:
+                        # Cache writes only happen once; rerun the triggering
+                        # step with cache materialization so future decode steps
+                        # match the early-exit depth.
+                        x = run_recurrent_step(step_input, write_cache=True)
+                    break
+
+        # Final logits: use early-exit logits if available, else last step
+        final_h = self.ln_final(x)
+        final_logits = self.head(final_h)
+
+        if return_all_steps:
+            # Replace last entry with final_logits (avoids redundant ln_final + head)
+            if all_logits:
+                all_logits[-1] = final_logits
+            return LoopLMOutput(
+                logits=final_logits,
+                all_logits=all_logits,
+                exit_lambdas=exit_lambdas,
+            )
+
+        # Use early-exit logits when available (adaptive depth)
+        output_logits = exit_logits if exit_logits is not None else final_logits
+
+        if use_cache:
+            return output_logits, new_caches
+        return output_logits
+
     def count_parameters(self) -> int:
         """Count actual trainable parameters."""
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
+# ---------------------------------------------------------------------------
+# Transformer block
+# ---------------------------------------------------------------------------
+
 class TransformerBlock(nn.Module):
-    """Pre-norm Transformer decoder block with RMSNorm and SwiGLU."""
+    """Pre-norm Transformer decoder block with RMSNorm and SwiGLU.
+
+    When ``config.looplm_sandwich_norm`` is True, an additional post-norm
+    is applied after each sublayer output (before the residual add).  This
+    ``sandwich normalization`` constrains representation growth across
+    recurrent loops and is critical for stable deep-recurrence training.
+    """
 
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -362,6 +634,12 @@ class TransformerBlock(nn.Module):
         self.ln2 = RMSNorm(config.embed_dim)
         self.ffn = SwiGLUFeedForward(config)
         self.dropout = nn.Dropout(config.dropout)
+
+        # Sandwich normalization (LoopLM stability)
+        self.sandwich_norm = config.looplm_sandwich_norm
+        if self.sandwich_norm:
+            self.ln1_post = RMSNorm(config.embed_dim)
+            self.ln2_post = RMSNorm(config.embed_dim)
 
     def forward(
         self,
@@ -374,6 +652,7 @@ class TransformerBlock(nn.Module):
         attn_temperature: float | None = None,
         kv_cache: KVCache | None = None,
         use_cache: bool = False,
+        cache_read_only: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, KVCache]:
         # Pre-norm attention
         attn_out = self.attn(
@@ -381,16 +660,30 @@ class TransformerBlock(nn.Module):
             cos=cos, sin=sin, use_pos=use_pos,
             attn_temperature=attn_temperature,
             kv_cache=kv_cache, use_cache=use_cache,
+            cache_read_only=cache_read_only,
         )
         if use_cache:
             attn_out, new_cache = attn_out
+
+        if self.sandwich_norm:
+            attn_out = self.ln1_post(attn_out)
+
         x = x + self.dropout(attn_out)
+
         # Pre-norm FFN
-        x = x + self.dropout(self.ffn(self.ln2(x)))
+        ffn_out = self.ffn(self.ln2(x))
+        if self.sandwich_norm:
+            ffn_out = self.ln2_post(ffn_out)
+        x = x + self.dropout(ffn_out)
+
         if use_cache:
             return x, new_cache
         return x
 
+
+# ---------------------------------------------------------------------------
+# Attention
+# ---------------------------------------------------------------------------
 
 class CausalSelfAttention(nn.Module):
     """Multi-head causal self-attention."""
@@ -474,6 +767,7 @@ class CausalSelfAttention(nn.Module):
         attn_temperature: float | None = None,
         kv_cache: KVCache | None = None,
         use_cache: bool = False,
+        cache_read_only: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, KVCache]:
         B, T, C = x.shape
 
@@ -519,9 +813,17 @@ class CausalSelfAttention(nn.Module):
             v_out[..., 0::2] = v
             v = v_out
 
-        # --- KV cache: in-place append into fixed buffers (no per-step cat) ---
+        # --- KV cache handling ---
         new_cache: KVCache | None = None
-        if use_cache:
+
+        if cache_read_only and kv_cache is not None:
+            # LoopLM non-final recurrent step during incremental decode:
+            # read cached K/V for attention context but do NOT write.
+            cached_len = kv_cache.seq_len
+            k_attn = torch.cat([kv_cache.k[:, :, :cached_len, :], k], dim=2)
+            v_attn = torch.cat([kv_cache.v[:, :, :cached_len, :], v], dim=2)
+
+        elif use_cache:
             if kv_cache is None:
                 # Prefill path: allocate once at max_seq_len.
                 k_buf = torch.empty(
@@ -590,7 +892,7 @@ class CausalSelfAttention(nn.Module):
         if attn_mask is not None:
             attn_mask = attn_mask.to(dtype=q.dtype)
         use_is_causal = False
-        if kv_cache is not None:
+        if kv_cache is not None or cache_read_only:
             # Incremental mode: new Q tokens can attend to all K/V positions
             pass
         elif pad_mask is not None or attn_mask is not None:
@@ -630,7 +932,7 @@ class SwiGLUFeedForward(nn.Module):
     """SwiGLU feed-forward network.
 
     Replaces the standard GELU FFN with a gated linear unit:
-        SwiGLU(x) = (SiLU(x @ W_gate) ⊙ x @ W1) @ W2
+        SwiGLU(x) = (SiLU(x @ W_gate) * x @ W1) @ W2
 
     Three weight matrices instead of two, so ``hidden_dim`` is reduced
     to ~8/3 * embed_dim (rounded to a multiple of 64) to keep the total
@@ -647,7 +949,7 @@ class SwiGLUFeedForward(nn.Module):
 
     @staticmethod
     def _compute_hidden(embed_dim: int) -> int:
-        """Compute SwiGLU hidden dim ≈ 8/3 * embed_dim, rounded to multiple of 64."""
+        """Compute SwiGLU hidden dim ~ 8/3 * embed_dim, rounded to multiple of 64."""
         raw = int(embed_dim * 8 / 3)
         return ((raw + 63) // 64) * 64
 

@@ -35,6 +35,13 @@ class ModelConfig:
     drope_trained: bool = False
     drope_train_seq_len: int | None = None
 
+    # LoopLM: weight-tied recurrence (Ouro / LoopLM architecture)
+    num_recurrent_steps: int = 1  # T_max; 1 = standard transformer, >1 = looped
+    looplm_sandwich_norm: bool = False  # RMSNorm after each sublayer for recurrence stability
+    looplm_exit_gate: bool = False  # Learned adaptive exit gate
+    looplm_kl_beta: float = 0.1  # Entropy regularization coefficient
+    looplm_exit_threshold: float = 0.5  # Inference CDF threshold for early exit
+
     def __post_init__(self) -> None:
         if self.num_kv_heads is not None:
             if self.num_kv_heads > self.num_heads:
@@ -75,7 +82,9 @@ class ModelConfig:
         attn = 2 * self.embed_dim * self.embed_dim + 2 * self.embed_dim * kv_dim
         swiglu_hidden = self.effective_swiglu_dim
         ffn = 3 * self.embed_dim * swiglu_hidden  # gate + up + down (no bias)
-        rms_norm = 2 * self.embed_dim  # 2 norms per layer, weight only (no bias)
+        # 2 pre-norms per layer; +2 post-norms if sandwich norm enabled
+        norms_per_layer = 4 if self.looplm_sandwich_norm else 2
+        rms_norm = norms_per_layer * self.embed_dim  # weight only (no bias)
         rel_dim = head_dim * (2 if self.pos_encoding == "pope" else 1)
         rel_attn = (
             self.num_heads * self.rel_attn_max_distance * rel_dim
@@ -85,4 +94,6 @@ class ModelConfig:
         layers = per_layer * self.num_layers
         # Output head (tied with embedding if weight_tying)
         head = 0 if self.weight_tying else self.embed_dim * self.vocab_size
-        return emb + layers + head
+        # LoopLM exit gate: Linear(embed_dim, 1) = embed_dim + 1 params
+        exit_gate = (self.embed_dim + 1) if self.looplm_exit_gate else 0
+        return emb + layers + head + exit_gate
