@@ -82,6 +82,18 @@ class RotaryEmbedding(nn.Module):
         )
 
 
+def _rel_shift(x: torch.Tensor) -> torch.Tensor:
+    """Skew absolute-by-relative logits into absolute-by-absolute indexing."""
+    bsz, n_heads, q_len, rel_len = x.shape
+    zero_pad = torch.zeros(
+        (bsz, n_heads, q_len, 1), dtype=x.dtype, device=x.device,
+    )
+    x = torch.cat([zero_pad, x], dim=-1)
+    x = x.reshape(bsz, n_heads, rel_len + 1, q_len)
+    x = x[:, :, 1:, :]
+    return x[:, :, :, :q_len]
+
+
 def apply_rotary_emb(
     x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
 ) -> torch.Tensor:
@@ -393,6 +405,8 @@ class CausalSelfAttention(nn.Module):
         self.num_kv_groups = self.num_heads // self.num_kv_heads
         self.pos_encoding = config.pos_encoding
         self.max_seq_len = config.max_seq_len
+        self.rel_attn_max_distance = config.rel_attn_max_distance
+        self.rel_attn_dim = self.head_dim * (2 if config.pos_encoding == "pope" else 1)
 
         kv_dim = self.num_kv_heads * self.head_dim
         self.q_proj = nn.Linear(config.embed_dim, self.num_heads * self.head_dim)
@@ -401,6 +415,53 @@ class CausalSelfAttention(nn.Module):
         self.proj = nn.Linear(config.embed_dim, config.embed_dim)
         self.attn_dropout = nn.Dropout(config.dropout)
         self.proj_dropout = nn.Dropout(config.dropout)
+        self.rel_attn_bias = None
+        if config.rel_attn_bias:
+            self.rel_attn_bias = nn.Parameter(
+                torch.empty(
+                    self.num_heads,
+                    self.rel_attn_max_distance,
+                    self.rel_attn_dim,
+                ),
+            )
+            nn.init.normal_(self.rel_attn_bias, mean=0.0, std=0.02)
+
+    def _compute_relative_attention_bias(
+        self,
+        q: torch.Tensor,
+        q_len: int,
+        k_len: int,
+        kv_cache: KVCache | None = None,
+    ) -> torch.Tensor | None:
+        """Return additive per-head relative logits."""
+        if self.rel_attn_bias is None:
+            return None
+
+        if kv_cache is None and q_len == k_len and k_len <= self.rel_attn_max_distance:
+            rel = self.rel_attn_bias[:, self.rel_attn_max_distance - k_len :, :]
+            rel_logits = torch.einsum("bhtd,hrd->bhtr", q, rel)
+            return _rel_shift(rel_logits)
+
+        rel_logits = torch.einsum("bhtd,hrd->bhtr", q, self.rel_attn_bias)
+        max_rel = self.rel_attn_max_distance - 1
+
+        if kv_cache is None:
+            query_positions = torch.arange(q_len, device=q.device)
+            key_positions = torch.arange(k_len, device=q.device)
+        else:
+            cached_len = kv_cache.seq_len
+            key_start = kv_cache.pos_offset - cached_len
+            query_start = kv_cache.pos_offset
+            query_positions = torch.arange(query_start, query_start + q_len, device=q.device)
+            key_positions = torch.arange(key_start, key_start + k_len, device=q.device)
+
+        rel_idx = key_positions[None, :] - query_positions[:, None]
+        rel_idx = rel_idx.clamp(min=-max_rel, max=0) + max_rel
+        rel_idx = rel_idx.to(torch.long)
+        gather_idx = rel_idx.view(1, 1, q_len, k_len).expand(
+            rel_logits.size(0), rel_logits.size(1), -1, -1,
+        )
+        return torch.gather(rel_logits, dim=-1, index=gather_idx)
 
     def forward(
         self,
@@ -520,18 +581,27 @@ class CausalSelfAttention(nn.Module):
             q = q / math.sqrt(attn_temperature)
 
         # Build attention mask combining causal + padding
-        attn_mask = None
+        attn_mask = self._compute_relative_attention_bias(
+            q=q,
+            q_len=T,
+            k_len=k_attn.shape[2],
+            kv_cache=kv_cache,
+        )
+        if attn_mask is not None:
+            attn_mask = attn_mask.to(dtype=q.dtype)
         use_is_causal = False
         if kv_cache is not None:
             # Incremental mode: new Q tokens can attend to all K/V positions
             pass
-        elif pad_mask is not None:
-            # pad_mask: (B, 1, T, T) where 0 = ignore
-            # Combine with causal mask: both must allow attention
-            combined = causal_mask.unsqueeze(0).unsqueeze(0) | (pad_mask == 0)
-            # Convert bool mask to float: True (blocked) -> -inf, False (attend) -> 0
-            attn_mask = torch.zeros_like(combined, dtype=q.dtype)
-            attn_mask.masked_fill_(combined, float("-inf"))
+        elif pad_mask is not None or attn_mask is not None:
+            combined = causal_mask.unsqueeze(0).unsqueeze(0)
+            if pad_mask is not None:
+                # pad_mask: (B, 1, T, T) where 0 = ignore
+                # Combine with causal mask: both must allow attention
+                combined = combined | (pad_mask == 0)
+            additive_mask = torch.zeros_like(combined, dtype=q.dtype)
+            additive_mask.masked_fill_(combined, float("-inf"))
+            attn_mask = additive_mask if attn_mask is None else attn_mask + additive_mask
         else:
             use_is_causal = True
 

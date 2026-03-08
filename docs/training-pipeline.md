@@ -99,6 +99,57 @@ uv run bach-gen train \
 
 This command builds a model at about `15.99M` parameters on the current `datamidiall/tokenizer.json` vocab (`125` tokens), which is the closest clean architecture to the `15.9M` raw-token target.
 
+### Optional: Relative Attention for Long-Range Motif Recall
+
+If the model already shows strong **short-range imitation** but weak **long-range thematic return**, enable Music Transformer-style relative attention:
+
+```bash
+uv run bach-gen train \
+  --curriculum \
+  --data-dir datamidiall \
+  --finetune bach \
+  --seq-len-stages "4096:40,8192:25,16384:15" \
+  --batch-size 4 \
+  --accumulation-steps 2 \
+  --lr 3e-4 \
+  --finetune-lr 1e-4 \
+  --embed-dim 384 \
+  --num-heads 8 \
+  --num-layers 9 \
+  --pos-encoding pope \
+  --rel-attn-bias \
+  --rel-attn-max-distance 1024 \
+  --piece-balance sqrt \
+  --fp16
+```
+
+**What this changes:**
+
+- Keeps the existing **PoPE → DroPE → Bach fine-tune** curriculum unchanged
+- Adds learned **relative position embeddings** inside attention, following the Music Transformer formulation (`Q E_r^T` + skew/relative-shift)
+- Helps the model reason about **distance from previous material**, which is especially relevant when motifs should return far from their first appearance
+
+**How it interacts with long context:**
+
+- When `seq_len <= --rel-attn-max-distance`, training uses the paper-style full-sequence relative formulation directly
+- When `seq_len` exceeds that limit, distances farther than `--rel-attn-max-distance - 1` are clipped to the furthest learned relative embedding
+- This lets you train at `4096/8192/16384` without exploding parameter count
+
+**Parameter cost on the current 384d / 8h / 9L / PoPE model:**
+
+| `--rel-attn-max-distance` | Approx params |
+|---|---|
+| none | `15.99M` |
+| `512` | `19.53M` |
+| `1024` | `23.07M` |
+| `2048` | `30.15M` |
+| `4096` | `44.31M` |
+| `16384` | `129.24M` |
+
+**Recommendation:** start with `1024` or `2048`. Setting `16384` is usually the wrong tradeoff at this model scale.
+
+**Resume note:** if a run was started with `--rel-attn-bias`, resume with the same relative-attention flags so the instantiated model matches the checkpoint architecture.
+
 ### What `--seq-len-stages` Does
 
 The flag `"4096:40,8192:25,16384:15"` defines three context-length stages within a single training run:
@@ -163,6 +214,7 @@ When sequences exceed the current stage's context length, `BachDataset.__getitem
 | FFN | SwiGLU (8/3 expansion) |
 | Normalization | RMSNorm, pre-norm |
 | Positional | PoPE (recommended) or RoPE |
+| Optional long-range bias | Music Transformer-style relative attention (`--rel-attn-bias`) |
 | Weight tying | Input embedding tied to output projection |
 | Precision | fp16 on CUDA, fp32 fallback |
 | Recommended optimizer batch | micro-batch `4`, accumulation `2` |
@@ -178,6 +230,8 @@ When sequences exceed the current stage's context length, `BachDataset.__getitem
 | `--num-layers` | `8` | Transformer depth |
 | `--pos-encoding` | `pope` | Positional encoding (pope or rope) |
 | `--num-kv-heads` | none (=MHA) | GQA KV heads |
+| `--rel-attn-bias` | off | Enable Music Transformer-style relative attention |
+| `--rel-attn-max-distance` | `2048` | Largest learned relative distance before clipping |
 | `--finetune` | none | Fine-tune target (style token or composer substring) |
 | `--finetune-lr` | 5e-5 | Fine-tune learning rate |
 | `--drope/--no-drope` | enabled | DroPE recalibration phase |
@@ -216,6 +270,25 @@ uv run bach-gen train \
   --num-heads 8 \
   --num-layers 9 \
   --pos-encoding pope \
+  --piece-balance sqrt \
+  --fp16
+
+# 3b. Optional: relative-attention run for stronger long-range motif recall
+uv run bach-gen train \
+  --curriculum \
+  --data-dir datamidiall \
+  --finetune bach \
+  --seq-len-stages "4096:40,8192:25,16384:15" \
+  --batch-size 4 \
+  --accumulation-steps 2 \
+  --lr 3e-4 \
+  --finetune-lr 1e-4 \
+  --embed-dim 384 \
+  --num-heads 8 \
+  --num-layers 9 \
+  --pos-encoding pope \
+  --rel-attn-bias \
+  --rel-attn-max-distance 1024 \
   --piece-balance sqrt \
   --fp16
 

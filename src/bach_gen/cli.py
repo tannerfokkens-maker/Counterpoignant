@@ -1139,6 +1139,10 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
               default="pope", help="Positional encoding for main training stage")
 @click.option("--num-kv-heads", default=None, type=int,
               help="Number of KV heads for GQA (default: same as num_heads = standard MHA)")
+@click.option("--rel-attn-bias/--no-rel-attn-bias", default=False,
+              help="Enable Music Transformer-style relative attention")
+@click.option("--rel-attn-max-distance", default=2048, type=int,
+              help="Maximum relative distance before clipping (default: 2048)")
 @click.option("--piece-balance", type=click.Choice(["none", "sqrt", "inverse"]),
               default="sqrt",
               help="Down-weight heavily-chunked pieces via WeightedRandomSampler (default: sqrt)")
@@ -1158,6 +1162,7 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None,
           val_interval: int | None,
           fp16: bool, embed_dim: int, num_heads: int, num_layers: int,
           pos_encoding: str, num_kv_heads: int | None,
+          rel_attn_bias: bool, rel_attn_max_distance: int,
           piece_balance: str) -> None:
     """Train the Bach Transformer model."""
     import torch
@@ -1309,6 +1314,8 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None,
         max_seq_len=seq_len,
         pos_encoding=pos_encoding,
         num_kv_heads=num_kv_heads,
+        rel_attn_bias=rel_attn_bias,
+        rel_attn_max_distance=rel_attn_max_distance,
     )
 
     model = BachTransformer(config)
@@ -1322,6 +1329,11 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None,
         attn_desc += f" (GQA: {config.effective_num_kv_heads} KV heads)"
     console.print(f"  Config: {config.embed_dim}d, {attn_desc}, "
                   f"{config.num_layers}L, {config.ffn_dim}ff")
+    if config.rel_attn_bias:
+        console.print(
+            "  Relative attention: "
+            f"paper-style, max_distance={config.rel_attn_max_distance}"
+        )
 
     # Train
     MODELS_DIR.mkdir(parents=True, exist_ok=True)

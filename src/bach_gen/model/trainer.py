@@ -182,6 +182,31 @@ class Trainer:
 
         return state_dict, True
 
+    @staticmethod
+    def _reconcile_optional_attention_state_dict(
+        state_dict: dict[str, torch.Tensor],
+        target_state_dict: dict[str, torch.Tensor],
+    ) -> tuple[dict[str, torch.Tensor], bool]:
+        """Add/drop optional attention params so old checkpoints still load.
+
+        Currently used for optional relative-attention parameters, which may
+        be absent in older checkpoints or absent in the target model.
+        """
+        updated = False
+        optional_suffix = ".attn.rel_attn_bias"
+
+        for key in list(state_dict.keys()):
+            if key.endswith(optional_suffix) and key not in target_state_dict:
+                state_dict.pop(key)
+                updated = True
+
+        for key, value in target_state_dict.items():
+            if key.endswith(optional_suffix) and key not in state_dict:
+                state_dict[key] = value.detach().clone()
+                updated = True
+
+        return state_dict, updated
+
     def save_checkpoint(self, filename: str) -> None:
         """Public checkpoint save helper for phase transitions."""
         self._save_checkpoint(filename)
@@ -198,13 +223,19 @@ class Trainer:
             state,
             target_vocab_size=self.model.config.vocab_size,
         )
+        state, reconciled_optional = self._reconcile_optional_attention_state_dict(
+            state,
+            self.model.state_dict(),
+        )
         self.model.load_state_dict(state, strict=True)
         if resized_vocab:
             logger.info(
                 "Checkpoint vocab resized to %d rows; optimizer state reset.",
                 self.model.config.vocab_size,
             )
-        else:
+        if reconciled_optional:
+            logger.info("Checkpoint optional relative-attention weights reconciled.")
+        if not (resized_vocab or reconciled_optional):
             try:
                 self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             except Exception as e:
@@ -832,6 +863,10 @@ class Trainer:
         # Backward compat: old checkpoints lack num_kv_heads
         if not hasattr(config, "num_kv_heads"):
             config.num_kv_heads = None
+        if not hasattr(config, "rel_attn_bias"):
+            config.rel_attn_bias = False
+        if not hasattr(config, "rel_attn_max_distance"):
+            config.rel_attn_max_distance = 2048
 
         # Override max_seq_len for context-length extension.  Positional
         # embedding caches are registered as non-persistent buffers so they
@@ -878,6 +913,13 @@ class Trainer:
                 "Resized checkpoint token embeddings/head to vocab_size=%d",
                 config.vocab_size,
             )
+
+        state, reconciled_optional = Trainer._reconcile_optional_attention_state_dict(
+            state,
+            model.state_dict(),
+        )
+        if reconciled_optional:
+            logger.info("Reconciled optional relative-attention weights during checkpoint load.")
 
         model.load_state_dict(state)
         model = model.to(device)

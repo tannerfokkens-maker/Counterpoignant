@@ -154,6 +154,52 @@ class TestKVCacheEquivalence:
 
         torch.testing.assert_close(incr_logits, full_logits, atol=1e-4, rtol=1e-4)
 
+    def test_rope_with_relative_bias(self):
+        """RoPE + relative bias: incremental logits match full forward."""
+        config = _tiny_config(pos_encoding="rope", rel_attn_bias=True)
+        model = BachTransformer(config)
+        model.eval()
+
+        input_ids = torch.randint(0, config.vocab_size, (1, 16))
+
+        with torch.no_grad():
+            full_logits = model(input_ids, use_rope=True)
+            incr_logits = _incremental_logits(model, input_ids, use_rope=True)
+
+        torch.testing.assert_close(incr_logits, full_logits, atol=1e-4, rtol=1e-4)
+
+    def test_pope_drope_with_relative_bias(self):
+        """PoPE DroPE mode keeps cache equivalence when relative bias is enabled."""
+        config = _tiny_config(pos_encoding="pope", rel_attn_bias=True)
+        model = BachTransformer(config)
+        model.eval()
+
+        input_ids = torch.randint(0, config.vocab_size, (1, 16))
+
+        with torch.no_grad():
+            full_logits = model(input_ids, use_rope=False)
+            incr_logits = _incremental_logits(model, input_ids, use_rope=False)
+
+        torch.testing.assert_close(incr_logits, full_logits, atol=1e-4, rtol=1e-4)
+
+    def test_relative_attention_clipped_distance_matches_incremental(self):
+        """Relative attention remains cache-consistent when distances are clipped."""
+        config = _tiny_config(
+            pos_encoding="pope",
+            rel_attn_bias=True,
+            rel_attn_max_distance=8,
+        )
+        model = BachTransformer(config)
+        model.eval()
+
+        input_ids = torch.randint(0, config.vocab_size, (1, 16))
+
+        with torch.no_grad():
+            full_logits = model(input_ids, use_rope=True)
+            incr_logits = _incremental_logits(model, input_ids, use_rope=True)
+
+        torch.testing.assert_close(incr_logits, full_logits, atol=1e-4, rtol=1e-4)
+
 
 class TestKVCacheBackwardCompat:
     """Default behavior (no caching) is unchanged."""

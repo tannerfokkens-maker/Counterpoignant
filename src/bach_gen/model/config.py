@@ -29,6 +29,8 @@ class ModelConfig:
     weight_tying: bool = True
     rope_theta: float = 10000.0
     pos_encoding: str = "pope"  # "rope" | "pope" | "none"
+    rel_attn_bias: bool = False
+    rel_attn_max_distance: int = 2048
     swiglu_dim: int | None = None  # Auto-computed from embed_dim if None
     drope_trained: bool = False
     drope_train_seq_len: int | None = None
@@ -44,6 +46,8 @@ class ModelConfig:
                     f"num_heads ({self.num_heads}) must be divisible by "
                     f"num_kv_heads ({self.num_kv_heads})"
                 )
+        if self.rel_attn_max_distance < 1:
+            raise ValueError("rel_attn_max_distance must be >= 1")
 
     @property
     def effective_num_kv_heads(self) -> int:
@@ -72,7 +76,12 @@ class ModelConfig:
         swiglu_hidden = self.effective_swiglu_dim
         ffn = 3 * self.embed_dim * swiglu_hidden  # gate + up + down (no bias)
         rms_norm = 2 * self.embed_dim  # 2 norms per layer, weight only (no bias)
-        per_layer = attn + ffn + rms_norm
+        rel_dim = head_dim * (2 if self.pos_encoding == "pope" else 1)
+        rel_attn = (
+            self.num_heads * self.rel_attn_max_distance * rel_dim
+            if self.rel_attn_bias else 0
+        )
+        per_layer = attn + ffn + rms_norm + rel_attn
         layers = per_layer * self.num_layers
         # Output head (tied with embedding if weight_tying)
         head = 0 if self.weight_tying else self.embed_dim * self.vocab_size
