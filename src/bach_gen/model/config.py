@@ -23,6 +23,9 @@ class ModelConfig:
     num_heads: int = DEFAULT_NUM_HEADS
     num_kv_heads: int | None = None  # None = standard MHA (same as num_heads)
     num_layers: int = DEFAULT_NUM_LAYERS
+    num_front_layers: int = 0
+    num_loop_layers: int = 0
+    num_back_layers: int = 0
     ffn_dim: int = DEFAULT_FFN_DIM  # Kept for backward compat; unused by SwiGLU
     max_seq_len: int = DEFAULT_SEQ_LEN
     dropout: float = DEFAULT_DROPOUT
@@ -36,13 +39,19 @@ class ModelConfig:
     drope_train_seq_len: int | None = None
 
     # LoopLM: weight-tied recurrence (Ouro / LoopLM architecture)
-    num_recurrent_steps: int = 1  # T_max; 1 = standard transformer, >1 = looped
+    num_recurrent_steps: int = 3  # T_max; 1 = standard transformer, >1 = looped
     looplm_sandwich_norm: bool = False  # RMSNorm after each sublayer for recurrence stability
-    looplm_exit_gate: bool = False  # Learned adaptive exit gate
-    looplm_kl_beta: float = 0.1  # Entropy regularization coefficient
+    looplm_exit_gate: bool = True  # Learned adaptive exit gate
+    looplm_kl_beta: float = 0.05  # Entropy regularization coefficient
     looplm_exit_threshold: float = 0.5  # Inference CDF threshold for early exit
+    loop_step_embedding: bool = True  # Learned recurrent-step embedding for block LoopLM
+    loop_per_step_norms: bool = False  # Placeholder for future untied per-step norms
 
     def __post_init__(self) -> None:
+        if self.num_layers < 1:
+            raise ValueError("num_layers must be >= 1")
+        if self.num_recurrent_steps < 1:
+            raise ValueError("num_recurrent_steps must be >= 1")
         if self.num_kv_heads is not None:
             if self.num_kv_heads > self.num_heads:
                 raise ValueError(
@@ -55,6 +64,22 @@ class ModelConfig:
                 )
         if self.rel_attn_max_distance < 1:
             raise ValueError("rel_attn_max_distance must be >= 1")
+        if self.num_front_layers < 0 or self.num_loop_layers < 0 or self.num_back_layers < 0:
+            raise ValueError("num_front_layers, num_loop_layers, and num_back_layers must be >= 0")
+
+        # Default to full-stack recurrence when no explicit split is provided.
+        if self.num_loop_layers == 0:
+            remaining = self.num_layers - self.num_front_layers - self.num_back_layers
+            if remaining > 0:
+                self.num_loop_layers = remaining
+
+        if self.num_loop_layers < 1:
+            raise ValueError("num_loop_layers must be >= 1")
+        if self.num_front_layers + self.num_loop_layers + self.num_back_layers != self.num_layers:
+            raise ValueError(
+                "num_front_layers + num_loop_layers + num_back_layers "
+                f"must equal num_layers ({self.num_layers})"
+            )
 
     @property
     def effective_num_kv_heads(self) -> int:
@@ -95,5 +120,10 @@ class ModelConfig:
         # Output head (tied with embedding if weight_tying)
         head = 0 if self.weight_tying else self.embed_dim * self.vocab_size
         # LoopLM exit gate: Linear(embed_dim, 1) = embed_dim + 1 params
-        exit_gate = (self.embed_dim + 1) if self.looplm_exit_gate else 0
-        return emb + layers + head + exit_gate
+        exit_gate = (self.embed_dim + 1) if (self.looplm_exit_gate and self.num_recurrent_steps > 1) else 0
+        loop_step_embed = (
+            self.num_recurrent_steps * self.embed_dim
+            if self.loop_step_embedding and self.num_recurrent_steps > 1
+            else 0
+        )
+        return emb + layers + head + exit_gate + loop_step_embed

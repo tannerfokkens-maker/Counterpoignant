@@ -471,6 +471,31 @@ class TestStagedTraining:
         assert history["lr"][0] == pytest.approx(1e-4)
         assert history["lr"][1] == pytest.approx(1e-4)
 
+    def test_stage_early_stop_uses_stage_local_best_val(self, tmp_path):
+        trainer = self._make_staged_trainer(tmp_path)
+        stages = [(32, 1), (64, 2)]
+        val_losses = iter([1.0, 3.0, 2.9])
+
+        with patch.object(trainer, "_train_epoch", return_value=(1.0, {})), patch.object(
+            trainer,
+            "_validate",
+            side_effect=lambda loader, use_rope=True: (next(val_losses), {}),
+        ):
+            history = trainer.train(
+                log_interval=1,
+                val_interval=1,
+                seq_len_stages=stages,
+                early_stop=True,
+                patience=1,
+                min_delta=1e-4,
+                min_epochs=1,
+            )
+
+        # Without resetting best_val_loss at the stage boundary, stage 2 would
+        # stop immediately because 3.0 does not beat the stage-1 best of 1.0.
+        assert history["epochs_ran"] == 3
+        assert trainer.best_val_loss == pytest.approx(2.9)
+
 
 # ===========================================================================
 # 10. CLI --seq-len-stages option

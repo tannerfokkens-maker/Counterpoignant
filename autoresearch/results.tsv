@@ -1,0 +1,34 @@
+commit	val_loss	objective_val_loss	pitch_val_loss	stability_pitch_range	stability_pitch_delta	stability_pitch_reversals	memory_gb	status	description
+9591dcf+dirty	nan	3.669020	nan	nan	nan	0	0.0	discard	baseline_stage1_4096_safe cpu_sandbox
+9591dcf+dirty	nan	2.056722	nan	nan	nan	0	0.7	keep	baseline_stage1_4096_safe mps
+9591dcf+dirty	nan	1.786716	nan	nan	nan	0	0.4	keep	proxy1024_pretrain_looplm_t2_l5_sandwich
+9591dcf+dirty	nan	1.590306	nan	nan	nan	0	0.4	keep	proxy1024_pretrain_looplm_t2_l5_sandwich_gate_b010
+9591dcf+dirty	nan	1.708305	nan	nan	nan	0	0.4	discard	proxy1024_pretrain_looplm_t2_l5_sandwich_gate_b003
+9591dcf+dirty	nan	1.584774	nan	nan	nan	0	0.4	keep	proxy1024_pretrain_looplm_t2_l5_sandwich_gate_b020
+9591dcf+dirty	nan	1.536442	nan	nan	nan	0	0.4	keep	proxy1024_pretrain_looplm_t2_l5_sandwich_gate_b030
+9591dcf+dirty	nan	1.461367	nan	nan	nan	0	0.4	keep	proxy1024_pretrain_looplm_t2_l5_sandwich_gate_b040
+9591dcf+dirty	nan	1.820938	nan	nan	nan	0	0.6	keep	proxy2048_pretrain_looplm_t2_l5_sandwich_gate_b040
+9591dcf+dirty	nan	1.355018	nan	nan	nan	0	0.3	keep	proxy1024_pretrain_looplm_t3_l4_sandwich_gate_b040
+9591dcf+dirty	nan	1.267330	nan	nan	nan	0	0.4	keep	proxy1024_pretrain_looplm_t3_l4_nosandwich_gate_b040
+9591dcf+dirty	nan	1.116817	nan	nan	nan	0	0.4	keep	proxy1024_pretrain_looplm_t3_l4_nosandwich_gate_b050
+9591dcf+dirty	nan	1.044444	nan	nan	nan	0	0.4	keep	proxy1024_pretrain_looplm_t3_l4_nosandwich_gate_b060
+9591dcf+dirty	1.630625	0.755144	2.289281	nan	nan	0	0.4	discard	proxy1024_pretrain_looplm_t3_l4_nosandwich_gate_b080
+9591dcf+dirty	1.712403	1.652738	2.248694	nan	nan	0	0.4	keep	proxy1024_pretrain_looplm_t3_l4_nosandwich_gate_b005
+9591dcf+dirty	1.737824	1.696976	2.350291	nan	nan	0	0.4	discard	proxy1024_pretrain_looplm_t3_l4_nosandwich_gate_b000
+9591dcf+dirty	1.684362	1.573378	2.324846	nan	nan	0	0.4	discard	proxy1024_pretrain_looplm_t3_l4_nosandwich_gate_b010
+9591dcf+dirty	1.649538	1.646516	2.376698	nan	nan	0	0.4	discard	proxy1024_pretrain_looplm_t3_l4_nosandwich_nogate
+9591dcf+dirty	1.719962	1.647659	2.408403	nan	nan	0	0.3	discard	proxy1024_pretrain_looplm_t4_l3_nosandwich_gate_b005
+9591dcf+dirty	1.758294	1.701046	2.425884	nan	nan	0	0.4	discard	proxy1024_pretrain_looplm_t3_l5_nosandwich_gate_b005
+9591dcf+dirty	1.753182	1.694453	2.407435	nan	nan	0	0.3	discard	proxy1024_pretrain_looplm_t3_l4_sandwich_gate_b005
+9591dcf+dirty	1.737708	1.704173	2.403089	nan	nan	0	0.4	discard	proxy1024_pretrain_looplm_t3_l4_nosandwich_gate_b003
+9591dcf+dirty	1.977737	1.915400	2.499140	nan	nan	0	0.6	keep	proxy2048_pretrain_looplm_t3_l4_nosandwich_gate_b005
+9591dcf+dirty	2.329634	2.274532	2.670472	1.272533	-1.224485	1	0.4	discard	stage4096_lr3e4_eb16_looplm_t3_l4_gate_b005
+9591dcf+dirty	2.195144	2.109807	2.591464	1.338299	-1.288077	1	0.4	discard	stage4096_lr3e4_eb16_looplm_t3_l4_gate_b005_nospeedbackoff
+9591dcf+dirty	3.478660	3.351431	3.870547	0.409349	-0.319464	1	0.4	discard	stage4096_lr3e4_eb16_mb1x16_looplm_t3_l4_gate_b005
+9591dcf+dirty	3.514729	3.390984	3.821862	0.402214	-0.402214	2	0.4	keep	stage4096_lr4e4_eb16_mb1x16_looplm_t3_l4_gate_b005
+9591dcf+dirty	3.542920	3.446968	3.916116	0.431623	-0.053472	3	0.4	discard	stage4096_lr5e4_eb16_mb1x16_looplm_t3_l4_gate_b005
+9591dcf+dirty	3.476536	3.357295	3.888984	0.165564	-0.118509	3	0.4	discard	stage4096_lr35e4_eb16_mb1x16_looplm_t3_l4_gate_b005
+9591dcf+dirty	0.000000	0.000000	0.000000	nan	nan	0	0.0	crash	stage8192_lr15e4_eb8_mb1x8_looplm_t3_l4_gate_b005
+9591dcf+dirty	2.957122	2.957122	3.166293	0.842017	-0.842017	0	0.5	discard	stage8192_lr15e4_eb8_mb1x8_t1_l4
+9591dcf+dirty	2.446349	2.446349	2.818830	1.419735	-1.419735	0	0.5	keep	stage8192_lr2e4_eb8_mb1x8_t1_l4
+9591dcf+dirty	2.511770	2.511770	2.883671	1.183491	-1.183491	0	0.5	discard	stage8192_lr25e4_eb8_mb1x8_t1_l4

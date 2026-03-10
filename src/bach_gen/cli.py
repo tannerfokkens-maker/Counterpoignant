@@ -1070,7 +1070,8 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
 @click.option("--seq-len-stages", default=None, type=str,
               help="Staged context-length training: 'len:epochs,...' "
                    "e.g. '4096:50,8192:30,16384:20'. Overrides --seq-len and --epochs. "
-                   "In curriculum mode the same schedule is reused for both pre-train and fine-tune.")
+                   "In curriculum mode the same schedule is reused for both pre-train and fine-tune. "
+                   "During curriculum pre-train, each new stage halves the stage-start LR and batch size.")
 @click.option("--mode", "-m", type=click.Choice(VALID_FORMS), default=None,
               help="Composition mode (auto-detected from data if not set)")
 @click.option("--accumulation-steps", default=1, type=int,
@@ -1135,6 +1136,12 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
               help=f"Attention heads (default: {DEFAULT_NUM_HEADS})")
 @click.option("--num-layers", default=DEFAULT_NUM_LAYERS, type=int,
               help=f"Transformer layers (default: {DEFAULT_NUM_LAYERS})")
+@click.option("--num-front-layers", default=0, type=int,
+              help="Block-LoopLM: layers run once before the recurrent core (default: 0)")
+@click.option("--num-loop-layers", default=0, type=int,
+              help="Block-LoopLM: recurrent core depth; 0 infers the remaining layers")
+@click.option("--num-back-layers", default=0, type=int,
+              help="Block-LoopLM: layers run once after the recurrent core (default: 0)")
 @click.option("--pos-encoding", type=click.Choice(["rope", "pope"]),
               default="pope", help="Positional encoding for main training stage")
 @click.option("--num-kv-heads", default=None, type=int,
@@ -1146,16 +1153,18 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
 @click.option("--piece-balance", type=click.Choice(["none", "sqrt", "inverse"]),
               default="sqrt",
               help="Down-weight heavily-chunked pieces via WeightedRandomSampler (default: sqrt)")
-@click.option("--num-recurrent-steps", default=1, type=int,
-              help="LoopLM: number of times to loop through the layer stack (1 = standard transformer, default: 1)")
+@click.option("--num-recurrent-steps", default=3, type=int,
+              help="LoopLM: number of times to loop through the layer stack (1 = standard transformer, default: 3)")
 @click.option("--looplm-sandwich-norm", is_flag=True, default=False,
               help="LoopLM: enable sandwich normalization (RMSNorm after each sublayer) for recurrence stability")
-@click.option("--looplm-exit-gate", is_flag=True, default=False,
-              help="LoopLM: enable learned adaptive exit gate for variable-depth computation")
-@click.option("--looplm-kl-beta", default=0.1, type=float,
-              help="LoopLM: entropy regularization coefficient for exit gate (default: 0.1)")
+@click.option("--looplm-exit-gate/--no-looplm-exit-gate", default=True,
+              help="LoopLM: enable learned adaptive exit gate for variable-depth computation (default: enabled)")
+@click.option("--looplm-kl-beta", default=0.05, type=float,
+              help="LoopLM: entropy regularization coefficient for exit gate (default: 0.05)")
 @click.option("--looplm-exit-threshold", default=0.5, type=float,
               help="LoopLM: inference CDF threshold for early exit (default: 0.5)")
+@click.option("--loop-step-embedding/--no-loop-step-embedding", default=True,
+              help="LoopLM: add a learned embedding before each recurrent core pass (default: enabled)")
 @click.option("--looplm-gate-epochs", default=0, type=int,
               help="LoopLM: Stage II gate-only training epochs after main training (0 = skip, default: 0)")
 @click.option("--looplm-gate-lr", default=1e-3, type=float,
@@ -1175,6 +1184,7 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None,
           log_interval: int,
           val_interval: int | None,
           fp16: bool, embed_dim: int, num_heads: int, num_layers: int,
+          num_front_layers: int, num_loop_layers: int, num_back_layers: int,
           pos_encoding: str, num_kv_heads: int | None,
           rel_attn_bias: bool, rel_attn_max_distance: int,
           piece_balance: str,
@@ -1183,6 +1193,7 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None,
           looplm_exit_gate: bool,
           looplm_kl_beta: float,
           looplm_exit_threshold: float,
+          loop_step_embedding: bool,
           looplm_gate_epochs: int,
           looplm_gate_lr: float) -> None:
     """Train the Bach Transformer model."""
@@ -1332,6 +1343,9 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None,
         embed_dim=embed_dim,
         num_heads=num_heads,
         num_layers=num_layers,
+        num_front_layers=num_front_layers,
+        num_loop_layers=num_loop_layers,
+        num_back_layers=num_back_layers,
         max_seq_len=seq_len,
         pos_encoding=pos_encoding,
         num_kv_heads=num_kv_heads,
@@ -1342,6 +1356,7 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None,
         looplm_exit_gate=looplm_exit_gate,
         looplm_kl_beta=looplm_kl_beta,
         looplm_exit_threshold=looplm_exit_threshold,
+        loop_step_embedding=loop_step_embedding,
     )
 
     model = BachTransformer(config)
@@ -1361,10 +1376,17 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None,
             f"paper-style, max_distance={config.rel_attn_max_distance}"
         )
     if config.num_recurrent_steps > 1:
+        effective_depth = (
+            config.num_front_layers
+            + config.num_back_layers
+            + config.num_loop_layers * config.num_recurrent_steps
+        )
         loop_desc = (
             f"  LoopLM: T={config.num_recurrent_steps} "
-            f"(effective depth {config.num_layers * config.num_recurrent_steps}), "
-            f"sandwich_norm={config.looplm_sandwich_norm}"
+            f"(front={config.num_front_layers}, loop={config.num_loop_layers}, "
+            f"back={config.num_back_layers}, effective depth {effective_depth}), "
+            f"sandwich_norm={config.looplm_sandwich_norm}, "
+            f"step_embedding={config.loop_step_embedding}"
         )
         if config.looplm_exit_gate:
             loop_desc += f", exit_gate(beta={config.looplm_kl_beta}, threshold={config.looplm_exit_threshold})"
@@ -1474,6 +1496,8 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None,
             console.print("  Phase 2 (DroPE): disabled")
         console.print(f"  Phase 3 (fine-tune): up to {finetune_epochs} epochs on {ft_source_desc}")
         console.print(f"  Pre-train LR: {lr}")
+        if parsed_stages:
+            console.print("  Pre-train stage policy: each new seq-len stage halves LR and batch size")
         if drope:
             console.print(f"  DroPE LR: {drope_lr}")
         console.print(f"  Fine-tune LR: {finetune_lr}")
@@ -1524,6 +1548,8 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None,
                     checkpoint_prefix="pretrain_",
                     use_rope=True,
                     seq_len_stages=parsed_stages,
+                    stage_lr_decay=0.5,
+                    stage_batch_decay=0.5,
                 )
 
             if pt_history["train_loss"]:

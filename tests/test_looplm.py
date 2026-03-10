@@ -23,6 +23,8 @@ def _tiny_config(**overrides) -> ModelConfig:
         max_seq_len=32,
         dropout=0.0,
         pos_encoding="rope",
+        num_recurrent_steps=1,
+        looplm_exit_gate=False,
     )
     defaults.update(overrides)
     return ModelConfig(**defaults)
@@ -129,6 +131,45 @@ class TestLoopLMForward:
             assert lam.shape == (2, 8)
             assert (lam >= 0).all() and (lam <= 1).all()
 
+    def test_block_loop_repeats_only_middle_layers(self):
+        """Front/back layers run once; only loop layers are recurrent."""
+        config = _tiny_config(
+            num_layers=4,
+            num_front_layers=1,
+            num_loop_layers=2,
+            num_back_layers=1,
+            num_recurrent_steps=3,
+        )
+        model = BachTransformer(config)
+        model.eval()
+
+        ids = torch.randint(0, 32, (2, 8))
+
+        counts = {"front": 0, "loop": 0, "back": 0}
+        front_orig = model.front_layers[0].forward
+        loop_orig = model.loop_layers[0].forward
+        back_orig = model.back_layers[0].forward
+
+        def wrap(name: str, orig):
+            def wrapped(*args, **kwargs):
+                counts[name] += 1
+                return orig(*args, **kwargs)
+            return wrapped
+
+        model.front_layers[0].forward = wrap("front", front_orig)
+        model.loop_layers[0].forward = wrap("loop", loop_orig)
+        model.back_layers[0].forward = wrap("back", back_orig)
+        try:
+            _ = model(ids)
+        finally:
+            model.front_layers[0].forward = front_orig
+            model.loop_layers[0].forward = loop_orig
+            model.back_layers[0].forward = back_orig
+
+        assert counts["front"] == 1
+        assert counts["loop"] == config.num_recurrent_steps
+        assert counts["back"] == 1
+
     def test_full_depth_equivalence_when_threshold_is_one(self):
         """q=1.0 should match the ordinary full-depth recurrent output."""
         config = _tiny_config(
@@ -218,6 +259,28 @@ class TestLoopLMForward:
         next_id = torch.randint(0, 32, (1, 1))
         out2, caches2 = model(next_id, use_cache=True, kv_cache=caches)
         assert out2.shape == (1, 1, 32)
+
+    def test_block_looped_kv_cache_incremental(self):
+        """Block-LoopLM with split stacks should keep the cache path alive."""
+        config = _tiny_config(
+            num_layers=4,
+            num_front_layers=1,
+            num_loop_layers=2,
+            num_back_layers=1,
+            num_recurrent_steps=3,
+        )
+        model = BachTransformer(config)
+        model.eval()
+
+        ids = torch.randint(0, 32, (1, 8))
+        out, caches = model(ids, use_cache=True)
+        assert out.shape == (1, 8, 32)
+        assert len(caches) == config.num_layers
+
+        next_id = torch.randint(0, 32, (1, 1))
+        out2, caches2 = model(next_id, use_cache=True, kv_cache=caches)
+        assert out2.shape == (1, 1, 32)
+        assert len(caches2) == config.num_layers
 
 
 class TestLoopLMTrainingLoss:
@@ -416,6 +479,35 @@ class TestLoopLMCheckpointCompat:
         assert reconciled is True
         standard_model.load_state_dict(state)
 
+    def test_load_flat_layers_checkpoint_into_block_looplm(self, tmp_path):
+        """Old flat-stack checkpoints should remap into split block-LoopLM layers."""
+        from bach_gen.model.trainer import Trainer
+
+        old_config = _tiny_config(num_layers=4, num_recurrent_steps=3, looplm_exit_gate=True)
+        old_model = BachTransformer(old_config)
+        flat_state = {}
+        for key, value in old_model.state_dict().items():
+            if key.startswith("loop_layers."):
+                flat_state[key.replace("loop_layers.", "layers.", 1)] = value
+            else:
+                flat_state[key] = value
+
+        block_config = _tiny_config(
+            num_layers=4,
+            num_front_layers=1,
+            num_loop_layers=2,
+            num_back_layers=1,
+            num_recurrent_steps=3,
+            looplm_exit_gate=True,
+        )
+        block_model = BachTransformer(block_config)
+        state, reconciled = Trainer._reconcile_looplm_state_dict(
+            flat_state,
+            block_model.state_dict(),
+        )
+        assert reconciled is True
+        block_model.load_state_dict(state)
+
 
 class TestModelConfigLoopLM:
     """Test ModelConfig LoopLM-related properties."""
@@ -439,4 +531,11 @@ class TestModelConfigLoopLM:
         gated = _tiny_config(num_recurrent_steps=2, looplm_exit_gate=True)
         diff = gated.num_params - base.num_params
         expected = base.embed_dim + 1  # Linear(embed_dim, 1) = weight + bias
+        assert diff == expected
+
+    def test_num_params_accounts_for_loop_step_embedding(self):
+        base = _tiny_config(num_recurrent_steps=3, loop_step_embedding=False)
+        stepped = _tiny_config(num_recurrent_steps=3, loop_step_embedding=True)
+        diff = stepped.num_params - base.num_params
+        expected = base.num_recurrent_steps * base.embed_dim
         assert diff == expected

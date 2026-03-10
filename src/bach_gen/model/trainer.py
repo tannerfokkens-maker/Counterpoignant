@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 import time
 from pathlib import Path
 
@@ -24,6 +25,9 @@ from bach_gen.utils.constants import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+_LAYER_KEY_RE = re.compile(r"^(layers|front_layers|loop_layers|back_layers)\.(\d+)\.(.+)$")
 
 
 def get_device() -> torch.device:
@@ -214,15 +218,81 @@ class Trainer:
     ) -> tuple[dict[str, torch.Tensor], bool]:
         """Add/drop LoopLM-specific params so checkpoints load across configs.
 
-        Handles: exit_gate.{weight,bias}, layers.*.ln{1,2}_post.weight
-        (sandwich norm).  Missing keys are initialized from the freshly-
-        constructed model; extra keys are dropped.
+        Handles:
+        - optional LoopLM params (exit gate, sandwich norm, loop-step embedding)
+        - layer-stack renames between old ``layers.*`` checkpoints and the
+          newer ``front_layers.*`` / ``loop_layers.*`` / ``back_layers.*``
+          layout used by block-LoopLM.
         """
         updated = False
         looplm_suffixes = (
             "exit_gate.weight", "exit_gate.bias",
             ".ln1_post.weight", ".ln2_post.weight",
+            "loop_step_embed.weight",
         )
+
+        source_layer_keys = {key for key in state_dict if _LAYER_KEY_RE.match(key)}
+        target_layer_keys = {key for key in target_state_dict if _LAYER_KEY_RE.match(key)}
+
+        if source_layer_keys and source_layer_keys != target_layer_keys:
+            source_groups: dict[str, dict[int, dict[str, torch.Tensor]]] = {
+                "layers": {},
+                "front_layers": {},
+                "loop_layers": {},
+                "back_layers": {},
+            }
+            target_groups: dict[str, dict[int, dict[str, str]]] = {
+                "layers": {},
+                "front_layers": {},
+                "loop_layers": {},
+                "back_layers": {},
+            }
+
+            for key, value in state_dict.items():
+                match = _LAYER_KEY_RE.match(key)
+                if match is None:
+                    continue
+                prefix, idx_str, suffix = match.groups()
+                source_groups[prefix].setdefault(int(idx_str), {})[suffix] = value
+
+            for key in target_state_dict:
+                match = _LAYER_KEY_RE.match(key)
+                if match is None:
+                    continue
+                prefix, idx_str, suffix = match.groups()
+                target_groups[prefix].setdefault(int(idx_str), {})[suffix] = key
+
+            source_blocks: list[dict[str, torch.Tensor]] = []
+            if source_groups["layers"]:
+                for idx in sorted(source_groups["layers"]):
+                    source_blocks.append(source_groups["layers"][idx])
+            else:
+                for prefix in ("front_layers", "loop_layers", "back_layers"):
+                    for idx in sorted(source_groups[prefix]):
+                        source_blocks.append(source_groups[prefix][idx])
+
+            target_blocks: list[dict[str, str]] = []
+            if target_groups["layers"]:
+                for idx in sorted(target_groups["layers"]):
+                    target_blocks.append(target_groups["layers"][idx])
+            else:
+                for prefix in ("front_layers", "loop_layers", "back_layers"):
+                    for idx in sorted(target_groups[prefix]):
+                        target_blocks.append(target_groups[prefix][idx])
+
+            if len(source_blocks) == len(target_blocks):
+                for key in list(state_dict.keys()):
+                    if _LAYER_KEY_RE.match(key):
+                        state_dict.pop(key)
+
+                for source_block, target_block in zip(source_blocks, target_blocks, strict=True):
+                    for suffix, target_key in target_block.items():
+                        if suffix in source_block:
+                            state_dict[target_key] = source_block[suffix]
+                        else:
+                            state_dict[target_key] = target_state_dict[target_key].detach().clone()
+
+                updated = True
 
         # Drop keys present in checkpoint but absent in target model
         for key in list(state_dict.keys()):
@@ -369,6 +439,8 @@ class Trainer:
         checkpoint_prefix: str = "",
         use_rope: bool | None = None,
         seq_len_stages: list[tuple[int, int]] | None = None,
+        stage_lr_decay: float = 1.0,
+        stage_batch_decay: float = 1.0,
     ) -> dict:
         """Run training loop.
 
@@ -393,12 +465,23 @@ class Trainer:
                 loop is divided into consecutive stages, each with its own
                 context length, cosine-annealed LR schedule, and early-
                 stopping counter.
+            stage_lr_decay: Multiplicative LR decay applied when entering a
+                new seq-len stage. ``1.0`` keeps the same base LR for every
+                stage; ``0.5`` halves the stage-start LR each transition.
+            stage_batch_decay: Multiplicative batch-size decay applied when
+                entering a new seq-len stage. ``1.0`` keeps the same batch
+                size for every stage; ``0.5`` halves the stage batch size
+                each transition, clamped to a minimum of 1.
 
         Returns:
             Dict with training history.
         """
         if use_rope is None:
             use_rope = not getattr(self.model.config, "drope_trained", False)
+        if stage_lr_decay <= 0.0:
+            raise ValueError("stage_lr_decay must be > 0")
+        if stage_batch_decay <= 0.0:
+            raise ValueError("stage_batch_decay must be > 0")
         phase_tag = f"[{phase_name}] " if phase_name else ""
         ckpt_prefix = checkpoint_prefix or ""
 
@@ -415,7 +498,11 @@ class Trainer:
             history["train_category_loss"] = []
             history["val_category_loss"] = []
 
-        effective_batch = self.batch_size * self.accumulation_steps
+        base_batch_size = self.batch_size
+        phase_base_lr = float(
+            self.optimizer.defaults.get("lr", self.optimizer.param_groups[0]["lr"])
+        )
+        effective_batch = base_batch_size * self.accumulation_steps
         logger.info(
             f"{phase_tag}Training on {self.device} for {total_epochs} epochs "
             f"({len(stages)} stage{'s' if len(stages) > 1 else ''}, "
@@ -426,9 +513,16 @@ class Trainer:
             logger.info(f"{phase_tag}Seq-len stages: {stage_desc}")
         logger.info(f"{phase_tag}Model params: {self.model.count_parameters():,}")
         logger.info(
-            f"{phase_tag}Batch size: {self.batch_size} x {self.accumulation_steps} accumulation"
+            f"{phase_tag}Batch size: {base_batch_size} x {self.accumulation_steps} accumulation"
             f" = {effective_batch} effective"
         )
+        if len(stages) > 1 and (not math.isclose(stage_lr_decay, 1.0) or not math.isclose(stage_batch_decay, 1.0)):
+            logger.info(
+                "%sStage transitions apply lr_decay=%.4f, batch_decay=%.4f",
+                phase_tag,
+                stage_lr_decay,
+                stage_batch_decay,
+            )
 
         if start_epoch > total_epochs:
             logger.warning(
@@ -445,137 +539,145 @@ class Trainer:
         global_epoch = 0  # 0-based counter across all stages
         stop_reason = "max_epochs_reached"
 
-        for stage_idx, (stage_seq_len, stage_epochs) in enumerate(stages):
-            # Transition context length
-            self.transition_seq_len(stage_seq_len)
+        try:
+            for stage_idx, (stage_seq_len, stage_epochs) in enumerate(stages):
+                stage_lr_scale = stage_lr_decay ** stage_idx
+                stage_batch_scale = stage_batch_decay ** stage_idx
+                stage_batch_size = max(1, int(math.floor(base_batch_size * stage_batch_scale)))
+                stage_base_lr = phase_base_lr * stage_lr_scale
+                self.batch_size = stage_batch_size
 
-            # Reset the stage-local best metric. Loss scales are not directly
-            # comparable across context lengths, so later stages must early-stop
-            # against their own validation baseline instead of a previous stage's.
-            if len(stages) > 1:
-                previous_best_val = self.best_val_loss
-                self.best_val_loss = float("inf")
-                if previous_best_val != float("inf"):
+                # Transition context length
+                self.transition_seq_len(stage_seq_len)
+
+                # Reset the stage-local best metric. Loss scales are not directly
+                # comparable across context lengths, so later stages must early-stop
+                # against their own validation baseline instead of a previous stage's.
+                if len(stages) > 1:
+                    previous_best_val = self.best_val_loss
+                    self.best_val_loss = float("inf")
+                    if previous_best_val != float("inf"):
+                        logger.info(
+                            "%sResetting stage best val: %.4f -> inf",
+                            phase_tag,
+                            previous_best_val,
+                        )
+
+                train_loader = self._make_train_loader()
+                val_loader = None
+                if self.val_dataset and len(self.val_dataset) > 0:
+                    val_loader = DataLoader(
+                        self.val_dataset,
+                        batch_size=self.batch_size,
+                        shuffle=False,
+                        num_workers=0,
+                    )
+
+                # Restart each stage from the stage-adjusted phase LR rather
+                # than inheriting the previous stage's annealed floor.
+                current_lr = float(self.optimizer.param_groups[0]["lr"])
+                if len(stages) > 1 and not math.isclose(current_lr, stage_base_lr, rel_tol=1e-9):
                     logger.info(
-                        "%sResetting stage best val: %.4f -> inf",
+                        "%sRestarting stage LR: %.6f -> %.6f",
                         phase_tag,
-                        previous_best_val,
+                        current_lr,
+                        stage_base_lr,
+                    )
+                for param_group in self.optimizer.param_groups:
+                    param_group["lr"] = stage_base_lr
+
+                # Per-stage cosine annealing from the reset stage LR
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    self.optimizer, T_max=stage_epochs, eta_min=1e-6,
+                )
+
+                # Fast-forward scheduler if resuming into this stage
+                stage_start_global = sum(ep for _, ep in stages[:stage_idx])
+                epochs_to_skip = max(0, (start_epoch - 1) - stage_start_global)
+                if epochs_to_skip >= stage_epochs:
+                    global_epoch += stage_epochs
+                    continue  # This entire stage was already completed
+                for _ in range(epochs_to_skip):
+                    scheduler.step()
+
+                if len(stages) > 1:
+                    logger.info(
+                        f"{phase_tag}Stage {stage_idx + 1}/{len(stages)}: "
+                        f"seq_len={stage_seq_len}, {stage_epochs} epochs, "
+                        f"batch_size={self.batch_size}, "
+                        f"effective_batch={self.batch_size * self.accumulation_steps}, "
+                        f"stage_lr={stage_base_lr:.6f}"
                     )
 
-            train_loader = self._make_train_loader()
-            val_loader = None
-            if self.val_dataset and len(self.val_dataset) > 0:
-                val_loader = DataLoader(
-                    self.val_dataset,
-                    batch_size=self.batch_size,
-                    shuffle=False,
-                    num_workers=0,
-                )
+                bad_epochs = 0
+                stage_stopped_early = False
 
-            # Restart each stage from the phase base LR rather than inheriting
-            # the previous stage's annealed floor. Without this, later stages
-            # can end up training entirely at eta_min.
-            stage_base_lr = float(
-                self.optimizer.defaults.get("lr", self.optimizer.param_groups[0]["lr"])
-            )
-            current_lr = float(self.optimizer.param_groups[0]["lr"])
-            if len(stages) > 1 and not math.isclose(current_lr, stage_base_lr, rel_tol=1e-9):
-                logger.info(
-                    "%sRestarting stage LR: %.6f -> %.6f",
-                    phase_tag,
-                    current_lr,
-                    stage_base_lr,
-                )
-            for param_group in self.optimizer.param_groups:
-                param_group["lr"] = stage_base_lr
+                for stage_ep in range(1, stage_epochs + 1):
+                    global_epoch = stage_start_global + stage_ep
+                    if global_epoch < start_epoch:
+                        continue  # Skip already-completed epochs
 
-            # Per-stage cosine annealing from the reset stage LR
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizer, T_max=stage_epochs, eta_min=1e-6,
-            )
+                    self.epoch = global_epoch
+                    train_loss, train_cat_losses = self._train_epoch(train_loader, use_rope=use_rope)
+                    history["train_loss"].append(train_loss)
+                    history["lr"].append(scheduler.get_last_lr()[0])
+                    if "train_category_loss" in history:
+                        history["train_category_loss"].append(train_cat_losses)
 
-            # Fast-forward scheduler if resuming into this stage
-            stage_start_global = sum(ep for _, ep in stages[:stage_idx])
-            epochs_to_skip = max(0, (start_epoch - 1) - stage_start_global)
-            if epochs_to_skip >= stage_epochs:
-                global_epoch += stage_epochs
-                continue  # This entire stage was already completed
-            for _ in range(epochs_to_skip):
-                scheduler.step()
+                    scheduler.step()
 
-            if len(stages) > 1:
-                logger.info(
-                    f"{phase_tag}Stage {stage_idx + 1}/{len(stages)}: "
-                    f"seq_len={stage_seq_len}, {stage_epochs} epochs"
-                )
+                    val_loss = None
+                    val_cat_losses: dict[str, float | None] = {}
+                    if val_loader and global_epoch % val_interval == 0:
+                        val_loss, val_cat_losses = self._validate(val_loader, use_rope=use_rope)
+                        history["val_loss"].append(val_loss)
+                        if "val_category_loss" in history:
+                            history["val_category_loss"].append(val_cat_losses)
 
-            bad_epochs = 0
-            stage_stopped_early = False
+                        if val_loss < (self.best_val_loss - min_delta):
+                            self.best_val_loss = val_loss
+                            bad_epochs = 0
+                            self._save_checkpoint(f"{ckpt_prefix}best.pt")
+                        elif val_loss < self.best_val_loss:
+                            # Improved but below min_delta threshold
+                            self.best_val_loss = val_loss
+                            bad_epochs += 1
+                            self._save_checkpoint(f"{ckpt_prefix}best.pt")
+                        else:
+                            bad_epochs += 1
 
-            for stage_ep in range(1, stage_epochs + 1):
-                global_epoch = stage_start_global + stage_ep
-                if global_epoch < start_epoch:
-                    continue  # Skip already-completed epochs
+                    if global_epoch % log_interval == 0:
+                        msg = f"{phase_tag}Epoch {global_epoch}/{total_epochs} | train_loss={train_loss:.4f}"
+                        if len(stages) > 1:
+                            msg += f" | seq_len={stage_seq_len} | batch_size={self.batch_size}"
+                        if train_cat_losses:
+                            msg += self._format_category_losses(train_cat_losses, label="train_cat")
+                        if val_loss is not None:
+                            msg += f" | val_loss={val_loss:.4f}"
+                            if val_cat_losses:
+                                msg += self._format_category_losses(val_cat_losses, label="val_cat")
+                        msg += f" | lr={scheduler.get_last_lr()[0]:.6f}"
+                        logger.info(msg)
 
-                self.epoch = global_epoch
-                train_loss, train_cat_losses = self._train_epoch(train_loader, use_rope=use_rope)
-                history["train_loss"].append(train_loss)
-                history["lr"].append(scheduler.get_last_lr()[0])
-                if "train_category_loss" in history:
-                    history["train_category_loss"].append(train_cat_losses)
+                    if progress_callback:
+                        progress_callback(global_epoch, train_loss, val_loss)
 
-                scheduler.step()
+                    # Save after every epoch so training can be stopped at any time
+                    self._save_checkpoint(f"{ckpt_prefix}latest.pt")
 
-                val_loss = None
-                val_cat_losses: dict[str, float | None] = {}
-                if val_loader and global_epoch % val_interval == 0:
-                    val_loss, val_cat_losses = self._validate(val_loader, use_rope=use_rope)
-                    history["val_loss"].append(val_loss)
-                    if "val_category_loss" in history:
-                        history["val_category_loss"].append(val_cat_losses)
+                    if early_stop and stage_ep >= min_epochs and bad_epochs >= patience:
+                        stop_reason = (
+                            f"early_stop(stage={stage_idx+1}, patience={patience}, min_delta={min_delta})"
+                        )
+                        logger.info(f"{phase_tag}Early stop at epoch {global_epoch}: {stop_reason}")
+                        stage_stopped_early = True
+                        break
 
-                    if val_loss < (self.best_val_loss - min_delta):
-                        self.best_val_loss = val_loss
-                        bad_epochs = 0
-                        self._save_checkpoint(f"{ckpt_prefix}best.pt")
-                    elif val_loss < self.best_val_loss:
-                        # Improved but below min_delta threshold
-                        self.best_val_loss = val_loss
-                        bad_epochs += 1
-                        self._save_checkpoint(f"{ckpt_prefix}best.pt")
-                    else:
-                        bad_epochs += 1
-
-                if global_epoch % log_interval == 0:
-                    msg = f"{phase_tag}Epoch {global_epoch}/{total_epochs} | train_loss={train_loss:.4f}"
-                    if len(stages) > 1:
-                        msg += f" | seq_len={stage_seq_len}"
-                    if train_cat_losses:
-                        msg += self._format_category_losses(train_cat_losses, label="train_cat")
-                    if val_loss is not None:
-                        msg += f" | val_loss={val_loss:.4f}"
-                        if val_cat_losses:
-                            msg += self._format_category_losses(val_cat_losses, label="val_cat")
-                    msg += f" | lr={scheduler.get_last_lr()[0]:.6f}"
-                    logger.info(msg)
-
-                if progress_callback:
-                    progress_callback(global_epoch, train_loss, val_loss)
-
-                # Save after every epoch so training can be stopped at any time
-                self._save_checkpoint(f"{ckpt_prefix}latest.pt")
-
-                if early_stop and stage_ep >= min_epochs and bad_epochs >= patience:
-                    stop_reason = (
-                        f"early_stop(stage={stage_idx+1}, patience={patience}, min_delta={min_delta})"
-                    )
-                    logger.info(f"{phase_tag}Early stop at epoch {global_epoch}: {stop_reason}")
-                    stage_stopped_early = True
-                    break
-
-            # Save stage checkpoint
-            if len(stages) > 1:
-                self._save_checkpoint(f"{ckpt_prefix}stage{stage_idx+1}.pt")
+                # Save stage checkpoint
+                if len(stages) > 1:
+                    self._save_checkpoint(f"{ckpt_prefix}stage{stage_idx+1}.pt")
+        finally:
+            self.batch_size = base_batch_size
 
         # Save final checkpoint
         self._save_checkpoint(f"{ckpt_prefix}final.pt")
@@ -1151,6 +1253,16 @@ class Trainer:
             config.looplm_kl_beta = 0.1
         if not hasattr(config, "looplm_exit_threshold"):
             config.looplm_exit_threshold = 0.5
+        if not hasattr(config, "num_front_layers"):
+            config.num_front_layers = 0
+        if not hasattr(config, "num_loop_layers"):
+            config.num_loop_layers = config.num_layers
+        if not hasattr(config, "num_back_layers"):
+            config.num_back_layers = 0
+        if not hasattr(config, "loop_step_embedding"):
+            config.loop_step_embedding = True
+        if not hasattr(config, "loop_per_step_norms"):
+            config.loop_per_step_norms = False
 
         # Override max_seq_len for context-length extension.  Positional
         # embedding caches are registered as non-persistent buffers so they

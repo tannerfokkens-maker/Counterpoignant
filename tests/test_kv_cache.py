@@ -28,6 +28,8 @@ def _tiny_config(**overrides) -> ModelConfig:
         dropout=0.0,
         weight_tying=False,
         pos_encoding="rope",
+        num_recurrent_steps=1,
+        looplm_exit_gate=False,
     )
     defaults.update(overrides)
     return ModelConfig(**defaults)

@@ -296,9 +296,10 @@ def compute_exit_distribution(
 class BachTransformer(nn.Module):
     """Small decoder-only Transformer for music generation.
 
-    When ``config.num_recurrent_steps > 1``, the same layer stack is applied
-    multiple times (LoopLM / Ouro architecture), trading unique parameters
-    for effective depth.
+    When ``config.num_recurrent_steps > 1``, block-LoopLM applies:
+    ``front_layers`` once, ``loop_layers`` recurrently, and ``back_layers``
+    once for final decoding. This keeps recurrence focused on an internal
+    refinement block instead of the full transformer stack.
     """
 
     def __init__(self, config: ModelConfig):
@@ -326,9 +327,15 @@ class BachTransformer(nn.Module):
 
         self.embed_dropout = nn.Dropout(config.dropout)
 
-        # Transformer decoder layers
-        self.layers = nn.ModuleList([
-            TransformerBlock(config) for _ in range(config.num_layers)
+        # Transformer decoder layers split into front / recurrent core / back.
+        self.front_layers = nn.ModuleList([
+            TransformerBlock(config) for _ in range(config.num_front_layers)
+        ])
+        self.loop_layers = nn.ModuleList([
+            TransformerBlock(config) for _ in range(config.num_loop_layers)
+        ])
+        self.back_layers = nn.ModuleList([
+            TransformerBlock(config) for _ in range(config.num_back_layers)
         ])
 
         self.ln_final = RMSNorm(config.embed_dim)
@@ -346,6 +353,11 @@ class BachTransformer(nn.Module):
         else:
             self.exit_gate = None
 
+        if config.loop_step_embedding and config.num_recurrent_steps > 1:
+            self.loop_step_embed = nn.Embedding(config.num_recurrent_steps, config.embed_dim)
+        else:
+            self.loop_step_embed = None
+
         self.apply(self._init_weights)
 
     def _init_weights(self, module: nn.Module) -> None:
@@ -360,6 +372,11 @@ class BachTransformer(nn.Module):
     # ------------------------------------------------------------------ #
     #  Forward
     # ------------------------------------------------------------------ #
+
+    @property
+    def layers(self) -> tuple[TransformerBlock, ...]:
+        """Compatibility view of the full layer stack in execution order."""
+        return tuple(self.front_layers) + tuple(self.loop_layers) + tuple(self.back_layers)
 
     def forward(
         self,
@@ -441,6 +458,113 @@ class BachTransformer(nn.Module):
             return_all_steps,
         )
 
+    def _split_kv_cache(
+        self,
+        kv_cache: list[KVCache] | None,
+    ) -> tuple[list[KVCache] | None, list[KVCache] | None, list[KVCache] | None]:
+        """Slice the flat cache list into front / loop / back ranges."""
+        if kv_cache is None:
+            return None, None, None
+        if len(kv_cache) != self.config.num_layers:
+            raise ValueError(
+                f"Expected {self.config.num_layers} KV caches, got {len(kv_cache)}"
+            )
+
+        front_len = len(self.front_layers)
+        loop_len = len(self.loop_layers)
+        front = kv_cache[:front_len]
+        loop = kv_cache[front_len:front_len + loop_len]
+        back = kv_cache[front_len + loop_len:]
+        return front, loop, back
+
+    @staticmethod
+    def _merge_kv_cache_groups(*groups: list[KVCache]) -> list[KVCache]:
+        merged: list[KVCache] = []
+        for group in groups:
+            merged.extend(group)
+        return merged
+
+    def _run_layer_stack(
+        self,
+        layers: nn.ModuleList,
+        x: torch.Tensor,
+        causal_mask: torch.Tensor | None,
+        pad_mask: torch.Tensor | None,
+        cos: torch.Tensor | None,
+        sin: torch.Tensor | None,
+        use_pos: bool,
+        attn_temperature: float | None,
+        use_cache: bool = False,
+        kv_cache: list[KVCache] | None = None,
+        cache_read_only: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, list[KVCache]]:
+        """Run an arbitrary transformer stack with optional KV cache support."""
+        if kv_cache is not None and len(kv_cache) != len(layers):
+            raise ValueError(
+                f"Expected {len(layers)} layer caches, got {len(kv_cache)}"
+            )
+
+        new_caches: list[KVCache] = []
+        for i, layer in enumerate(layers):
+            layer_cache = kv_cache[i] if kv_cache is not None else None
+            layer_out = layer(
+                x,
+                causal_mask=causal_mask,
+                pad_mask=pad_mask,
+                cos=cos,
+                sin=sin,
+                use_pos=use_pos,
+                attn_temperature=attn_temperature,
+                kv_cache=layer_cache,
+                use_cache=use_cache,
+                cache_read_only=cache_read_only,
+            )
+            if use_cache:
+                x, layer_new_cache = layer_out
+                new_caches.append(layer_new_cache)
+            else:
+                x = layer_out
+
+        if use_cache:
+            return x, new_caches
+        return x
+
+    def _decode_from_core(
+        self,
+        core_state: torch.Tensor,
+        causal_mask: torch.Tensor | None,
+        pad_mask: torch.Tensor | None,
+        cos: torch.Tensor | None,
+        sin: torch.Tensor | None,
+        use_pos: bool,
+        attn_temperature: float | None,
+        use_cache: bool = False,
+        kv_cache: list[KVCache] | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, list[KVCache]]:
+        """Decode logits from the recurrent core state via back layers."""
+        back_out = self._run_layer_stack(
+            self.back_layers,
+            core_state,
+            causal_mask,
+            pad_mask,
+            cos,
+            sin,
+            use_pos,
+            attn_temperature,
+            use_cache=use_cache,
+            kv_cache=kv_cache,
+        )
+        if use_cache:
+            decoded, new_caches = back_out
+        else:
+            decoded = back_out
+            new_caches = []
+
+        logits = self.head(self.ln_final(decoded))
+        if use_cache:
+            return logits, new_caches
+        return logits
+
     def _forward_single(
         self,
         x: torch.Tensor,
@@ -454,26 +578,63 @@ class BachTransformer(nn.Module):
         kv_cache: list[KVCache] | None,
     ) -> torch.Tensor | tuple[torch.Tensor, list[KVCache]]:
         """Standard single-pass forward (no recurrence)."""
-        new_caches: list[KVCache] = []
-        for i, layer in enumerate(self.layers):
-            layer_cache = kv_cache[i] if kv_cache is not None else None
-            layer_out = layer(
-                x, causal_mask=causal_mask, pad_mask=pad_mask,
-                cos=cos, sin=sin, use_pos=use_pos,
-                attn_temperature=attn_temperature,
-                kv_cache=layer_cache, use_cache=use_cache,
-            )
-            if use_cache:
-                x, layer_new_cache = layer_out
-                new_caches.append(layer_new_cache)
-            else:
-                x = layer_out
+        front_cache, loop_cache, back_cache = self._split_kv_cache(kv_cache)
 
-        x = self.ln_final(x)
-        logits = self.head(x)
+        front_out = self._run_layer_stack(
+            self.front_layers,
+            x,
+            causal_mask,
+            pad_mask,
+            cos,
+            sin,
+            use_pos,
+            attn_temperature,
+            use_cache=use_cache,
+            kv_cache=front_cache,
+        )
+        if use_cache:
+            x, front_new = front_out
+        else:
+            x = front_out
+            front_new = []
+
+        loop_out = self._run_layer_stack(
+            self.loop_layers,
+            x,
+            causal_mask,
+            pad_mask,
+            cos,
+            sin,
+            use_pos,
+            attn_temperature,
+            use_cache=use_cache,
+            kv_cache=loop_cache,
+        )
+        if use_cache:
+            x, loop_new = loop_out
+        else:
+            x = loop_out
+            loop_new = []
+
+        decoded = self._decode_from_core(
+            x,
+            causal_mask,
+            pad_mask,
+            cos,
+            sin,
+            use_pos,
+            attn_temperature,
+            use_cache=use_cache,
+            kv_cache=back_cache,
+        )
+        if use_cache:
+            logits, back_new = decoded
+        else:
+            logits = decoded
+            back_new = []
 
         if use_cache:
-            return logits, new_caches
+            return logits, self._merge_kv_cache_groups(front_new, loop_new, back_new)
         return logits
 
     def _forward_looped(
@@ -489,13 +650,13 @@ class BachTransformer(nn.Module):
         kv_cache: list[KVCache] | None,
         return_all_steps: bool,
     ) -> torch.Tensor | tuple[torch.Tensor, list[KVCache]] | LoopLMOutput:
-        """LoopLM recurrent forward: apply layer stack T_max times.
+        """Block-LoopLM recurrent forward: loop only the middle core stack.
 
         KV-cache strategy (``last-step reuse`` from the Ouro paper):
         - Non-final recurrent steps READ from the cache but do NOT write.
-        - The final recurrent step reads AND writes, updating the cache.
-        This keeps memory cost identical to a standard transformer while
-        allowing all recurrent steps to attend to previous positions.
+        - The selected/final recurrent step reads AND writes, updating the
+          loop-block cache once.
+        Front and back stacks behave like normal transformer stacks.
 
         Adaptive early exit (inference only):
         When ``self.exit_gate`` is not None and the model is in eval mode,
@@ -506,7 +667,7 @@ class BachTransformer(nn.Module):
 
         all_logits: list[torch.Tensor] = []
         exit_lambdas: list[torch.Tensor] = []
-        new_caches: list[KVCache] = []
+        front_cache, loop_cache, back_cache = self._split_kv_cache(kv_cache)
 
         # Adaptive exit tracking (inference only)
         adaptive_exit = (
@@ -516,63 +677,80 @@ class BachTransformer(nn.Module):
             and self.config.looplm_exit_threshold < 1.0
         )
         cumulative_mass: torch.Tensor | None = None  # (B, S)
-        exit_logits: torch.Tensor | None = None
+        front_out = self._run_layer_stack(
+            self.front_layers,
+            x,
+            causal_mask,
+            pad_mask,
+            cos,
+            sin,
+            use_pos,
+            attn_temperature,
+            use_cache=use_cache,
+            kv_cache=front_cache,
+        )
+        if use_cache:
+            x, front_new = front_out
+        else:
+            x = front_out
+            front_new = []
 
-        def run_recurrent_step(
-            step_x: torch.Tensor,
+        core_state = x
+        loop_new: list[KVCache] = []
+
+        def run_loop_step(
+            step_input: torch.Tensor,
             write_cache: bool,
-        ) -> torch.Tensor:
-            """Run one recurrent pass, optionally materializing KV cache."""
-            for i, layer in enumerate(self.layers):
-                layer_cache = kv_cache[i] if kv_cache is not None else None
-
-                if write_cache:
-                    layer_out = layer(
-                        step_x, causal_mask=causal_mask, pad_mask=pad_mask,
-                        cos=cos, sin=sin, use_pos=use_pos,
-                        attn_temperature=attn_temperature,
-                        kv_cache=layer_cache, use_cache=True,
-                    )
-                    step_x, lc = layer_out
-                    if len(new_caches) <= i:
-                        new_caches.append(lc)
-                    else:
-                        new_caches[i] = lc
-                elif kv_cache is not None:
-                    step_x = layer(
-                        step_x, causal_mask=causal_mask, pad_mask=pad_mask,
-                        cos=cos, sin=sin, use_pos=use_pos,
-                        attn_temperature=attn_temperature,
-                        kv_cache=layer_cache, use_cache=False,
-                        cache_read_only=True,
-                    )
-                else:
-                    step_x = layer(
-                        step_x, causal_mask=causal_mask, pad_mask=pad_mask,
-                        cos=cos, sin=sin, use_pos=use_pos,
-                        attn_temperature=attn_temperature,
-                    )
-            return step_x
+        ) -> torch.Tensor | tuple[torch.Tensor, list[KVCache]]:
+            """Run one recurrent core pass, optionally materializing loop cache."""
+            return self._run_layer_stack(
+                self.loop_layers,
+                step_input,
+                causal_mask,
+                pad_mask,
+                cos,
+                sin,
+                use_pos,
+                attn_temperature,
+                use_cache=write_cache,
+                kv_cache=loop_cache,
+                cache_read_only=(not write_cache and loop_cache is not None),
+            )
 
         for t in range(T_max):
             is_last = (t == T_max - 1)
-            step_input = x
-            x = run_recurrent_step(step_input, write_cache=use_cache and is_last)
+            step_input = core_state
+            if self.loop_step_embed is not None:
+                step_input = step_input + self.loop_step_embed.weight[t].view(1, 1, -1)
+
+            loop_out = run_loop_step(step_input, write_cache=use_cache and is_last)
+            if use_cache and is_last:
+                core_state, loop_new = loop_out
+            else:
+                core_state = loop_out
 
             # --- Per-step logits & gate ---
             if return_all_steps:
-                step_logits = self.head(self.ln_final(x))
+                step_logits = self._decode_from_core(
+                    core_state,
+                    causal_mask,
+                    pad_mask,
+                    cos,
+                    sin,
+                    use_pos,
+                    attn_temperature,
+                )
                 all_logits.append(step_logits)
 
                 # Only compute gate for steps 0..T-2; final step gets
                 # remaining survival mass — its lambda is unused.
                 if self.exit_gate is not None and not is_last:
-                    lam = torch.sigmoid(self.exit_gate(x)).squeeze(-1)  # (B, S)
+                    lam = torch.sigmoid(self.exit_gate(core_state)).squeeze(-1)  # (B, S)
                     exit_lambdas.append(lam)
 
             # --- Adaptive early exit at inference ---
-            if adaptive_exit and not is_last and exit_logits is None:
-                lam = torch.sigmoid(self.exit_gate(x)).squeeze(-1)  # (B, S)
+            if adaptive_exit and not is_last:
+                lam = torch.sigmoid(self.exit_gate(core_state)).squeeze(-1)  # (B, S)
                 if cumulative_mass is None:
                     cumulative_mass = lam
                 else:
@@ -580,17 +758,26 @@ class BachTransformer(nn.Module):
                     cumulative_mass = cumulative_mass + lam * (1.0 - cumulative_mass)
 
                 if (cumulative_mass >= self.config.looplm_exit_threshold).all():
-                    exit_logits = self.head(self.ln_final(x))
                     if use_cache:
-                        # Cache writes only happen once; rerun the triggering
-                        # step with cache materialization so future decode steps
-                        # match the early-exit depth.
-                        x = run_recurrent_step(step_input, write_cache=True)
+                        core_state, loop_new = run_loop_step(step_input, write_cache=True)
                     break
 
-        # Final logits: use early-exit logits if available, else last step
-        final_h = self.ln_final(x)
-        final_logits = self.head(final_h)
+        decoded = self._decode_from_core(
+            core_state,
+            causal_mask,
+            pad_mask,
+            cos,
+            sin,
+            use_pos,
+            attn_temperature,
+            use_cache=use_cache,
+            kv_cache=back_cache,
+        )
+        if use_cache:
+            final_logits, back_new = decoded
+        else:
+            final_logits = decoded
+            back_new = []
 
         if return_all_steps:
             # Replace last entry with final_logits (avoids redundant ln_final + head)
@@ -602,12 +789,9 @@ class BachTransformer(nn.Module):
                 exit_lambdas=exit_lambdas,
             )
 
-        # Use early-exit logits when available (adaptive depth)
-        output_logits = exit_logits if exit_logits is not None else final_logits
-
         if use_cache:
-            return output_logits, new_caches
-        return output_logits
+            return final_logits, self._merge_kv_cache_groups(front_new, loop_new, back_new)
+        return final_logits
 
     def count_parameters(self) -> int:
         """Count actual trainable parameters."""
