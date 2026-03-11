@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import random
+import re
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
@@ -21,6 +22,7 @@ from bach_gen.utils.constants import (
     METER_MAP, LENGTH_NAMES, METER_NAMES,
     compute_measure_count, length_bucket, DEFAULT_PREPARE_COMPOSER_FILTER,
     DEFAULT_EMBED_DIM, DEFAULT_NUM_HEADS, DEFAULT_NUM_LAYERS,
+    bwv_to_form,
 )
 
 console = Console()
@@ -230,6 +232,49 @@ def _infer_roundtrip_settings(seq: list[int], tokenizer, default_form: str) -> t
         elif name.startswith("KEY_"):
             break
     return form, encoding_mode
+
+
+def _infer_evaluate_mode(source: str, num_tracks: int) -> str:
+    """Infer evaluation form from the source path before falling back to voice count."""
+    source_lower = source.lower().replace("\\", "/")
+
+    bwv_match = re.search(r"bwv[-_\s]?(\d+)", source_lower, re.IGNORECASE)
+    if bwv_match:
+        bwv_num = int(bwv_match.group(1))
+        form = bwv_to_form(bwv_num)
+        if form is not None:
+            return form
+
+    keyword_map = [
+        ("artfugue", "fugue"),
+        ("wtc1f", "fugue"),
+        ("wtc2f", "fugue"),
+        ("fugue", "fugue"),
+        ("three-part_inventions", "sinfonia"),
+        ("three-part-inventions", "sinfonia"),
+        ("three_part_inventions", "sinfonia"),
+        ("sinfonia", "sinfonia"),
+        ("two-part_inventions", "invention"),
+        ("two-part-inventions", "invention"),
+        ("two_part_inventions", "invention"),
+        ("invention", "invention"),
+        ("chorale", "chorale"),
+    ]
+    for keyword, form in keyword_map:
+        if keyword in source_lower:
+            return form
+
+    filename = Path(source_lower).name
+    if re.search(r"(^|[_\-.])chor\d+", filename):
+        return "chorale"
+
+    if num_tracks == 2:
+        return "2-part"
+    if num_tracks == 3:
+        return "sinfonia"
+    if num_tracks >= 4:
+        return "chorale"
+    return "2-part"
 
 
 def _build_token_category_map(tokenizer) -> tuple[list[int], list[str]]:
@@ -2114,17 +2159,10 @@ def evaluate(
         console.print("[red]Need at least 2 voices/tracks in the MIDI file.[/red]")
         sys.exit(1)
 
-    # Auto-detect mode from number of tracks
+    # Auto-detect mode from filename/BWV cues first, then fall back to track count.
     num_tracks = len(tracks)
     if mode is None:
-        if num_tracks == 2:
-            mode = "2-part"
-        elif num_tracks == 3:
-            mode = "sinfonia"
-        elif num_tracks >= 4:
-            mode = "chorale"
-        else:
-            mode = "2-part"
+        mode = _infer_evaluate_mode(midi_file, num_tracks)
 
     # Detect key from all voices
     pc_counts = np.zeros(12)

@@ -1,0 +1,59 @@
+{
+  "description": "Canonical Bach benchmark groups for form-aware evaluation regression.",
+  "groups": [
+    {
+      "name": "art_of_fugue",
+      "form": "fugue",
+      "kind": "gold",
+      "patterns": [
+        "data/midi/all/bach/kernscores__artfugue-*.krn.fromscore.mid"
+      ],
+      "expected_count": 20
+    },
+    {
+      "name": "wtc1_fugues",
+      "form": "fugue",
+      "kind": "gold",
+      "patterns": [
+        "data/midi/all/bach/kernscores__wtc1f*.krn.fromscore.mid"
+      ],
+      "expected_count": 24
+    },
+    {
+      "name": "wtc2_fugues",
+      "form": "fugue",
+      "kind": "gold",
+      "patterns": [
+        "data/midi/all/bach/kernscores__wtc2f*.krn.fromscore.mid"
+      ],
+      "expected_count": 24
+    },
+    {
+      "name": "two_part_inventions",
+      "form": "invention",
+      "kind": "gold",
+      "patterns": [
+        "data/midi/all/bach/kunstderfuge__bach-js_two-part_inventions_*_(c)icking-archive.mid"
+      ],
+      "expected_count": 15
+    },
+    {
+      "name": "sinfonias",
+      "form": "sinfonia",
+      "kind": "gold",
+      "patterns": [
+        "data/midi/all/bach/kunstderfuge__bach-js_three-part_inventions_*_(c)icking-archive.mid"
+      ],
+      "expected_count": 15
+    },
+    {
+      "name": "chorales",
+      "form": "chorale",
+      "kind": "gold",
+      "patterns": [
+        "data/midi/all/bach/kernscores__chor*.krn.fromscore.mid"
+      ],
+      "expected_count": 370
+    }
+  ]
+}

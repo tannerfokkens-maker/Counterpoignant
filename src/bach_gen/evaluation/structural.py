@@ -79,7 +79,12 @@ def score_structural(item: VoicePair | VoiceComposition) -> tuple[float, dict]:
 
 
 def _score_length(voices: list[list[tuple[int, int, int]]]) -> float:
-    """Score based on piece length (prefer 20-60 bars)."""
+    """Score based on piece length.
+
+    Short snippets should score poorly, but extended contrapuntal works
+    (especially fugues) should not be heavily penalized simply for running
+    past 60 bars.
+    """
     all_notes = [n for v in voices for n in v]
     if not all_notes:
         return 0.0
@@ -91,10 +96,10 @@ def _score_length(voices: list[list[tuple[int, int, int]]]) -> float:
         return 0.1
     elif bars < 12:
         return 0.3 + 0.4 * (bars - 4) / 8
-    elif bars <= 60:
+    elif bars <= 80:
         return 0.8 + 0.2 * min(1, (bars - 12) / 20)
     else:
-        return max(0.5, 1.0 - (bars - 60) / 60)
+        return max(0.75, 1.0 - (bars - 80) / 320)
 
 
 def _score_key_consistency(
@@ -499,6 +504,7 @@ def _extract_subject_notes(
     # Take notes until first significant gap or up to default_bars bars
     cutoff_tick = earliest_time + default_bars * TICKS_PER_QUARTER * 4
     gap_threshold = TICKS_PER_QUARTER  # quarter note gap = phrase break
+    min_subject_notes = 5
 
     subject = []
     for i, (start, dur, pitch) in enumerate(sorted_voice):
@@ -510,8 +516,20 @@ def _extract_subject_notes(
         if i + 1 < len(sorted_voice):
             note_end = start + dur
             next_start = sorted_voice[i + 1][0]
-            if next_start - note_end >= gap_threshold and len(subject) >= 3:
+            if next_start - note_end >= gap_threshold and len(subject) >= min_subject_notes:
                 break  # phrase boundary
+
+    # Sparse openings in longer fugue subjects can hit an early rest before the
+    # subject is musically informative. Extend modestly rather than returning a
+    # too-short motif that thematic recall cannot match later on.
+    if len(subject) < 4:
+        extended_cutoff = earliest_time + (default_bars + 1) * TICKS_PER_QUARTER * 4
+        for start, dur, pitch in sorted_voice[len(subject):]:
+            if start > extended_cutoff:
+                break
+            subject.append((start, dur, pitch))
+            if len(subject) >= min_subject_notes:
+                break
 
     return subject
 
@@ -549,7 +567,7 @@ def score_thematic_recall(
         return 0.0
 
     # Build fragment sets grouped by length.
-    frag_lengths = list(range(min(4, len(subj_intervals)), min(7, len(subj_intervals) + 1)))
+    frag_lengths = list(range(min(3, len(subj_intervals)), min(7, len(subj_intervals) + 1)))
     subj_frags_by_len: dict[int, set[tuple[int, ...]]] = {}
     inv_frags_by_len: dict[int, set[tuple[int, ...]]] = {}
     retro_frags_by_len: dict[int, set[tuple[int, ...]]] = {}
@@ -577,7 +595,14 @@ def score_thematic_recall(
     min_tick = min(n[0] for n in all_notes)
     max_tick = max(n[0] + n[1] for n in all_notes)
     total_duration = max_tick - min_tick
-    late_cutoff = min_tick + total_duration * 0.25
+    bar_ticks = TICKS_PER_QUARTER * 4
+    if total_duration >= 40 * bar_ticks:
+        late_cutoff_ratio = 0.15
+    elif total_duration >= 24 * bar_ticks:
+        late_cutoff_ratio = 0.20
+    else:
+        late_cutoff_ratio = 0.25
+    late_cutoff = min_tick + total_duration * late_cutoff_ratio
 
     # Search all voices past the cutoff with local deduplication to avoid
     # counting many near-identical sliding-window hits as separate entries.

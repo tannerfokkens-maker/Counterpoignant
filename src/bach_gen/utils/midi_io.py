@@ -85,9 +85,15 @@ def load_midi(path: str | Path) -> mido.MidiFile:
 def midi_to_note_events(mid: mido.MidiFile) -> list[list[tuple[int, int, int]]]:
     """Extract note events from a MIDI file.
 
+    Imported MIDI files can use arbitrary ``ticks_per_beat`` values. The rest
+    of the codebase assumes the internal 480-ticks-per-quarter grid defined by
+    ``TICKS_PER_QUARTER``, so imported events are normalized onto that grid.
+
     Returns:
         List of tracks, each track is a list of (start_tick, duration_tick, pitch).
     """
+    tick_scale = TICKS_PER_QUARTER / max(1, mid.ticks_per_beat)
+
     all_tracks = []
     for track in mid.tracks:
         notes: list[tuple[int, int, int]] = []
@@ -100,9 +106,11 @@ def midi_to_note_events(mid: mido.MidiFile) -> list[list[tuple[int, int, int]]]:
                 active[msg.note] = current_tick
             elif msg.type == "note_off" or (msg.type == "note_on" and msg.velocity == 0):
                 if msg.note in active:
-                    start = active.pop(msg.note)
-                    dur = current_tick - start
-                    if dur > 0:
+                    raw_start = active.pop(msg.note)
+                    raw_dur = current_tick - raw_start
+                    if raw_dur > 0:
+                        start = int(round(raw_start * tick_scale))
+                        dur = max(1, int(round(raw_dur * tick_scale)))
                         notes.append((start, dur, msg.note))
 
         if notes:

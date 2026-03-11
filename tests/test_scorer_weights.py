@@ -169,3 +169,32 @@ def test_invention_interaction_adjustment_prefers_rhetorical_flow():
     assert rhetorical_delta > flat_delta
     assert "invention_clean_but_flat" in flat_flags
     assert "invention_strong_rhetorical_shape" in rhetorical_flags
+
+
+def test_fugue_guardrail_does_not_require_four_voices() -> None:
+    comp = VoiceComposition(
+        voices=[
+            [(i * 480, 480, 72 - (i % 5)) for i in range(12)],
+            [(i * 480, 480, 67 - (i % 4)) for i in range(12)],
+            [(i * 480, 480, 60 + (i % 3)) for i in range(12)],
+        ],
+        key_root=0,
+        key_mode="minor",
+        source="unit-test",
+    )
+
+    mult, flags = scorer._guardrail_multiplier(
+        form="fugue",
+        comp=comp,
+        voice_leading=0.9,
+        structural_details={"cadence": 0.7},
+        contrapuntal_details={
+            "onset_staggering": 0.75,
+            "voice_independence": 0.9,
+            "voice_balance": 0.8,
+        },
+        completeness=0.9,
+    )
+
+    assert mult == 1.0
+    assert "fugue_missing_voice" not in flags

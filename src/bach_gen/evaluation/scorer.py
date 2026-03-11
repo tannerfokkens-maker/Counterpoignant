@@ -247,17 +247,16 @@ def _guardrail_multiplier(
         if total_notes < 32:
             return mult, flags
 
-        non_empty = sum(1 for v in comp.voices if v)
         cadence = float(structural_details.get("cadence", 0.0))
         onset_stagger = float(contrapuntal_details.get("onset_staggering", 0.0))
         voice_indep = float(contrapuntal_details.get("voice_independence", 0.0))
         voice_balance = float(contrapuntal_details.get("voice_balance", 1.0))
 
-        if non_empty < 4:
-            mult *= 0.70
-            flags.append("fugue_missing_voice")
-        if cadence < 0.45:
+        if cadence < 0.18:
             mult *= 0.85
+            flags.append("fugue_weak_cadence")
+        elif cadence < 0.30:
+            mult *= 0.92
             flags.append("fugue_weak_cadence")
         if voice_balance < 0.35:
             mult *= 0.75
@@ -358,7 +357,12 @@ def _interaction_adjustment(
 
     # Penalize "clean but flat" outputs.
     vl_floor, phrase_floor, contrary_floor, clean_penalty, clean_flag = profile["clean_flat"]  # type: ignore[index]
-    if voice_leading >= vl_floor and (phrase < phrase_floor or contrary < contrary_floor):
+    cadence_flat_ceiling = 0.62 if form == "fugue" else 1.01
+    if (
+        voice_leading >= vl_floor
+        and cadence < cadence_flat_ceiling
+        and (phrase < phrase_floor or contrary < contrary_floor)
+    ):
         delta += clean_penalty
         flags.append(str(clean_flag))
 
@@ -371,11 +375,13 @@ def _interaction_adjustment(
         safe_penalty,
         safe_flag,
     ) = profile["safe_homog"]  # type: ignore[index]
+    cadence_safe_ceiling = 0.68 if form == "fugue" else 1.01
     if (
         voice_leading >= vl_safe_floor
         and voice_indep < indep_floor
         and onset_stagger < onset_floor
         and contrary < contrary_safe_floor
+        and cadence < cadence_safe_ceiling
     ):
         delta += safe_penalty
         flags.append(str(safe_flag))
