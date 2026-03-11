@@ -48,6 +48,37 @@ class ModelConfig:
     loop_per_step_norms: bool = False  # Placeholder for future untied per-step norms
 
     def __post_init__(self) -> None:
+        self._validate_and_normalize()
+
+    def __setstate__(self, state: dict[str, object]) -> None:
+        self.__dict__.update(state)
+        self.apply_checkpoint_compat()
+
+    def apply_checkpoint_compat(self) -> None:
+        """Backfill fields missing from older checkpoint configs, then validate."""
+        state = vars(self)
+        legacy_defaults = {
+            "pos_encoding": "rope",
+            "num_kv_heads": None,
+            "rel_attn_bias": False,
+            "rel_attn_max_distance": 2048,
+            "num_recurrent_steps": 1,
+            "looplm_sandwich_norm": False,
+            "looplm_exit_gate": False,
+            "looplm_kl_beta": 0.1,
+            "looplm_exit_threshold": 0.5,
+            "num_front_layers": 0,
+            "num_loop_layers": self.num_layers,
+            "num_back_layers": 0,
+            "loop_step_embedding": True,
+            "loop_per_step_norms": False,
+        }
+        for name, value in legacy_defaults.items():
+            if name not in state:
+                setattr(self, name, value)
+        self._validate_and_normalize()
+
+    def _validate_and_normalize(self) -> None:
         if self.num_layers < 1:
             raise ValueError("num_layers must be >= 1")
         if self.num_recurrent_steps < 1:

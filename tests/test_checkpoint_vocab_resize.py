@@ -42,6 +42,21 @@ def _tiny_config_with_rel_bias(vocab_size: int, enabled: bool) -> ModelConfig:
     )
 
 
+def _tiny_looplm_config(vocab_size: int) -> ModelConfig:
+    return ModelConfig(
+        vocab_size=vocab_size,
+        embed_dim=32,
+        num_heads=2,
+        num_layers=2,
+        ffn_dim=64,
+        max_seq_len=16,
+        dropout=0.0,
+        pos_encoding="pope",
+        num_recurrent_steps=3,
+        looplm_exit_gate=True,
+    )
+
+
 def test_tokenizer_uses_subject_boundary_slots_without_subj_aliases():
     tokenizer = BachTokenizer()
 
@@ -145,3 +160,46 @@ def test_resume_from_checkpoint_drops_unexpected_relative_bias(tmp_path):
     next_epoch = trainer_big.resume_from_checkpoint(tmp_path / "with_bias.pt")
 
     assert next_epoch == 1
+
+
+def test_load_checkpoint_normalizes_legacy_flat_layer_stack(tmp_path):
+    vocab_size = BachTokenizer().vocab_size
+    model = BachTransformer(_tiny_looplm_config(vocab_size))
+    state_dict = {}
+    for key, value in model.state_dict().items():
+        if key.startswith("loop_layers."):
+            flat_key = key.replace("loop_layers.", "layers.", 1)
+            state_dict[flat_key] = value.detach().clone()
+        else:
+            state_dict[key] = value.detach().clone()
+
+    legacy_config = _tiny_looplm_config(vocab_size)
+    legacy_config.num_front_layers = 0
+    legacy_config.num_loop_layers = 0
+    legacy_config.num_back_layers = 0
+
+    checkpoint_path = tmp_path / "legacy_flat_layers.pt"
+    torch.save(
+        {
+            "model_state_dict": state_dict,
+            "config": legacy_config,
+            "epoch": 0,
+        },
+        checkpoint_path,
+    )
+
+    loaded_model, loaded_config = Trainer.load_checkpoint(
+        checkpoint_path,
+        device=torch.device("cpu"),
+    )
+
+    assert loaded_config.num_front_layers == 0
+    assert loaded_config.num_loop_layers == loaded_config.num_layers == 2
+    assert loaded_config.num_back_layers == 0
+    assert len(loaded_model.front_layers) == 0
+    assert len(loaded_model.loop_layers) == 2
+    assert len(loaded_model.back_layers) == 0
+    torch.testing.assert_close(
+        loaded_model.state_dict()["loop_layers.0.ln1.weight"],
+        model.state_dict()["loop_layers.0.ln1.weight"],
+    )

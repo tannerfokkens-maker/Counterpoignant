@@ -1232,37 +1232,15 @@ class Trainer:
         device = device or get_device()
         checkpoint = torch.load(path, map_location=device, weights_only=False)
         config = checkpoint["config"]
-        # Backward compat: old checkpoints lack pos_encoding
-        if not hasattr(config, "pos_encoding"):
-            config.pos_encoding = "rope"
-        # Backward compat: old checkpoints lack num_kv_heads
-        if not hasattr(config, "num_kv_heads"):
-            config.num_kv_heads = None
-        if not hasattr(config, "rel_attn_bias"):
-            config.rel_attn_bias = False
-        if not hasattr(config, "rel_attn_max_distance"):
-            config.rel_attn_max_distance = 2048
-        # Backward compat: old checkpoints lack LoopLM fields
-        if not hasattr(config, "num_recurrent_steps"):
-            config.num_recurrent_steps = 1
-        if not hasattr(config, "looplm_sandwich_norm"):
-            config.looplm_sandwich_norm = False
-        if not hasattr(config, "looplm_exit_gate"):
-            config.looplm_exit_gate = False
-        if not hasattr(config, "looplm_kl_beta"):
-            config.looplm_kl_beta = 0.1
-        if not hasattr(config, "looplm_exit_threshold"):
-            config.looplm_exit_threshold = 0.5
-        if not hasattr(config, "num_front_layers"):
-            config.num_front_layers = 0
-        if not hasattr(config, "num_loop_layers"):
-            config.num_loop_layers = config.num_layers
-        if not hasattr(config, "num_back_layers"):
-            config.num_back_layers = 0
-        if not hasattr(config, "loop_step_embedding"):
-            config.loop_step_embedding = True
-        if not hasattr(config, "loop_per_step_norms"):
-            config.loop_per_step_norms = False
+        if isinstance(config, dict):
+            config = ModelConfig(**config)
+        elif isinstance(config, ModelConfig):
+            config.apply_checkpoint_compat()
+        else:
+            raise TypeError(
+                "Checkpoint config must be a ModelConfig or dict, "
+                f"got {type(config)!r}"
+            )
 
         # Override max_seq_len for context-length extension.  Positional
         # embedding caches are registered as non-persistent buffers so they
@@ -1322,7 +1300,10 @@ class Trainer:
             model.state_dict(),
         )
         if reconciled_looplm:
-            logger.info("Reconciled LoopLM weights (exit gate / sandwich norm) during checkpoint load.")
+            logger.info(
+                "Reconciled LoopLM weights (layer stack / exit gate / sandwich norm) "
+                "during checkpoint load."
+            )
 
         model.load_state_dict(state)
         model = model.to(device)
