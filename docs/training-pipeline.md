@@ -75,7 +75,7 @@ The recommended training pipeline is a **three-phase curriculum with staged cont
 
 1. **Pre-train** on the broad corpus (all eras) with progressively increasing context length
 2. **DroPE recalibration** — drop positional embeddings for length generalization
-3. **Fine-tune** on Bach with the same staged context schedule
+3. **Fine-tune** on Bach at the final staged context by default
 
 ### The Command
 
@@ -160,7 +160,7 @@ The flag `"4096:40,8192:25,16384:15"` defines three context-length stages within
 | 2 | 8192 | 25 | Context extension — model adapts to longer dependencies |
 | 3 | 16384 | 15 | Full context — final polish at target length |
 
-At each stage boundary the training loop automatically:
+At each pre-train stage boundary the training loop automatically:
 - Updates the dataset crop window (prefix-preserving: conditioning tokens BOS→KEY are always kept)
 - Extends the positional embedding caches (lazy, no rebuild needed)
 - Resets the cosine LR schedule for the new stage
@@ -186,7 +186,8 @@ At each stage boundary the training loop automatically:
 **Phase 3 — Fine-tune on Bach:**
 - Filters pre-train data to `STYLE_BACH` sequences (via `--finetune bach`)
 - Fresh optimizer at `--finetune-lr`
-- Runs through all `--seq-len-stages` again
+- By default, runs only the final `--seq-len-stages` context
+- Use `--finetune-all-stages` if you want to reuse the full staged schedule
 - Checkpoints: `finetune_best.pt`, `finetune_stage1.pt`, ...
 
 ### Piece Balancing

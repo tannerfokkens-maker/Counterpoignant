@@ -39,7 +39,7 @@ class ModelConfig:
     drope_train_seq_len: int | None = None
 
     # LoopLM: weight-tied recurrence (Ouro / LoopLM architecture)
-    num_recurrent_steps: int = 2  # T_max; 1 = standard transformer, >1 = looped
+    num_recurrent_steps: int = 1  # T_max; 1 = standard transformer, >1 = looped
     looplm_sandwich_norm: bool = False  # RMSNorm after each sublayer for recurrence stability
     looplm_exit_gate: bool = True  # Learned adaptive exit gate
     looplm_kl_beta: float = 0.05  # Entropy regularization coefficient

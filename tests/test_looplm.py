@@ -512,6 +512,10 @@ class TestLoopLMCheckpointCompat:
 class TestModelConfigLoopLM:
     """Test ModelConfig LoopLM-related properties."""
 
+    def test_global_default_is_standard_transformer(self):
+        config = ModelConfig()
+        assert config.num_recurrent_steps == 1
+
     def test_default_no_recurrence(self):
         config = _tiny_config()
         assert config.num_recurrent_steps == 1

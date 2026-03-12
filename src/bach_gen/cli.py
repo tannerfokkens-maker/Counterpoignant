@@ -1117,8 +1117,9 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
 @click.option("--seq-len-stages", default=None, type=str,
               help="Staged context-length training: 'len:epochs,...' "
                    "e.g. '4096:50,8192:30,16384:20'. Overrides --seq-len and --epochs. "
-                   "In curriculum mode the same schedule is reused for both pre-train and fine-tune. "
-                   "During curriculum pre-train, each new stage halves the stage-start LR and batch size.")
+                   "In curriculum mode the full schedule is used for pre-train; by default "
+                   "fine-tune uses only the final stage. During curriculum pre-train, each new "
+                   "stage halves the stage-start LR and batch size.")
 @click.option("--mode", "-m", type=click.Choice(VALID_FORMS), default=None,
               help="Composition mode (auto-detected from data if not set)")
 @click.option("--accumulation-steps", default=1, type=int,
@@ -1139,6 +1140,9 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
               help="Fine-tune subset from same --data-dir (style token or composer substring, e.g. 'bach' or 'beethoven')")
 @click.option("--finetune-lr", default=5e-5, type=float,
               help="Learning rate for fine-tuning phase (default: 5e-5)")
+@click.option("--finetune-final-stage-only/--finetune-all-stages", default=True,
+              help="In curriculum mode with --seq-len-stages, fine-tune only on the final stage "
+                   "(default: enabled). Disable to reuse the full staged schedule for fine-tuning.")
 @click.option("--pretrained-checkpoint", default=None, type=click.Path(exists=True),
               help="Skip curriculum pre-train phase and start at DroPE from this checkpoint")
 @click.option("--drope/--no-drope", default=True,
@@ -1200,8 +1204,8 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
 @click.option("--piece-balance", type=click.Choice(["none", "sqrt", "inverse"]),
               default="sqrt",
               help="Down-weight heavily-chunked pieces via WeightedRandomSampler (default: sqrt)")
-@click.option("--num-recurrent-steps", default=2, type=int,
-              help="LoopLM: number of times to loop through the layer stack (1 = standard transformer, default: 2)")
+@click.option("--num-recurrent-steps", default=1, type=int,
+              help="LoopLM: number of times to loop through the layer stack (1 = standard transformer, default: 1)")
 @click.option("--looplm-sandwich-norm", is_flag=True, default=False,
               help="LoopLM: enable sandwich normalization (RMSNorm after each sublayer) for recurrence stability")
 @click.option("--looplm-exit-gate/--no-looplm-exit-gate", default=True,
@@ -1221,7 +1225,7 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None,
           accumulation_steps: int, resume: str | None, data_dir: str | None,
           curriculum: bool, pretrain_epochs: int, finetune_data_dir: str,
           finetune_style: str | None,
-          finetune_lr: float, pretrained_checkpoint: str | None,
+          finetune_lr: float, finetune_final_stage_only: bool, pretrained_checkpoint: str | None,
           drope: bool, drope_epochs: int, drope_lr: float, drope_warmup_epochs: int,
           drope_early_stop: bool, drope_patience: int, drope_min_delta: float,
           drope_min_epochs: int,
@@ -1303,6 +1307,7 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None,
     # Parse staged context-length schedule
     parsed_stages: list[tuple[int, int]] | None = None
     stage_total_epochs: int | None = None
+    finetune_stages: list[tuple[int, int]] | None = None
     if seq_len_stages:
         try:
             parsed_stages = []
@@ -1324,9 +1329,11 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None,
         stage_total_epochs = sum(ep for _, ep in parsed_stages)
         stage_desc = " → ".join(f"{sl}@{ep}ep" for sl, ep in parsed_stages)
         if curriculum:
+            finetune_stages = parsed_stages[-1:] if finetune_final_stage_only else list(parsed_stages)
+            ft_stage_desc = " → ".join(f"{sl}@{ep}ep" for sl, ep in finetune_stages)
             console.print(f"  Staged curriculum schedule: {stage_desc}")
-            console.print(f"  Epochs per train phase: {stage_total_epochs}")
-            console.print("  The staged schedule will be applied to both pre-train and fine-tune.")
+            console.print(f"  Pre-train staged epochs: {stage_total_epochs}")
+            console.print(f"  Fine-tune staged schedule: {ft_stage_desc}")
         else:
             # Override total epochs
             epochs = stage_total_epochs
@@ -1438,6 +1445,8 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None,
         if config.looplm_exit_gate:
             loop_desc += f", exit_gate(beta={config.looplm_kl_beta}, threshold={config.looplm_exit_threshold})"
         console.print(loop_desc)
+    else:
+        console.print("  Architecture: standard transformer (no LoopLM recurrence)")
 
     # Train
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
@@ -1480,13 +1489,15 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None,
         # Validate curriculum parameters
         if parsed_stages:
             pretrain_epochs = stage_total_epochs or 0
-            finetune_epochs = stage_total_epochs or 0
+            finetune_stages = finetune_stages or parsed_stages[-1:]
+            finetune_epochs = sum(ep for _, ep in finetune_stages)
         else:
             if pretrain_epochs >= epochs:
                 console.print(f"[red]--pretrain-epochs ({pretrain_epochs}) must be less than "
                               f"--epochs ({epochs})[/red]")
                 sys.exit(1)
             finetune_epochs = epochs - pretrain_epochs
+            finetune_stages = None
 
         if pretrain_epochs < 1 or finetune_epochs < 1:
             console.print(
@@ -1545,6 +1556,10 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None,
         console.print(f"  Pre-train LR: {lr}")
         if parsed_stages:
             console.print("  Pre-train stage policy: each new seq-len stage halves LR and batch size")
+            if finetune_stages and len(finetune_stages) > 1:
+                console.print("  Fine-tune stage policy: each new seq-len stage halves batch size")
+            else:
+                console.print("  Fine-tune stage policy: final seq-len stage only")
         if drope:
             console.print(f"  DroPE LR: {drope_lr}")
         console.print(f"  Fine-tune LR: {finetune_lr}")
@@ -1700,7 +1715,7 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None,
                 min_epochs=ft_es_min_epochs,
                 phase_name="FINETUNE",
                 checkpoint_prefix="finetune_",
-                seq_len_stages=parsed_stages,
+                seq_len_stages=finetune_stages,
                 stage_batch_decay=0.5,
             )
 

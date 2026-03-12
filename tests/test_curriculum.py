@@ -425,6 +425,7 @@ class TestCLIOptions:
         assert "--finetune-data-dir" in result.output
         assert "--pretrained-checkpoint" in result.output
         assert "--finetune-lr" in result.output
+        assert "--finetune-final-stage-only" in result.output
         assert "--log-interval" in result.output
         assert "--val-interval" in result.output
         assert "--data-dir" in result.output
@@ -673,8 +674,8 @@ class TestCLIOptions:
         assert train_kwargs[-1]["phase_name"] == "FINETUNE"
         assert train_kwargs[-1]["checkpoint_prefix"] == "finetune_"
 
-    def test_curriculum_finetune_applies_stage_batch_decay(self, tmp_path):
-        """Fine-tune should inherit staged context batch decay when seq-len stages are used."""
+    def test_curriculum_finetune_defaults_to_final_stage_only(self, tmp_path):
+        """Fine-tune should default to only the final seq-len stage."""
         from click.testing import CliRunner
         from bach_gen.cli import cli
 
@@ -746,6 +747,87 @@ class TestCLIOptions:
                 "--pretrain-epochs", "6",
                 "--pretrained-checkpoint", str(pretrained_ckpt),
                 "--seq-len-stages", "4096:4,8192:2",
+            ])
+
+        assert result.exit_code == 0
+        assert train_kwargs[-1]["phase_name"] == "FINETUNE"
+        assert train_kwargs[-1]["seq_len_stages"] == [(8192, 2)]
+        assert train_kwargs[-1]["stage_batch_decay"] == 0.5
+
+    def test_curriculum_finetune_can_reuse_all_stages(self, tmp_path):
+        """--finetune-all-stages should reuse the full seq-len schedule during fine-tune."""
+        from click.testing import CliRunner
+        from bach_gen.cli import cli
+
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        (data_dir / "sequences.json").write_text(json.dumps([list(range(20, 60)) for _ in range(10)]))
+        (data_dir / "mode.json").write_text(json.dumps({"mode": "all", "max_seq_len": 64}))
+
+        ft_dir = tmp_path / "data_bach"
+        ft_dir.mkdir()
+        (ft_dir / "sequences.json").write_text(json.dumps([list(range(20, 60)) for _ in range(6)]))
+        (ft_dir / "mode.json").write_text(json.dumps({"mode": "all", "max_seq_len": 64}))
+
+        pretrained_ckpt = tmp_path / "pretrained.pt"
+        pretrained_ckpt.write_bytes(b"x")
+
+        models_dir = tmp_path / "models"
+        models_dir.mkdir()
+
+        mock_tokenizer = MagicMock()
+        mock_tokenizer.vocab_size = 100
+        mock_tokenizer.name_to_token = {}
+        mock_tokenizer.token_to_name = {}
+
+        class FakeModel:
+            def __init__(self, config):
+                self.config = config
+
+            def count_parameters(self):
+                return 123
+
+        trainer = MagicMock()
+        train_kwargs: list[dict] = []
+
+        def _drope_side(**kwargs):
+            (models_dir / "drope_best.pt").touch()
+            return {
+                "train_loss": [1.0],
+                "val_loss": [0.9],
+                "lr": [kwargs["lr"]],
+                "epochs_ran": 1,
+                "stop_reason": "max_epochs_reached",
+            }
+
+        def _train_side(*args, **kwargs):
+            train_kwargs.append(kwargs)
+            return {"train_loss": [0.8], "val_loss": [0.7], "lr": [1e-4]}
+
+        trainer.recalibrate_drope.side_effect = _drope_side
+        trainer.train.side_effect = _train_side
+
+        with patch("bach_gen.cli.MODELS_DIR", models_dir), \
+             patch("bach_gen.data.tokenizer.load_tokenizer", return_value=mock_tokenizer), \
+             patch("bach_gen.data.dataset.create_dataset", side_effect=[(_make_dataset(10), _make_dataset(2)),
+                                                                         (_make_dataset(6), _make_dataset(2))]), \
+             patch("bach_gen.model.architecture.BachTransformer", FakeModel), \
+             patch("bach_gen.model.trainer.get_device", return_value=torch.device("cpu")), \
+             patch("bach_gen.model.trainer.Trainer", return_value=trainer), \
+             patch("bach_gen.evaluation.information.calibrate_from_corpus",
+                   return_value={"perplexity_range": [0.0, 1.0], "entropy_range": [0.0, 1.0]}), \
+             patch("bach_gen.evaluation.information.save_information_calibration"):
+            runner = CliRunner()
+            result = runner.invoke(cli, [
+                "train",
+                "--curriculum",
+                "--data-dir", str(data_dir),
+                "--finetune-data-dir", str(ft_dir),
+                "--epochs", "12",
+                "--pretrain-epochs", "6",
+                "--pretrained-checkpoint", str(pretrained_ckpt),
+                "--seq-len-stages", "4096:4,8192:2",
+                "--finetune-all-stages",
             ])
 
         assert result.exit_code == 0

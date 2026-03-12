@@ -118,6 +118,7 @@ fi
 REMOTE_LOG_FILE="$REMOTE_LOG_DIR/${SESSION}.log"
 REMOTE_RUNNER="$REMOTE_REPO_DIR/.launch_${SESSION}.sh"
 REMOTE_DATA_DIR="$REMOTE_REPO_DIR/$REMOTE_DATA_NAME"
+LOCAL_LOCK_FILE="$ROOT_DIR/uv.lock"
 
 run() {
   if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -151,7 +152,18 @@ if ! command -v tmux >/dev/null 2>&1; then
   exit 1
 fi
 if ! command -v uv >/dev/null 2>&1; then
-  echo "uv is required on the remote host" >&2
+  if command -v curl >/dev/null 2>&1; then
+    curl -LsSf https://astral.sh/uv/install.sh | env UV_UNMANAGED_INSTALL="$HOME/.local/bin" sh
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO- https://astral.sh/uv/install.sh | env UV_UNMANAGED_INSTALL="$HOME/.local/bin" sh
+  else
+    echo "uv is missing and neither curl nor wget is available to install it" >&2
+    exit 1
+  fi
+  export PATH="$HOME/.local/bin:$PATH"
+fi
+if ! command -v uv >/dev/null 2>&1; then
+  echo "uv installation failed on the remote host" >&2
   exit 1
 fi
 
@@ -171,7 +183,10 @@ fi
 EOF
 
 run ssh "$HOST" mkdir -p "$REMOTE_DATA_DIR"
-run rsync -az --delete --info=progress2 "$LOCAL_DATA_DIR"/ "$HOST:$REMOTE_DATA_DIR/"
+run rsync -az --delete --progress "$LOCAL_DATA_DIR"/ "$HOST:$REMOTE_DATA_DIR/"
+if [[ -f "$LOCAL_LOCK_FILE" ]]; then
+  run rsync -az "$LOCAL_LOCK_FILE" "$HOST:$REMOTE_REPO_DIR/uv.lock"
+fi
 
 run ssh "$HOST" bash -s -- \
   "$REMOTE_REPO_DIR" \
@@ -208,16 +223,23 @@ exec > >(tee -a "$log_file") 2>&1
 echo "[\$(date '+%Y-%m-%d %H:%M:%S')] Starting training"
 cd "$repo_abs"
 export UV_CACHE_DIR="\$HOME/.cache/uv"
+export PATH="\$HOME/.local/bin:\$PATH"
 echo "[\$(date '+%Y-%m-%d %H:%M:%S')] uv=\$(uv --version)"
-uv sync --frozen
-TORCH_VERSION="\$(uv run python - <<'PY'
+if [[ -f uv.lock ]]; then
+  echo "[\$(date '+%Y-%m-%d %H:%M:%S')] Found uv.lock; using frozen sync"
+  uv sync --frozen
+else
+  echo "[\$(date '+%Y-%m-%d %H:%M:%S')] No uv.lock found; using non-frozen sync"
+  uv sync
+fi
+TORCH_VERSION="\$(.venv/bin/python - <<'PY'
 import importlib.metadata as md
 print(md.version("torch"))
 PY
 )"
 echo "[\$(date '+%Y-%m-%d %H:%M:%S')] Reinstalling torch \$TORCH_VERSION with uv automatic backend selection"
-UV_TORCH_BACKEND=auto uv pip install --reinstall "torch==\$TORCH_VERSION"
-uv run python - <<'PY'
+UV_TORCH_BACKEND=auto uv pip install --python .venv/bin/python --reinstall "torch==\$TORCH_VERSION"
+.venv/bin/python - <<'PY'
 import platform
 import sys
 import torch
@@ -236,7 +258,7 @@ print(f"cuda_device_count={torch.cuda.device_count()}")
 for idx in range(torch.cuda.device_count()):
     print(f"cuda_device_{idx}={torch.cuda.get_device_name(idx)}")
 PY
-uv run bach-gen train \
+.venv/bin/bach-gen train \
   --curriculum \
   --data-dir "$data_dir" \
   --finetune bach \
@@ -248,6 +270,9 @@ uv run bach-gen train \
   --embed-dim 384 \
   --num-heads 8 \
   --num-layers 9 \
+  --num-recurrent-steps 1 \
+  --no-looplm-exit-gate \
+  --no-loop-step-embedding \
   --pos-encoding pope \
   --piece-balance sqrt \
   --fp16
