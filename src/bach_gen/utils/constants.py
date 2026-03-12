@@ -35,6 +35,26 @@ FORM_VOICE_RANGES: dict[tuple[str, int], tuple[int, int]] = {
     ("sonata", 2): ALTO_RANGE,
     ("sonata", 3): TENOR_RANGE,
     ("sonata", 4): BASS_RANGE,
+    # Generic keyboard repertoire: SATB-like cap at 4 voices
+    ("keyboard_piece", 1): SOPRANO_RANGE,
+    ("keyboard_piece", 2): ALTO_RANGE,
+    ("keyboard_piece", 3): TENOR_RANGE,
+    ("keyboard_piece", 4): BASS_RANGE,
+    # Generic chamber reductions: SATB-like cap at 4 voices
+    ("chamber_piece", 1): SOPRANO_RANGE,
+    ("chamber_piece", 2): ALTO_RANGE,
+    ("chamber_piece", 3): TENOR_RANGE,
+    ("chamber_piece", 4): BASS_RANGE,
+    # Smart orchestral reductions into 4-part texture
+    ("orchestral_reduction", 1): SOPRANO_RANGE,
+    ("orchestral_reduction", 2): ALTO_RANGE,
+    ("orchestral_reduction", 3): TENOR_RANGE,
+    ("orchestral_reduction", 4): BASS_RANGE,
+    # Generic vocal polyphony
+    ("vocal_polyphony", 1): SOPRANO_RANGE,
+    ("vocal_polyphony", 2): ALTO_RANGE,
+    ("vocal_polyphony", 3): TENOR_RANGE,
+    ("vocal_polyphony", 4): BASS_RANGE,
     # Motet: same as chorale (capped at 4 voices)
     ("motet", 1): SOPRANO_RANGE,
     ("motet", 2): ALTO_RANGE,
@@ -51,6 +71,10 @@ FORM_DEFAULTS: dict[str, tuple[int, int]] = {
     "chorale": (4, 1024),
     "quartet": (4, 1024),
     "sonata": (4, 1536),
+    "keyboard_piece": (4, 1536),
+    "chamber_piece": (4, 1024),
+    "orchestral_reduction": (4, 1536),
+    "vocal_polyphony": (4, 1024),
     "fugue": (4, 2048),
     "motet": (4, 1024),
 }
@@ -151,11 +175,21 @@ SPECIAL_TOKENS = [
     "CAD_DC",
 ]
 
-# Style token names (order matches SPECIAL_TOKENS)
+# Base style token names (order matches the fixed front-of-vocab token IDs)
 STYLE_NAMES = ["bach", "baroque", "renaissance", "classical"]
+APPENDED_STYLE_NAMES = ["romantic", "modern", "medieval", "other"]
+ALL_STYLE_NAMES = STYLE_NAMES + APPENDED_STYLE_NAMES
 
-# Form token names
+# Base form token names (order matches the fixed front-of-vocab token IDs)
 FORM_NAMES = ["chorale", "invention", "fugue", "sinfonia", "quartet", "trio_sonata", "motet"]
+APPENDED_FORM_NAMES = [
+    "sonata",
+    "keyboard_piece",
+    "chamber_piece",
+    "orchestral_reduction",
+    "vocal_polyphony",
+]
+ALL_FORM_NAMES = FORM_NAMES + APPENDED_FORM_NAMES
 
 # Length bucket names and boundaries (in bars/measures)
 LENGTH_NAMES = ["short", "medium", "long", "extended"]
@@ -352,87 +386,12 @@ DIR_TO_STYLE: dict[str, str] = {
     "machault": "medieval",
 }
 
-# Map directory name to form name (for auto-detection)
+# Map trusted path markers to specific form names (for auto-detection).
+# Keep this conservative: only use entries that are genuinely form-pure.
 DIR_TO_FORM: dict[str, str] = {
-    # Classical quartets
-    "haydn": "quartet",
-    "mozart": "quartet",
-    "beethoven": "quartet",
-    # Renaissance motets
-    "josquin": "motet",
-    "ockeghem": "motet",
-    "victoria": "motet",
-    "lassus": "motet",
-    "byrd": "motet",
-    "dufay": "motet",
-    "dunstable": "motet",
-    "isaac": "motet",
-    "banchieri": "motet",
-    "flecha": "motet",
-    "giovannelli": "motet",
-    "landini": "motet",
-    "vecchi": "motet",
-    "obrecht": "motet",
-    "desprez": "motet",
-    "busnois": "motet",
-    "delarue": "motet",
-    "martini": "motet",
-    "agricola": "motet",
-    "compere": "motet",
-    "mouton": "motet",
-    "brumel": "motet",
-    "regis": "motet",
-    "tinctoris": "motet",
-    "mayer": "quartet",
-    "saintgeorges": "quartet",
-    "hensel": "quartet",
-    "arriaga": "quartet",
-    "kalliwoda": "quartet",
-    "maier": "quartet",
-    "brahms": "quartet",
-    "schubert": "quartet",
-    "schumann": "quartet",
-    "cherubini": "quartet",
-    "hoffmeister": "quartet",
-    "boccherini": "quartet",
-    "andree": "quartet",
-    "bartok": "quartet",
-    "beach": "quartet",
-    "borodin": "quartet",
-    "bridge": "quartet",
-    "busoni": "quartet",
-    "carreno": "quartet",
-    "debussy": "quartet",
-    "delius": "quartet",
-    "dvorak": "quartet",
-    "elgar": "quartet",
-    "faure": "quartet",
-    "glazunov": "quartet",
-    "glinka": "quartet",
-    "gounod": "quartet",
-    "gouvy": "quartet",
-    "grieg": "quartet",
-    "indy": "quartet",
-    "janacek": "quartet",
-    "krzyzanowska": "quartet",
-    "moeran": "quartet",
-    "mullerhermann": "quartet",
-    "nielsen": "quartet",
-    "ravel": "quartet",
-    "reger": "quartet",
-    "schulhoff": "quartet",
-    "smetana": "quartet",
-    "smyth": "quartet",
-    "stanford": "quartet",
-    "strauss": "quartet",
-    "wolf": "quartet",
-    # Renaissance (music21 corpus)
-    "palestrina": "motet",
-    "trecento": "motet",
-    "ciconia": "motet",
-    "luca": "motet",
-    "lusitano": "motet",
-    "monteverdi": "motet",
+    "openscore_quartets": "quartet",
+    "quartets": "quartet",
+    "motets": "motet",
 }
 
 

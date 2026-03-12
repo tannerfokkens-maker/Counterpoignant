@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import re
 from typing import Optional
 
 import numpy as np
 
-from bach_gen.utils.constants import KEY_NAMES
+from bach_gen.utils.constants import KEY_NAMES, TICKS_PER_QUARTER, ticks_per_measure
 
 # Pitch class names (sharps)
 PC_NAMES_SHARP = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
@@ -38,6 +39,14 @@ NATURAL_MINOR_INTERVALS = [0, 2, 3, 5, 7, 8, 10]  # alias for scale-degree token
 MAJOR_SCALE_INTERVALS = [0, 2, 4, 5, 7, 9, 11]    # alias for scale-degree tokenizer
 HARMONIC_MINOR = [0, 2, 3, 5, 7, 8, 11]
 MELODIC_MINOR_ASC = [0, 2, 3, 5, 7, 9, 11]
+MODAL_INTERVALS: dict[str, list[int]] = {
+    "ionian": [0, 2, 4, 5, 7, 9, 11],
+    "dorian": [0, 2, 3, 5, 7, 9, 10],
+    "phrygian": [0, 1, 3, 5, 7, 8, 10],
+    "lydian": [0, 2, 4, 6, 7, 9, 11],
+    "mixolydian": [0, 2, 4, 5, 7, 9, 10],
+    "aeolian": [0, 2, 3, 5, 7, 8, 10],
+}
 
 # Krumhansl-Schmuckler key profiles
 KRUMHANSL_MAJOR = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52,
@@ -66,6 +75,16 @@ CONSONANCE = {
     10: 0.3,  # minor 7th
     11: 0.2,  # major 7th
 }
+
+
+@dataclass(frozen=True)
+class ModeFamilyDiagnosis:
+    """Mode-family diagnostic used for modal-aware labeling."""
+
+    root_pc: int
+    mode_family: str
+    system: str
+    confidence: float
 
 
 def parse_key(key_str: str) -> tuple[int, str]:
@@ -132,6 +151,13 @@ def get_scale(root_pc: int, mode: str) -> list[int]:
     else:
         raise ValueError(f"Unknown mode: {mode}")
     return [(root_pc + i) % 12 for i in intervals]
+
+
+def get_modal_scale(root_pc: int, mode_family: str) -> list[int]:
+    """Get modal scale pitch classes for the given root and mode family."""
+    if mode_family not in MODAL_INTERVALS:
+        raise ValueError(f"Unknown mode family: {mode_family}")
+    return [(root_pc + i) % 12 for i in MODAL_INTERVALS[mode_family]]
 
 
 def get_key_signature_name(root_pc: int, mode: str) -> str:
@@ -226,6 +252,415 @@ def detect_key(pitch_class_counts: np.ndarray) -> tuple[int, str, float]:
                 best_mode = mode
 
     return best_root, best_mode, best_corr
+
+
+def parse_midi_key_signature(key_sig: str) -> tuple[int, str] | None:
+    """Parse a MIDI key-signature string such as ``C`` or ``F#m``."""
+    if not key_sig:
+        return None
+    text = key_sig.strip()
+    mode = "minor" if text.endswith("m") else "major"
+    root_name = text[:-1] if mode == "minor" else text
+    if not root_name:
+        return None
+    try:
+        return note_name_to_pc(root_name), mode
+    except ValueError:
+        return None
+
+
+_TEXT_KEY_PATTERN = re.compile(
+    r"(?<![a-z])"
+    r"([a-g])"
+    r"(?:[ _-]?(sharp|flat|s|b))?"
+    r"[ _-]?"
+    r"(major|minor)"
+    r"(?![a-z])",
+    re.IGNORECASE,
+)
+
+
+def parse_explicit_key_from_text(text: str) -> tuple[int, str] | None:
+    """Parse an explicit textual key hint such as ``a-flat_major`` or ``cminor``.
+
+    This is intentionally conservative: it only fires when a note name and an
+    explicit ``major``/``minor`` label occur together in the text.
+    """
+    if not text:
+        return None
+
+    normalized = text.strip().lower()
+    for match in _TEXT_KEY_PATTERN.finditer(normalized):
+        note_name = match.group(1).upper()
+        accidental = (match.group(2) or "").lower()
+        mode = match.group(3).lower()
+
+        if accidental in {"flat", "b"}:
+            note_name += "b"
+        elif accidental in {"sharp", "s"}:
+            note_name += "#"
+
+        try:
+            return note_name_to_pc(note_name), mode
+        except ValueError:
+            continue
+    return None
+
+
+def key_to_midi_key_signature(root_pc: int, mode: str) -> str:
+    """Return a MIDI key-signature string for a supported key."""
+    major_names = {
+        0: "C",
+        1: "Db",
+        2: "D",
+        3: "Eb",
+        4: "E",
+        5: "F",
+        6: "F#",
+        7: "G",
+        8: "Ab",
+        9: "A",
+        10: "Bb",
+        11: "B",
+    }
+    minor_names = {
+        0: "Cm",
+        1: "C#m",
+        2: "Dm",
+        3: "Ebm",
+        4: "Em",
+        5: "Fm",
+        6: "F#m",
+        7: "Gm",
+        8: "G#m",
+        9: "Am",
+        10: "Bbm",
+        11: "Bm",
+    }
+    mapping = major_names if mode == "major" else minor_names
+    return mapping[root_pc % 12]
+
+
+def _final_key_support(
+    voices: list[list[tuple[int, int, int]]],
+    *,
+    root: int,
+    mode: str,
+) -> float:
+    """Return tonic-support bonus from the closing sonority."""
+    if not voices:
+        return 0.0
+
+    max_tick = max(start + dur for voice in voices for start, dur, _ in voice)
+    sample_tick = max(0, max_tick - 1)
+    final_pitches: list[int] = []
+    final_bass: int | None = None
+    final_soprano: int | None = None
+
+    for voice_idx, voice in enumerate(voices):
+        sounding = None
+        for start, dur, pitch in voice:
+            if start <= sample_tick < start + dur:
+                sounding = pitch
+        if sounding is None and voice:
+            sounding = voice[-1][2]
+        if sounding is None:
+            continue
+        final_pitches.append(sounding % 12)
+        if voice_idx == 0:
+            final_soprano = sounding % 12
+        if voice_idx == len(voices) - 1:
+            final_bass = sounding % 12
+
+    if not final_pitches:
+        return 0.0
+
+    third = (root + (4 if mode == "major" else 3)) % 12
+    dominant = (root + 7) % 12
+    tonic_triad = {root, third, dominant}
+    final_set = set(final_pitches)
+
+    support = 0.0
+    if final_bass == root:
+        support += 0.48
+    elif final_bass == dominant:
+        support += 0.06
+
+    if final_soprano == root:
+        support += 0.18
+    elif final_soprano in tonic_triad:
+        support += 0.10
+
+    support += 0.24 * (len(final_set & tonic_triad) / max(1, len(final_set)))
+
+    if final_set.issubset(tonic_triad):
+        support += 0.10
+
+    bass_voice = voices[-1] if voices else []
+    if bass_voice:
+        opening_bass = bass_voice[0][2] % 12
+        if opening_bass == root:
+            support += 0.04
+        elif opening_bass == dominant:
+            support += 0.02
+
+    return max(0.0, min(1.0, support))
+
+
+def _final_mode_support(
+    voices: list[list[tuple[int, int, int]]],
+    *,
+    root: int,
+    mode_family: str,
+) -> float:
+    """Return closing support for a modal final on ``root``."""
+    if not voices:
+        return 0.0
+
+    scale_set = set(get_modal_scale(root, mode_family))
+    max_tick = max(start + dur for voice in voices for start, dur, _ in voice)
+    sample_tick = max(0, max_tick - 1)
+    final_pitches: list[int] = []
+    final_bass: int | None = None
+    final_soprano: int | None = None
+
+    for voice_idx, voice in enumerate(voices):
+        sounding = None
+        for start, dur, pitch in voice:
+            if start <= sample_tick < start + dur:
+                sounding = pitch
+        if sounding is None and voice:
+            sounding = voice[-1][2]
+        if sounding is None:
+            continue
+        final_pc = sounding % 12
+        final_pitches.append(final_pc)
+        if voice_idx == 0:
+            final_soprano = final_pc
+        if voice_idx == len(voices) - 1:
+            final_bass = final_pc
+
+    if not final_pitches:
+        return 0.0
+
+    third = (root + MODAL_INTERVALS[mode_family][2]) % 12
+    final_set = set(final_pitches)
+
+    support = 0.0
+    if final_bass == root:
+        support += 0.52
+    if final_soprano == root:
+        support += 0.18
+    elif final_soprano == third:
+        support += 0.10
+
+    support += 0.20 * (len(final_set & scale_set) / max(1, len(final_set)))
+    if final_set.issubset(scale_set):
+        support += 0.10
+
+    bass_voice = voices[-1] if voices else []
+    if bass_voice:
+        opening_bass = bass_voice[0][2] % 12
+        if opening_bass == root:
+            support += 0.04
+
+    return max(0.0, min(1.0, support))
+
+
+def _window_profile(
+    all_notes: list[tuple[int, int, int]],
+    start_tick: int,
+    end_tick: int,
+) -> np.ndarray:
+    """Return a duration-weighted pitch-class profile over a time window."""
+    profile = np.zeros(12)
+    for note_start, note_dur, pitch in all_notes:
+        overlap = max(0, min(note_start + note_dur, end_tick) - max(note_start, start_tick))
+        if overlap <= 0:
+            continue
+        profile[pitch % 12] += max(0.10, overlap / TICKS_PER_QUARTER)
+    return profile
+
+
+def _mode_quality_support(profile_counts: np.ndarray, root: int, mode: str) -> float:
+    """Return support for the candidate mode from its defining scale degrees."""
+    total = float(profile_counts.sum()) + 1e-10
+    third = (root + (4 if mode == "major" else 3)) % 12
+    alt_third = (root + (3 if mode == "major" else 4)) % 12
+    sixth = (root + (9 if mode == "major" else 8)) % 12
+    alt_sixth = (root + (8 if mode == "major" else 9)) % 12
+    seventh = (root + (11 if mode == "major" else 10)) % 12
+    alt_seventh = (root + (10 if mode == "major" else 11)) % 12
+
+    support = 0.0
+    support += 0.50 * (profile_counts[third] - profile_counts[alt_third])
+    support += 0.20 * (profile_counts[sixth] - profile_counts[alt_sixth])
+    support += 0.16 * (profile_counts[seventh] - profile_counts[alt_seventh])
+    support += 0.14 * profile_counts[root]
+    return support / total
+
+
+def detect_mode_family(
+    voices: list[list[tuple[int, int, int]]],
+    *,
+    time_signature: tuple[int, int] = (4, 4),
+) -> ModeFamilyDiagnosis:
+    """Detect a diatonic mode family for modal-aware analysis.
+
+    This is intentionally diagnostic: it does not replace the main
+    major/minor key detector used for tokenization and evaluation.
+    """
+    all_notes = [note for voice in voices for note in voice]
+    if not all_notes:
+        return ModeFamilyDiagnosis(0, "ambiguous", "ambiguous", 0.0)
+
+    measure_ticks = max(TICKS_PER_QUARTER, ticks_per_measure(time_signature))
+    max_tick = max(start + dur for start, dur, _ in all_notes)
+
+    duration_counts = np.zeros(12)
+    attack_counts = np.zeros(12)
+    contextual_counts = np.zeros(12)
+
+    for start, dur, pitch in all_notes:
+        pc = pitch % 12
+        duration_counts[pc] += max(0.25, dur / TICKS_PER_QUARTER)
+        attack_counts[pc] += 1.0
+        if start < measure_ticks:
+            contextual_counts[pc] += 0.20
+        if (start + dur) >= max_tick - measure_ticks:
+            contextual_counts[pc] += 0.45 + 0.08 * min(4.0, dur / TICKS_PER_QUARTER)
+
+    profile_counts = duration_counts * 0.70 + attack_counts * 0.15 + contextual_counts
+    attack_profile = attack_counts + contextual_counts * 0.4
+
+    ranked: list[tuple[float, int, str]] = []
+    total_profile = profile_counts.sum() + 1e-10
+    total_attack = attack_profile.sum() + 1e-10
+
+    for root in range(12):
+        for mode_family in MODAL_INTERVALS:
+            scale_set = set(get_modal_scale(root, mode_family))
+            profile_in = sum(profile_counts[pc] for pc in scale_set) / total_profile
+            attack_in = sum(attack_profile[pc] for pc in scale_set) / total_attack
+            ending_support = _final_mode_support(voices, root=root, mode_family=mode_family)
+            score = 0.55 * profile_in + 0.15 * attack_in + 0.30 * ending_support
+            ranked.append((score, root, mode_family))
+
+    ranked.sort(reverse=True)
+    best_score, best_root, best_mode_family = ranked[0]
+    second_score = ranked[1][0] if len(ranked) > 1 else 0.0
+    margin = max(0.0, best_score - second_score)
+    confidence = max(0.0, min(1.0, best_score * 0.72 + margin * 1.6))
+
+    if best_mode_family in {"ionian", "aeolian"}:
+        system = "tonal" if confidence >= 0.60 else "ambiguous"
+    else:
+        system = "modal" if confidence >= 0.58 else "ambiguous"
+
+    return ModeFamilyDiagnosis(best_root, best_mode_family, system, confidence)
+
+
+def detect_composition_key(
+    voices: list[list[tuple[int, int, int]]],
+    *,
+    time_signature: tuple[int, int] = (4, 4),
+    midi_key_signature: str | None = None,
+    style: str | None = None,
+    source_key_hint: tuple[int, str] | None = None,
+) -> tuple[int, str, float, str]:
+    """Detect the key of a composition from note events.
+
+    Prefers explicit MIDI key-signature metadata when available. Otherwise,
+    uses a stronger fallback than plain global pitch-class counts by combining
+    duration-weighted profiles with tonic support from the ending sonority.
+    """
+    parsed_meta = parse_midi_key_signature(midi_key_signature or "")
+    raw_key_sig = (midi_key_signature or "").strip()
+    if parsed_meta is not None and raw_key_sig.endswith("m"):
+        return parsed_meta[0], parsed_meta[1], 1.0, "metadata"
+
+    all_notes = [note for voice in voices for note in voice]
+    if not all_notes:
+        return 0, "major", 0.0, "empty"
+
+    measure_ticks = max(TICKS_PER_QUARTER, ticks_per_measure(time_signature))
+    max_tick = max(start + dur for start, dur, _ in all_notes)
+
+    duration_counts = np.zeros(12)
+    attack_counts = np.zeros(12)
+    contextual_counts = np.zeros(12)
+
+    for start, dur, pitch in all_notes:
+        pc = pitch % 12
+        attack_counts[pc] += 1.0
+        duration_counts[pc] += max(0.25, dur / TICKS_PER_QUARTER)
+
+        if start < measure_ticks:
+            contextual_counts[pc] += 0.35
+        if (start + dur) >= max_tick - measure_ticks:
+            contextual_counts[pc] += 0.55 + 0.10 * min(4.0, dur / TICKS_PER_QUARTER)
+
+    profile_counts = duration_counts * 0.75 + attack_counts * 0.25 + contextual_counts
+    attack_profile = attack_counts + contextual_counts * 0.5
+    opening_profile = _window_profile(all_notes, 0, min(max_tick, measure_ticks * 4))
+    closing_profile = _window_profile(all_notes, max(0, max_tick - measure_ticks * 4), max_tick)
+
+    best_root = 0
+    best_mode = "major"
+    best_score = -10.0
+
+    metadata_prior: dict[tuple[int, str], float] = {}
+    signature_candidates: set[tuple[int, str]] = set()
+    if parsed_meta is not None:
+        if raw_key_sig.endswith("m"):
+            metadata_prior[(parsed_meta[0], parsed_meta[1])] = 0.25
+            metadata_prior[((parsed_meta[0] + 3) % 12, "major")] = 0.05
+            signature_candidates.add((parsed_meta[0], parsed_meta[1]))
+        else:
+            signature_candidates.add((parsed_meta[0], "major"))
+            signature_candidates.add(((parsed_meta[0] + 9) % 12, "minor"))
+            metadata_prior[(parsed_meta[0], "major")] = 0.22
+            metadata_prior[((parsed_meta[0] + 9) % 12, "minor")] = 0.16
+
+    hinted_candidates: set[tuple[int, str]] = set()
+    if source_key_hint is not None:
+        hinted_candidates.add(source_key_hint)
+        metadata_prior[source_key_hint] = max(metadata_prior.get(source_key_hint, 0.0), 0.24)
+
+    for root in range(12):
+        for mode in ("major", "minor"):
+            corr_profile = krumhansl_correlation(profile_counts, root, mode)
+            corr_attack = krumhansl_correlation(attack_profile, root, mode)
+            corr_opening = krumhansl_correlation(opening_profile, root, mode)
+            corr_closing = krumhansl_correlation(closing_profile, root, mode)
+            ending_support = _final_key_support(voices, root=root, mode=mode)
+            mode_support = _mode_quality_support(
+                profile_counts + opening_profile + closing_profile, root, mode
+            )
+            metadata_bonus = metadata_prior.get((root, mode), 0.0)
+            signature_penalty = 0.0
+            if signature_candidates and (root, mode) not in signature_candidates:
+                signature_penalty = -0.08
+            hint_penalty = -0.05 if hinted_candidates and (root, mode) not in hinted_candidates else 0.0
+            score = (
+                corr_profile * 0.48
+                + corr_attack * 0.08
+                + corr_opening * 0.08
+                + corr_closing * 0.14
+                + ending_support * 0.28
+                + mode_support * 0.18
+                + metadata_bonus
+                + signature_penalty
+                + hint_penalty
+            )
+            if score > best_score:
+                best_score = score
+                best_root = root
+                best_mode = mode
+
+    confidence = max(0.0, min(1.0, 0.45 + best_score / 1.6))
+    source = "signature+heuristic" if metadata_prior else "heuristic"
+    return best_root, best_mode, confidence, source
 
 
 def parse_note_string(note_str: str) -> Optional[int]:

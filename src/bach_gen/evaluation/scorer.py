@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -117,6 +118,26 @@ def get_weights_for_form(form: str | None = None) -> dict[str, float]:
     return DEFAULT_WEIGHTS
 
 
+def _weighted_proxy_sum(values: dict[str, float], weights: dict[str, float]) -> float:
+    """Return a clamped weighted sum for proxy calculations."""
+    total = sum(values.get(name, 0.0) * weight for name, weight in weights.items())
+    return max(0.0, min(1.0, total))
+
+
+def _geometric_blend(primary: float, secondary: float, primary_weight: float = 0.6) -> float:
+    """Blend two proxy components while requiring both to be present.
+
+    A weighted geometric mean is more robust than a simple sum here:
+    high rhetorical shape with near-zero musical substance should not
+    still look like a strong demo candidate.
+    """
+    primary = max(1e-6, min(1.0, primary))
+    secondary = max(1e-6, min(1.0, secondary))
+    secondary_weight = 1.0 - primary_weight
+    blended = math.exp(primary_weight * math.log(primary) + secondary_weight * math.log(secondary))
+    return max(0.0, min(1.0, blended))
+
+
 def score_composition(
     comp: VoiceComposition,
     token_sequence: list[int] | None = None,
@@ -169,6 +190,17 @@ def score_composition(
     tr_score = score_thematic_recall(comp, token_sequence=token_sequence, tokenizer=tokenizer)
     all_details["thematic_recall"] = {"score": tr_score}
 
+    proxy_scores = _compute_style_proxies(
+        form=form,
+        voice_leading=vl_score,
+        statistical=stat_score,
+        structural_details=struct_details,
+        contrapuntal_details=cp_details,
+        completeness=comp_score,
+        thematic_recall=tr_score,
+    )
+    all_details["style_proxies"] = proxy_scores
+
     # Composite (information dimension removed — zero discrimination power)
     raw_composite = (
         vl_score * w.get("voice_leading", 0.22)
@@ -218,6 +250,383 @@ def score_composition(
         composite=composite,
         details=all_details,
     )
+
+
+def _compute_style_proxies(
+    *,
+    form: str | None,
+    voice_leading: float,
+    statistical: float,
+    structural_details: dict,
+    contrapuntal_details: dict,
+    completeness: float,
+    thematic_recall: float,
+) -> dict[str, float]:
+    """Compute diagnostic proxy scores for Bach similarity and demo impact.
+
+    These proxies are intentionally diagnostic rather than prescriptive: they
+    help separate "this feels like a strong Bach-like piece" from "this lands
+    as a dramatic, demo-worthy highlight." They do not replace the composite.
+    """
+    cadence = float(structural_details.get("cadence", 0.0))
+    phrase = float(structural_details.get("phrase_structure", 0.0))
+    key_consistency = float(structural_details.get("key_consistency", 0.0))
+    modulation = float(structural_details.get("modulation", 0.0))
+
+    voice_indep = float(contrapuntal_details.get("voice_independence", 0.0))
+    contrary = float(contrapuntal_details.get("contrary_at_cadences", 0.0))
+    sequential = float(contrapuntal_details.get("sequential_patterns", 0.0))
+    melodic = float(contrapuntal_details.get("melodic_coherence", 0.0))
+    onset = float(contrapuntal_details.get("onset_staggering", 0.0))
+    voice_balance = float(contrapuntal_details.get("voice_balance", 0.0))
+    register = float(contrapuntal_details.get("register_consistency", 0.0))
+
+    if form == "fugue":
+        bach_similarity = (
+            voice_leading * 0.15
+            + statistical * 0.17
+            + key_consistency * 0.11
+            + thematic_recall * 0.18
+            + voice_indep * 0.09
+            + sequential * 0.13
+            + register * 0.10
+            + phrase * 0.03
+            + cadence * 0.02
+            + contrary * 0.02
+        )
+        rhetorical_shape = _weighted_proxy_sum(
+            {
+                "cadence": cadence,
+                "phrase": phrase,
+                "modulation": modulation,
+                "completeness": completeness,
+                "melodic": melodic,
+                "onset": onset,
+                "sequential": sequential,
+                "contrary": contrary,
+            },
+            {
+                "cadence": 0.20,
+                "phrase": 0.18,
+                "modulation": 0.12,
+                "completeness": 0.10,
+                "melodic": 0.08,
+                "onset": 0.15,
+                "sequential": 0.08,
+                "contrary": 0.09,
+            },
+        )
+        musical_substance = _weighted_proxy_sum(
+            {
+                "voice_leading": voice_leading,
+                "statistical": statistical,
+                "thematic_recall": thematic_recall,
+                "register": register,
+                "voice_indep": voice_indep,
+                "sequential": sequential,
+                "contrary": contrary,
+                "melodic": melodic,
+            },
+            {
+                "voice_leading": 0.23,
+                "statistical": 0.13,
+                "thematic_recall": 0.20,
+                "register": 0.15,
+                "voice_indep": 0.09,
+                "sequential": 0.08,
+                "contrary": 0.05,
+                "melodic": 0.07,
+            },
+        )
+        rhetorical_impact = _geometric_blend(rhetorical_shape, musical_substance, primary_weight=0.58)
+    elif form in {"invention", "2-part"}:
+        bach_similarity = (
+            voice_leading * 0.18
+            + statistical * 0.18
+            + key_consistency * 0.10
+            + thematic_recall * 0.17
+            + voice_indep * 0.14
+            + sequential * 0.10
+            + register * 0.09
+            + phrase * 0.02
+            + cadence * 0.01
+            + contrary * 0.01
+        )
+        rhetorical_shape = _weighted_proxy_sum(
+            {
+                "cadence": cadence,
+                "phrase": phrase,
+                "modulation": modulation,
+                "completeness": completeness,
+                "melodic": melodic,
+                "onset": onset,
+                "thematic_recall": thematic_recall,
+                "sequential": sequential,
+                "contrary": contrary,
+            },
+            {
+                "cadence": 0.14,
+                "phrase": 0.18,
+                "modulation": 0.08,
+                "completeness": 0.11,
+                "melodic": 0.14,
+                "onset": 0.15,
+                "thematic_recall": 0.10,
+                "sequential": 0.06,
+                "contrary": 0.04,
+            },
+        )
+        musical_substance = _weighted_proxy_sum(
+            {
+                "voice_leading": voice_leading,
+                "statistical": statistical,
+                "thematic_recall": thematic_recall,
+                "register": register,
+                "voice_indep": voice_indep,
+                "sequential": sequential,
+                "contrary": contrary,
+                "melodic": melodic,
+            },
+            {
+                "voice_leading": 0.22,
+                "statistical": 0.13,
+                "thematic_recall": 0.19,
+                "register": 0.15,
+                "voice_indep": 0.15,
+                "sequential": 0.08,
+                "contrary": 0.04,
+                "melodic": 0.04,
+            },
+        )
+        rhetorical_impact = _geometric_blend(rhetorical_shape, musical_substance, primary_weight=0.57)
+    elif form == "sinfonia":
+        bach_similarity = (
+            voice_leading * 0.17
+            + statistical * 0.18
+            + key_consistency * 0.10
+            + thematic_recall * 0.16
+            + voice_indep * 0.13
+            + sequential * 0.10
+            + register * 0.10
+            + phrase * 0.02
+            + cadence * 0.02
+            + contrary * 0.02
+        )
+        rhetorical_shape = _weighted_proxy_sum(
+            {
+                "cadence": cadence,
+                "phrase": phrase,
+                "modulation": modulation,
+                "completeness": completeness,
+                "melodic": melodic,
+                "onset": onset,
+                "thematic_recall": thematic_recall,
+                "sequential": sequential,
+                "contrary": contrary,
+            },
+            {
+                "cadence": 0.15,
+                "phrase": 0.17,
+                "modulation": 0.09,
+                "completeness": 0.10,
+                "melodic": 0.12,
+                "onset": 0.12,
+                "thematic_recall": 0.10,
+                "sequential": 0.08,
+                "contrary": 0.07,
+            },
+        )
+        musical_substance = _weighted_proxy_sum(
+            {
+                "voice_leading": voice_leading,
+                "statistical": statistical,
+                "thematic_recall": thematic_recall,
+                "register": register,
+                "voice_indep": voice_indep,
+                "sequential": sequential,
+                "contrary": contrary,
+                "melodic": melodic,
+            },
+            {
+                "voice_leading": 0.21,
+                "statistical": 0.13,
+                "thematic_recall": 0.18,
+                "register": 0.16,
+                "voice_indep": 0.14,
+                "sequential": 0.08,
+                "contrary": 0.06,
+                "melodic": 0.04,
+            },
+        )
+        rhetorical_impact = _geometric_blend(rhetorical_shape, musical_substance, primary_weight=0.57)
+    elif form == "chorale":
+        bach_similarity = (
+            voice_leading * 0.24
+            + statistical * 0.18
+            + key_consistency * 0.14
+            + cadence * 0.14
+            + phrase * 0.07
+            + voice_balance * 0.08
+            + completeness * 0.05
+            + thematic_recall * 0.06
+            + register * 0.03
+            + contrary * 0.01
+        )
+        rhetorical_shape = _weighted_proxy_sum(
+            {
+                "cadence": cadence,
+                "phrase": phrase,
+                "modulation": modulation,
+                "completeness": completeness,
+                "melodic": melodic,
+                "onset": onset,
+                "voice_balance": voice_balance,
+                "contrary": contrary,
+            },
+            {
+                "cadence": 0.20,
+                "phrase": 0.20,
+                "modulation": 0.08,
+                "completeness": 0.14,
+                "melodic": 0.10,
+                "onset": 0.05,
+                "voice_balance": 0.13,
+                "contrary": 0.10,
+            },
+        )
+        musical_substance = _weighted_proxy_sum(
+            {
+                "voice_leading": voice_leading,
+                "statistical": statistical,
+                "register": register,
+                "key_consistency": key_consistency,
+                "voice_balance": voice_balance,
+                "cadence": cadence,
+                "contrary": contrary,
+                "completeness": completeness,
+            },
+            {
+                "voice_leading": 0.24,
+                "statistical": 0.14,
+                "register": 0.16,
+                "key_consistency": 0.16,
+                "voice_balance": 0.10,
+                "cadence": 0.08,
+                "contrary": 0.06,
+                "completeness": 0.06,
+            },
+        )
+        rhetorical_impact = _geometric_blend(rhetorical_shape, musical_substance, primary_weight=0.56)
+    else:
+        bach_similarity = (
+            voice_leading * 0.18
+            + statistical * 0.16
+            + key_consistency * 0.10
+            + thematic_recall * 0.15
+            + voice_indep * 0.11
+            + sequential * 0.09
+            + register * 0.08
+            + phrase * 0.05
+            + cadence * 0.04
+            + contrary * 0.04
+        )
+        rhetorical_shape = _weighted_proxy_sum(
+            {
+                "cadence": cadence,
+                "phrase": phrase,
+                "modulation": modulation,
+                "completeness": completeness,
+                "melodic": melodic,
+                "onset": onset,
+                "thematic_recall": thematic_recall,
+                "sequential": sequential,
+                "contrary": contrary,
+            },
+            {
+                "cadence": 0.17,
+                "phrase": 0.18,
+                "modulation": 0.10,
+                "completeness": 0.12,
+                "melodic": 0.12,
+                "onset": 0.10,
+                "thematic_recall": 0.08,
+                "sequential": 0.05,
+                "contrary": 0.08,
+            },
+        )
+        musical_substance = _weighted_proxy_sum(
+            {
+                "voice_leading": voice_leading,
+                "statistical": statistical,
+                "thematic_recall": thematic_recall,
+                "register": register,
+                "voice_indep": voice_indep,
+                "sequential": sequential,
+                "contrary": contrary,
+                "melodic": melodic,
+            },
+            {
+                "voice_leading": 0.22,
+                "statistical": 0.14,
+                "thematic_recall": 0.16,
+                "register": 0.15,
+                "voice_indep": 0.13,
+                "sequential": 0.08,
+                "contrary": 0.06,
+                "melodic": 0.06,
+            },
+        )
+        rhetorical_impact = _geometric_blend(rhetorical_shape, musical_substance, primary_weight=0.57)
+
+    # Small bonuses/penalties to reflect listener-facing shape vs deeper style fidelity.
+    if cadence >= 0.70 and phrase >= 0.75 and completeness >= 0.75:
+        rhetorical_impact += 0.05
+    if onset >= 0.75 and melodic >= 0.75:
+        rhetorical_impact += 0.03
+    if cadence < 0.20 and completeness < 0.70:
+        rhetorical_impact -= 0.06
+    if phrase < 0.45 and melodic < 0.65:
+        rhetorical_impact -= 0.04
+    if register < 0.20 and voice_leading < 0.45:
+        rhetorical_impact -= 0.10
+    if statistical < 0.34 and thematic_recall < 0.18 and phrase >= 0.65:
+        rhetorical_impact -= 0.08
+    if contrary < 0.12 and phrase >= 0.75 and cadence >= 0.45:
+        rhetorical_impact -= 0.05
+
+    if (
+        voice_leading >= 0.90
+        and statistical >= 0.42
+        and key_consistency >= 0.82
+        and thematic_recall >= 0.72
+    ):
+        bach_similarity += 0.04
+    if voice_indep >= 0.82 and sequential >= 0.45:
+        bach_similarity += 0.03
+    if register >= 0.85 and thematic_recall >= 0.70:
+        bach_similarity += 0.02
+    if statistical < 0.32:
+        bach_similarity -= 0.06
+    if voice_leading < 0.75:
+        bach_similarity -= 0.05
+    if form in {"fugue", "invention", "2-part", "sinfonia"} and sequential < 0.18:
+        bach_similarity -= 0.05
+    if form in {"fugue", "invention", "2-part", "sinfonia"} and register < 0.45:
+        bach_similarity -= 0.05
+    if form == "chorale" and voice_leading < 0.92:
+        bach_similarity -= 0.05
+    if form == "chorale" and voice_leading < 0.88:
+        bach_similarity -= 0.05
+
+    demo_bach_balance = min(bach_similarity, rhetorical_impact)
+
+    return {
+        "bach_similarity": max(0.0, min(1.0, bach_similarity)),
+        "rhetorical_shape": max(0.0, min(1.0, rhetorical_shape)),
+        "musical_substance": max(0.0, min(1.0, musical_substance)),
+        "rhetorical_impact": max(0.0, min(1.0, rhetorical_impact)),
+        "demo_bach_balance": max(0.0, min(1.0, demo_bach_balance)),
+    }
 
 
 def _guardrail_multiplier(

@@ -18,8 +18,8 @@ from bach_gen.data.tokenizer import BachTokenizer, load_tokenizer
 from bach_gen.evaluation.information import load_information_calibration
 from bach_gen.evaluation.scorer import score_composition
 from bach_gen.evaluation.statistical import load_corpus_stats
-from bach_gen.utils.midi_io import load_midi, midi_to_note_events
-from bach_gen.utils.music_theory import detect_key, pc_to_note_name
+from bach_gen.utils.midi_io import load_midi, midi_key_signature, midi_time_signature, midi_to_note_events
+from bach_gen.utils.music_theory import detect_composition_key, pc_to_note_name
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MANIFEST = REPO_ROOT / "data/benchmarks/bach_gold.json"
@@ -51,7 +51,8 @@ def _expand_group_files(group: dict) -> list[Path]:
 
 
 def _load_comp(path: Path) -> tuple[VoiceComposition, str]:
-    tracks = midi_to_note_events(load_midi(path))
+    mid = load_midi(path)
+    tracks = midi_to_note_events(mid)
     voices = [v for v in tracks if v]
 
     if len(voices) < 2 and len(tracks) == 1 and tracks[0]:
@@ -64,17 +65,19 @@ def _load_comp(path: Path) -> tuple[VoiceComposition, str]:
     if len(voices) < 2:
         raise ValueError("Need at least two non-empty voices")
 
-    pc_counts = np.zeros(12)
-    for voice in voices:
-        for _, _, pitch in voice:
-            pc_counts[pitch % 12] += 1
-    key_root, key_mode, _ = detect_key(pc_counts)
+    time_sig = midi_time_signature(mid)
+    key_root, key_mode, _key_conf, _key_source = detect_composition_key(
+        voices,
+        time_signature=time_sig,
+        midi_key_signature=midi_key_signature(mid),
+    )
     key_name = f"{pc_to_note_name(key_root)} {key_mode}"
     return VoiceComposition(
         voices=voices,
         key_root=key_root,
         key_mode=key_mode,
         source=str(path),
+        time_signature=time_sig,
     ), key_name
 
 
@@ -150,6 +153,7 @@ def _score_row(
     contrapuntal = (sb.details or {}).get("contrapuntal", {})
     guardrails = (sb.details or {}).get("guardrails", {})
     interactions = (sb.details or {}).get("interactions", {})
+    proxies = (sb.details or {}).get("style_proxies", {})
 
     return {
         "group": group_name,
@@ -165,6 +169,11 @@ def _score_row(
         "contrapuntal": float(sb.contrapuntal),
         "completeness": float(sb.completeness),
         "thematic_recall": float(sb.thematic_recall),
+        "bach_similarity": float(proxies.get("bach_similarity", 0.0)),
+        "rhetorical_shape": float(proxies.get("rhetorical_shape", 0.0)),
+        "musical_substance": float(proxies.get("musical_substance", 0.0)),
+        "rhetorical_impact": float(proxies.get("rhetorical_impact", 0.0)),
+        "demo_bach_balance": float(proxies.get("demo_bach_balance", 0.0)),
         "struct_cadence": float(structural.get("cadence", 0.0)),
         "struct_phrase_structure": float(structural.get("phrase_structure", 0.0)),
         "struct_key_consistency": float(structural.get("key_consistency", 0.0)),
@@ -292,14 +301,30 @@ def main() -> None:
     print()
     print("Summary by form / variant")
     summary: dict[tuple[str, str], list[float]] = defaultdict(list)
+    bach_summary: dict[tuple[str, str], list[float]] = defaultdict(list)
+    shape_summary: dict[tuple[str, str], list[float]] = defaultdict(list)
+    substance_summary: dict[tuple[str, str], list[float]] = defaultdict(list)
+    rhetoric_summary: dict[tuple[str, str], list[float]] = defaultdict(list)
     for row in rows:
         summary[(str(row["form"]), str(row["variant"]))].append(float(row["composite"]))
+        bach_summary[(str(row["form"]), str(row["variant"]))].append(float(row["bach_similarity"]))
+        shape_summary[(str(row["form"]), str(row["variant"]))].append(float(row["rhetorical_shape"]))
+        substance_summary[(str(row["form"]), str(row["variant"]))].append(float(row["musical_substance"]))
+        rhetoric_summary[(str(row["form"]), str(row["variant"]))].append(float(row["rhetorical_impact"]))
     for key in sorted(summary):
         stats = _stats(summary[key])
+        bach_stats = _stats(bach_summary[key])
+        shape_stats = _stats(shape_summary[key])
+        substance_stats = _stats(substance_summary[key])
+        rhetoric_stats = _stats(rhetoric_summary[key])
         print(
             f"{key[0]:10s} {key[1]:10s} "
             f"n={len(summary[key]):4d} "
             f"mean={stats['mean']:.3f} "
+            f"bach={bach_stats['mean']:.3f} "
+            f"shape={shape_stats['mean']:.3f} "
+            f"substance={substance_stats['mean']:.3f} "
+            f"impact={rhetoric_stats['mean']:.3f} "
             f"p10={stats['p10']:.3f} "
             f"median={stats['median']:.3f} "
             f"p90={stats['p90']:.3f}"

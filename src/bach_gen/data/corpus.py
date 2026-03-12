@@ -34,6 +34,9 @@ logger = logging.getLogger(__name__)
 
 SLOW_TASK_LOG_SECONDS = 10.0
 PENDING_TASK_HEARTBEAT_SECONDS = 15.0
+REPO_ROOT = Path(__file__).resolve().parents[3]
+DATA_MIDI_ROOT = REPO_ROOT / "data" / "midi"
+DATA_MIDI_ALL_ROOT = DATA_MIDI_ROOT / "all"
 
 # ---------------------------------------------------------------------------
 # Top-level worker functions (must be module-level for pickling)
@@ -61,7 +64,7 @@ def _parse_and_extract_corpus_entry(args: tuple) -> list[tuple]:
         if voices_override is not None:
             num_voices = voices_override
         groups = extract_voice_groups(
-            score, num_voices, source=source_path, form=form,
+            score, num_voices, source=source_path, form=form, style=style,
         )
         if max_groups > 0:
             groups = groups[:max_groups]
@@ -91,10 +94,25 @@ def _parse_and_extract_file_entry(args: tuple) -> list[tuple]:
         if len(parts) < 2 or len(parts) > max_source_voices:
             return []
         form, num_voices = detect_form(score, desc, style)
+        key_override: tuple[int, str] | None = None
+        time_signature_override: tuple[int, int] | None = None
+        companion_overrides = _load_companion_overrides(Path(file_path_str), style)
+        if companion_overrides is not None:
+            key_override, time_signature_override, companion_form, companion_voices = companion_overrides
+            if companion_form is not None:
+                form = companion_form
+            if voices_override is None and companion_voices is not None:
+                num_voices = companion_voices
         if voices_override is not None:
             num_voices = voices_override
         groups = extract_voice_groups(
-            score, num_voices, source=desc, form=form,
+            score,
+            num_voices,
+            source=desc,
+            form=form,
+            style=style,
+            key_override=key_override,
+            time_signature_override=time_signature_override,
         )
         if max_groups > 0:
             groups = groups[:max_groups]
@@ -378,7 +396,7 @@ def _infer_style_from_rel_parts(rel_parts: tuple[str, ...]) -> str:
         style = DIR_TO_STYLE.get(part.lower())
         if style:
             return style
-    return ""
+    return "other"
 
 
 def _work_matches_filter(desc: str, style: str, accepted: set[str] | None) -> bool:
@@ -405,6 +423,52 @@ def _original_source(source: str) -> str:
     """
     idx = source.rfind(" (voices ")
     return source[:idx] if idx >= 0 else source
+
+
+def _resolve_companion_source(path: Path) -> Path | None:
+    """Resolve a score-backed companion source for a file under ``data/midi/all``."""
+    try:
+        rel = path.resolve().relative_to(DATA_MIDI_ALL_ROOT.resolve())
+    except ValueError:
+        return None
+    if len(rel.parts) < 2 or "__" not in rel.name:
+        return None
+
+    composer_dir = rel.parts[0]
+    source_family, remainder = rel.name.split("__", 1)
+    family_root = DATA_MIDI_ROOT / source_family / composer_dir
+    candidates: list[Path] = []
+    if remainder.endswith(".fromscore.mid"):
+        candidates.append(family_root / remainder[:-len(".fromscore.mid")])
+    if remainder.endswith(".fromscore.midi"):
+        candidates.append(family_root / remainder[:-len(".fromscore.midi")])
+    candidates.append(family_root / remainder)
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _load_companion_overrides(
+    path: Path,
+    style: str,
+) -> tuple[tuple[int, str], tuple[int, int], str | None, int | None] | None:
+    """Load key/time/form overrides from a companion source when available."""
+    companion = _resolve_companion_source(path)
+    if companion is None:
+        return None
+
+    try:
+        from bach_gen.data.extraction import _detect_key, _detect_time_signature, detect_form
+
+        companion_score = music21.converter.parse(str(companion))
+        key_override = _detect_key(companion_score, style=style, source=str(companion))
+        time_signature_override = _detect_time_signature(companion_score)
+        companion_form, companion_voices = detect_form(companion_score, str(companion), style)
+        return key_override, time_signature_override, companion_form, companion_voices
+    except Exception:
+        return None
 
 
 def _default_local_midi_dir() -> Path:
@@ -459,7 +523,7 @@ def get_midi_files(
     files into subdirectories (e.g. data/midi/bach/, data/midi/handel/).
 
     Style is inferred from the first subdirectory name under midi_dir using
-    DIR_TO_STYLE.  Falls back to empty string if not recognised.
+    DIR_TO_STYLE.  Falls back to ``other`` if not recognised.
 
     Phase 1 (fast, sequential): discover and filter file paths.
     Phase 2 (slow, parallel): parse and extract voice groups.

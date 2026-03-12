@@ -7,6 +7,7 @@ from pathlib import Path
 import mido
 
 from bach_gen.utils.constants import TICKS_PER_QUARTER
+from bach_gen.utils.music_theory import key_to_midi_key_signature, parse_midi_key_signature
 
 
 def note_events_to_midi(
@@ -15,6 +16,9 @@ def note_events_to_midi(
     voices: list[list[tuple[int, int, int]]] | None = None,
     ticks_per_quarter: int = TICKS_PER_QUARTER,
     tempo: int = 500000,  # microseconds per beat (120 BPM)
+    key_root: int | None = None,
+    key_mode: str | None = None,
+    time_signature: tuple[int, int] | None = None,
 ) -> mido.MidiFile:
     """Convert note events to a MIDI file.
 
@@ -50,6 +54,26 @@ def note_events_to_midi(
 
         if channel == 0:
             track.append(mido.MetaMessage("set_tempo", tempo=tempo, time=0))
+            if time_signature is not None:
+                numerator, denominator = time_signature
+                track.append(
+                    mido.MetaMessage(
+                        "time_signature",
+                        numerator=int(numerator),
+                        denominator=int(denominator),
+                        clocks_per_click=24,
+                        notated_32nd_notes_per_beat=8,
+                        time=0,
+                    )
+                )
+            if key_root is not None and key_mode is not None:
+                track.append(
+                    mido.MetaMessage(
+                        "key_signature",
+                        key=key_to_midi_key_signature(int(key_root), str(key_mode)),
+                        time=0,
+                    )
+                )
 
         # Build note-on/note-off events
         events: list[tuple[int, str, int, int]] = []
@@ -80,6 +104,26 @@ def save_midi(mid: mido.MidiFile, path: str | Path) -> None:
 def load_midi(path: str | Path) -> mido.MidiFile:
     """Load a MIDI file from disk."""
     return mido.MidiFile(str(path))
+
+
+def midi_key_signature(mid: mido.MidiFile) -> str | None:
+    """Return the first MIDI key-signature meta message, if present."""
+    for track in mid.tracks:
+        for msg in track:
+            if msg.type == "key_signature":
+                parsed = parse_midi_key_signature(msg.key)
+                if parsed is not None:
+                    return msg.key
+    return None
+
+
+def midi_time_signature(mid: mido.MidiFile) -> tuple[int, int]:
+    """Return the first MIDI time-signature meta message, or 4/4."""
+    for track in mid.tracks:
+        for msg in track:
+            if msg.type == "time_signature":
+                return int(msg.numerator), int(msg.denominator)
+    return (4, 4)
 
 
 def midi_to_note_events(mid: mido.MidiFile) -> list[list[tuple[int, int, int]]]:

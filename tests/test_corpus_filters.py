@@ -80,7 +80,15 @@ def test_get_midi_files_treats_kunstderfuge_like_any_other_dataset(tmp_path: Pat
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_bytes(b"")
 
-    def fake_extract(score, num_voices, source="", form=None):
+    def fake_extract(
+        score,
+        num_voices,
+        source="",
+        form=None,
+        style="",
+        key_override=None,
+        time_signature_override=None,
+    ):
         comp = VoiceComposition(
             voices=[[(0, 480, 60)], [(0, 480, 48)]],
             key_root=0, key_mode="major", source=source, style="",

@@ -7,6 +7,7 @@ import random
 import pytest
 
 from bach_gen.data.conditioning import (
+    _extract_exposition_subject,
     apply_conditioning_dropout,
     cadence_token_ids_by_tick,
     detect_cadence_events,
@@ -32,7 +33,7 @@ def test_detect_cadence_events_finds_simple_pac():
         time_signature=(4, 4),
     )
 
-    events = detect_cadence_events(comp, min_confidence=2.0)
+    events = detect_cadence_events(comp, min_confidence=2.0, form="chorale")
 
     assert any(e.token_name == "CAD_PAC" and e.tick == 1920 for e in events)
 
@@ -54,6 +55,119 @@ def test_detect_subject_entries_finds_exposition_and_late_entry():
     assert len(entries) >= 2
     assert any(e.is_exposition for e in entries)
     assert any(e.voice_index == 1 for e in entries)
+
+
+def test_extract_exposition_subject_does_not_truncate_after_short_early_gap() -> None:
+    comp = VoiceComposition(
+        voices=[
+            [
+                (0, 480, 60),
+                (480, 480, 62),
+                (960, 480, 61),
+                (1440, 480, 63),
+                (2880, 480, 64),
+                (3360, 480, 65),
+            ],
+            [
+                (3840, 480, 67),
+                (4320, 480, 69),
+                (4800, 480, 68),
+                (5280, 480, 70),
+                (5760, 480, 71),
+            ],
+        ],
+        key_root=0,
+        key_mode="major",
+        source="unit-subject-gap",
+        time_signature=(4, 4),
+    )
+
+    _, subject, _ = _extract_exposition_subject(comp)
+
+    assert len(subject) >= 6
+
+
+def test_detect_subject_entries_rejects_compressed_same_voice_fragment() -> None:
+    subject = [
+        (0, 480, 60),
+        (480, 480, 62),
+        (960, 480, 61),
+        (1440, 480, 63),
+        (1920, 480, 64),
+        (2400, 480, 65),
+    ]
+    compressed_fragment = [
+        (4800, 180, 60),
+        (4980, 180, 62),
+        (5160, 180, 61),
+        (5340, 180, 63),
+        (5520, 180, 64),
+        (5700, 180, 65),
+    ]
+    transposed = [
+        (7680, 480, 67),
+        (8160, 480, 69),
+        (8640, 480, 68),
+        (9120, 480, 70),
+        (9600, 480, 71),
+        (10080, 480, 72),
+    ]
+
+    comp = VoiceComposition(
+        voices=[subject + compressed_fragment, transposed],
+        key_root=0,
+        key_mode="major",
+        source="unit-subject-span",
+        time_signature=(4, 4),
+    )
+
+    entries = detect_subject_entries(comp, min_quality=0.8, min_match_ratio=0.7)
+
+    assert len(entries) == 2
+    assert any(e.is_exposition for e in entries)
+    assert any(e.voice_index == 1 for e in entries)
+
+
+def test_detect_subject_entries_uses_stricter_sinfonia_thresholds() -> None:
+    subject = [
+        (0, 480, 60),
+        (480, 480, 62),
+        (960, 480, 61),
+        (1440, 480, 63),
+        (1920, 480, 64),
+        (2400, 480, 65),
+    ]
+    same_voice_loose_fragment = [
+        (3600, 300, 60),
+        (3900, 300, 62),
+        (4200, 300, 61),
+        (4500, 300, 63),
+        (4800, 300, 64),
+        (5100, 300, 65),
+    ]
+    transposed = [
+        (7680, 480, 67),
+        (8160, 480, 69),
+        (8640, 480, 68),
+        (9120, 480, 70),
+        (9600, 480, 71),
+        (10080, 480, 72),
+    ]
+
+    comp = VoiceComposition(
+        voices=[subject + same_voice_loose_fragment, transposed],
+        key_root=0,
+        key_mode="major",
+        source="unit-subject-sinfonia-thresholds",
+        time_signature=(4, 4),
+    )
+
+    default_entries = detect_subject_entries(comp, form="fugue")
+    sinfonia_entries = detect_subject_entries(comp, form="sinfonia")
+
+    assert len(default_entries) >= 3
+    assert len(sinfonia_entries) == 2
+    assert any(e.voice_index == 1 for e in sinfonia_entries)
 
 
 def test_apply_conditioning_dropout_keeps_first_subject_pair():
@@ -91,7 +205,7 @@ def test_scale_degree_encode_inserts_cadence_and_subject_markers():
         time_signature=(4, 4),
     )
 
-    cad_events = detect_cadence_events(comp, min_confidence=1.0)
+    cad_events = detect_cadence_events(comp, min_confidence=1.0, form="invention")
     cad_map = cadence_token_ids_by_tick(cad_events, tokenizer.name_to_token)
     subj_starts = {(1, 0)}
     subj_ends = {(1, 1)}
@@ -145,7 +259,7 @@ def test_tokenizers_emit_cadence_markers_consistently_across_encodings(tokenizer
         time_signature=(4, 4),
     )
 
-    cad_events = detect_cadence_events(comp, min_confidence=2.0)
+    cad_events = detect_cadence_events(comp, min_confidence=2.0, form="fugue")
     assert any(e.token_name == "CAD_PAC" and e.tick == 1920 for e in cad_events)
     cad_map = cadence_token_ids_by_tick(cad_events, tokenizer.name_to_token)
 
@@ -162,3 +276,20 @@ def test_tokenizers_emit_cadence_markers_consistently_across_encodings(tokenizer
     assert inter_names[cad_idx + 1] == "BAR"
     cad_idx = seq_names.index("CAD_PAC")
     assert seq_names[cad_idx + 1] == "BAR"
+
+
+def test_detect_cadence_events_finds_final_partial_bar_pac():
+    comp = VoiceComposition(
+        voices=[
+            [(0, 3360, 67), (3360, 240, 60)],
+            [(0, 3360, 55), (3360, 240, 48)],
+        ],
+        key_root=0,
+        key_mode="major",
+        source="unit-final-cadence",
+        time_signature=(4, 4),
+    )
+
+    events = detect_cadence_events(comp, form="chorale")
+
+    assert any(e.token_name == "CAD_PAC" and e.tick == 3840 for e in events)

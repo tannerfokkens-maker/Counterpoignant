@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 import logging
 from dataclasses import dataclass, field
 
@@ -16,6 +17,11 @@ from bach_gen.utils.constants import (
     TICKS_PER_QUARTER,
     DIR_TO_FORM,
     bwv_to_form,
+)
+from bach_gen.utils.music_theory import (
+    detect_composition_key,
+    parse_explicit_key_from_text,
+    pc_to_note_name,
 )
 
 logger = logging.getLogger(__name__)
@@ -79,14 +85,20 @@ def detect_form(score: music21.stream.Score, source: str, style: str) -> tuple[s
 
     Priority order:
     1. BWV number matching (from source string)
-    2. Source string keyword matching
-    3. Directory-based form (DIR_TO_FORM lookup on source path components)
-    4. Voice count + style fallback
+    2. High-confidence source string keyword matching
+    3. Trusted directory/path markers
+    4. Neutral fallback by source family + voice count
 
     Returns:
         (form_name, num_voices)
     """
     import re
+
+    try:
+        n_parts = len(list(score.parts))
+    except Exception:
+        n_parts = 4
+    inferred_num_voices = min(max(n_parts, 2), 4)
 
     # 1. BWV number matching
     bwv_match = re.search(r'BWV\s*(\d+)', source, re.IGNORECASE)
@@ -97,12 +109,103 @@ def detect_form(score: music21.stream.Score, source: str, style: str) -> tuple[s
             num_voices = FORM_DEFAULTS[form][0]
             return form, num_voices
 
+    def _has_any_keyword(text: str, keywords: tuple[str, ...]) -> bool:
+        return any(keyword in text for keyword in keywords)
+
+    def _is_orchestral_reduction_source(text: str) -> bool:
+        return _has_any_keyword(
+            text,
+            (
+                "symphony",
+                "orchestra",
+                "orchestral",
+                "concerto",
+                "overture",
+                "opera",
+                "ballet",
+                "cantata",
+                "requiem",
+                "mass",
+                "missa",
+                "for orchestra",
+                "for_orchestra",
+            ),
+        )
+
+    def _is_chamber_piece_source(text: str) -> bool:
+        return _has_any_keyword(
+            text,
+            (
+                "duet",
+                "duo",
+                "trio",
+                "quartet",
+                "quintet",
+                "sextet",
+                "septet",
+                "octet",
+            ),
+        )
+
+    def _is_strict_chorale_source(text: str) -> bool:
+        filename = text.rsplit("/", 1)[-1]
+        return bool(
+            re.search(r"(^|[_\-.])chor\d{3,}", filename)
+            or re.search(r"chorales?[_\-\s]\d{3,}", text)
+            or _has_any_keyword(
+                text,
+                (
+                    "four-part chorales",
+                    "four part chorales",
+                    "chorale harmonization",
+                    "chorale harmonizations",
+                    "harmonized chorales",
+                ),
+            )
+        )
+
+    def _is_chorale_based_keyboard_source(text: str) -> bool:
+        return _has_any_keyword(
+            text,
+            (
+                "chorale-prelude",
+                "chorale prelude",
+                "chorale_prelude",
+                "chorale-preludes",
+                "chorale preludes",
+                "chorale_preludes",
+                "chorale-variations",
+                "chorale variations",
+                "chorale_variations",
+                "schubler chorales",
+                "schubler_chorales",
+                "schubler-chorales",
+                "partita",
+                "fantasia",
+                "fantasy",
+                "organ",
+            ),
+        )
+
+    def _is_bach_sinfonia_source(text: str) -> bool:
+        return _has_any_keyword(
+            text,
+            (
+                "three-part inventions",
+                "three_part_inventions",
+                "three-part_inventions",
+                "three part inventions",
+                "sinfonias_bwv",
+                "sinfonias bwv",
+            ),
+        )
+
     # 2. Source string keyword matching
     source_lower = source.lower()
+    if _is_bach_sinfonia_source(source_lower):
+        return "sinfonia", FORM_DEFAULTS["sinfonia"][0]
     keyword_map = [
-        ("chorale", "chorale"),
         ("invention", "invention"),
-        ("sinfonia", "sinfonia"),
         ("trio sonata", "trio_sonata"),
         ("sonata", "sonata"),
         ("fugue", "fugue"),
@@ -117,7 +220,25 @@ def detect_form(score: music21.stream.Score, source: str, style: str) -> tuple[s
             num_voices = FORM_DEFAULTS[form][0]
             return form, num_voices
 
-    # 3. Directory-based form lookup
+    if "chorale" in source_lower:
+        if _is_strict_chorale_source(source_lower):
+            return "chorale", FORM_DEFAULTS["chorale"][0]
+        if style in {"renaissance", "medieval"} and not is_keyboard_like_source(source):
+            return "vocal_polyphony", inferred_num_voices
+        if _is_chorale_based_keyboard_source(source_lower) or style != "renaissance":
+            return "keyboard_piece", inferred_num_voices
+        return "chamber_piece", inferred_num_voices
+
+    if "sinfonia" in source_lower:
+        if style == "classical" or _is_orchestral_reduction_source(source_lower):
+            return "orchestral_reduction", inferred_num_voices
+        if is_keyboard_like_source(source):
+            return "keyboard_piece", inferred_num_voices
+        if _is_chamber_piece_source(source_lower):
+            return "chamber_piece", inferred_num_voices
+        return "chamber_piece", inferred_num_voices
+
+    # 3. Trusted directory/path-marker lookup
     source_parts = source.lower().replace("\\", "/").split("/")
     for part in source_parts:
         if part in DIR_TO_FORM:
@@ -125,25 +246,26 @@ def detect_form(score: music21.stream.Score, source: str, style: str) -> tuple[s
             num_voices = FORM_DEFAULTS[form][0]
             return form, num_voices
 
-    # 4. Voice count + style fallback
-    try:
-        n_parts = len(list(score.parts))
-    except Exception:
-        n_parts = 4
+    # 4. Voice count + source-family fallback
+    num_voices = inferred_num_voices
+
+    if style in {"renaissance", "medieval"} and not is_keyboard_like_source(source):
+        return "vocal_polyphony", num_voices
+
+    if _is_orchestral_reduction_source(source_lower):
+        return "orchestral_reduction", num_voices
+
+    if is_keyboard_like_source(source):
+        return "keyboard_piece", num_voices
+
+    if _is_chamber_piece_source(source_lower):
+        return "chamber_piece", num_voices
 
     if n_parts <= 2:
-        return "invention", 2
-    elif n_parts == 3:
-        return "sinfonia", 3
-    else:
-        # 4+ voices: pick form by style
-        num_voices = min(n_parts, 4)
-        if style == "renaissance":
-            return "motet", num_voices
-        elif style == "classical":
-            return "quartet", num_voices
-        else:
-            return "chorale", num_voices
+        return "keyboard_piece", 2
+    if n_parts == 3:
+        return "chamber_piece", 3
+    return "chamber_piece", num_voices
 
 
 def extract_voice_groups(
@@ -151,6 +273,9 @@ def extract_voice_groups(
     num_voices: int,
     source: str = "",
     form: str | None = None,
+    style: str = "",
+    key_override: tuple[int, str] | None = None,
+    time_signature_override: tuple[int, int] | None = None,
 ) -> list[VoiceComposition]:
     """Extract N-voice groups from a music21 Score.
 
@@ -164,8 +289,7 @@ def extract_voice_groups(
     Returns:
         List of VoiceComposition with exactly num_voices voices each.
     """
-    key_root, key_mode = _detect_key(score)
-    time_sig = _detect_time_signature(score)
+    time_sig = time_signature_override or _detect_time_signature(score)
 
     parts = list(score.parts)
     if not parts:
@@ -184,6 +308,17 @@ def extract_voice_groups(
         logger.debug(f"Fewer than {num_voices} voices in {source}, skipping")
         return []
 
+    if key_override is not None:
+        key_root, key_mode = key_override
+    else:
+        key_root, key_mode = _detect_key(
+            score,
+            style=style,
+            source=source,
+            voices=voices,
+            time_signature=time_sig,
+        )
+
     results: list[VoiceComposition] = []
 
     if len(voices) == num_voices:
@@ -192,6 +327,7 @@ def extract_voice_groups(
             key_root=key_root,
             key_mode=key_mode,
             source=source,
+            style=style,
             time_signature=time_sig,
         )
         if _validate_voice_group(comp):
@@ -205,6 +341,7 @@ def extract_voice_groups(
                 key_root=key_root,
                 key_mode=key_mode,
                 source=f"{source} (voices {i+1}-{i+num_voices})",
+                style=style,
                 time_signature=time_sig,
             )
             if _validate_voice_group(comp):
@@ -216,6 +353,7 @@ def extract_voice_groups(
 def extract_voice_pairs(
     score: music21.stream.Score,
     source: str = "",
+    style: str = "",
     pair_strategy: str = "adjacent+outer",
     max_pairs: int | None = None,
 ) -> list[VoicePair]:
@@ -237,8 +375,6 @@ def extract_voice_pairs(
     Returns:
         List of VoicePair (possibly capped by ``max_pairs``).
     """
-    # Detect key
-    key_root, key_mode = _detect_key(score)
     time_sig = _detect_time_signature(score)
 
     # Get individual voice parts
@@ -257,6 +393,14 @@ def extract_voice_pairs(
         logger.debug(f"Fewer than 2 voices in {source}, skipping")
         return []
 
+    key_root, key_mode = _detect_key(
+        score,
+        style=style,
+        source=source,
+        voices=voices,
+        time_signature=time_sig,
+    )
+
     pairs = []
 
     if len(voices) == 2:
@@ -266,6 +410,7 @@ def extract_voice_pairs(
             key_root=key_root,
             key_mode=key_mode,
             source=source,
+            style=style,
             time_signature=time_sig,
         ))
     else:
@@ -290,6 +435,7 @@ def extract_voice_pairs(
                 key_root=key_root,
                 key_mode=key_mode,
                 source=f"{source} (voices {i+1}-{j+1})",
+                style=style,
                 time_signature=time_sig,
             ))
 
@@ -305,25 +451,123 @@ def extract_voice_pairs(
     return valid_pairs
 
 
-def _detect_key(score: music21.stream.Score) -> tuple[int, str]:
-    """Detect the key of a score."""
+def _score_key_signature_string(score: music21.stream.Score) -> str | None:
+    """Return the first written key-signature name, if present."""
+    names = _score_key_signature_names(score)
+    return names[0] if names else None
+
+
+def _score_key_signature_names(score: music21.stream.Score) -> list[str]:
+    """Return unique written key-signature tonic names in score order."""
+    names: list[str] = []
     try:
-        # Many exported scores already carry explicit key objects.
-        # Reuse that metadata instead of invoking a fresh analysis pass.
-        for explicit_key in score.recurse().getElementsByClass(music21.key.Key):
-            root_pc = explicit_key.tonic.pitchClass
-            mode = "minor" if explicit_key.mode == "minor" else "major"
+        for key_sig in score.recurse().getElementsByClass(music21.key.KeySignature):
+            if getattr(key_sig, "sharps", None) is None:
+                continue
+            if not -7 <= key_sig.sharps <= 7:
+                continue
+            tonic = key_sig.asKey("major").tonic.pitchClass
+            name = pc_to_note_name(tonic)
+            if name not in names:
+                names.append(name)
+    except Exception:
+        return names
+    return names
+
+
+def _score_detect_voices(score: music21.stream.Score) -> list[list[tuple[int, int, int]]]:
+    """Extract note lists per part for score-level key detection."""
+    parts = list(score.parts) or [score]
+    voices: list[list[tuple[int, int, int]]] = []
+    for part in parts:
+        notes = _part_to_notes(part)
+        if notes:
+            voices.append(notes)
+    return voices
+
+
+def _detect_key(
+    score: music21.stream.Score,
+    *,
+    style: str = "",
+    source: str = "",
+    voices: list[list[tuple[int, int, int]]] | None = None,
+    time_signature: tuple[int, int] | None = None,
+) -> tuple[int, str]:
+    """Detect the key of a score or score-derived voice list."""
+    source_hint = str(source or getattr(score, "filePath", "") or "").lower()
+    source_key_hint = parse_explicit_key_from_text(source_hint)
+    key_sig_names = _score_key_signature_names(score)
+    has_stable_written_signature = len(key_sig_names) == 1
+
+    if voices and source_hint.endswith((".mid", ".midi")):
+        root_pc, mode, _conf, _source = detect_composition_key(
+            voices,
+            time_signature=time_signature or _detect_time_signature(score),
+            midi_key_signature=_score_key_signature_string(score),
+            style=style,
+            source_key_hint=source_key_hint,
+        )
+        return root_pc, mode
+
+    explicit_keys: list[tuple[int, str]] = []
+    try:
+        if (
+            not source_hint.endswith((".mid", ".midi"))
+            and style not in {"renaissance", "medieval"}
+        ):
+            for explicit_key in score.recurse().getElementsByClass(music21.key.Key):
+                if getattr(explicit_key, "mode", None) not in {"major", "minor"}:
+                    continue
+                root_pc = explicit_key.tonic.pitchClass
+                mode = "minor" if explicit_key.mode == "minor" else "major"
+                explicit_keys.append((root_pc, mode))
+    except Exception:
+        pass
+
+    if explicit_keys:
+        return Counter(explicit_keys).most_common(1)[0][0]
+
+    detect_voices = voices or _score_detect_voices(score)
+    heuristic_key: tuple[int, str] | None = None
+    heuristic_conf = 0.0
+    if detect_voices:
+        root_pc, mode, heuristic_conf, _source = detect_composition_key(
+            detect_voices,
+            time_signature=time_signature or _detect_time_signature(score),
+            midi_key_signature=_score_key_signature_string(score),
+            style=style,
+            source_key_hint=source_key_hint,
+        )
+        heuristic_key = (root_pc, mode)
+
+    try:
+        analyzed_key = score.analyze("key")
+        if getattr(analyzed_key, "mode", None) in {"major", "minor"}:
+            root_pc = analyzed_key.tonic.pitchClass
+            mode = "minor" if analyzed_key.mode == "minor" else "major"
+            if heuristic_key is not None and has_stable_written_signature:
+                parsed_sig = parse_explicit_key_from_text(f"{key_sig_names[0]} major") if key_sig_names else None
+                if parsed_sig is not None:
+                    compatible = {
+                        parsed_sig,
+                        ((parsed_sig[0] + 9) % 12, "minor"),
+                    }
+                    if heuristic_key in compatible and (root_pc, mode) not in compatible:
+                        return heuristic_key
             return root_pc, mode
     except Exception:
         pass
 
-    try:
-        analyzed_key = score.analyze("key")
-        root_pc = analyzed_key.tonic.pitchClass
-        mode = "minor" if analyzed_key.mode == "minor" else "major"
-        return root_pc, mode
-    except Exception:
-        return 0, "major"  # default to C major
+    if heuristic_key is not None:
+        return heuristic_key
+
+    key_sig_name = _score_key_signature_string(score)
+    if key_sig_name is not None:
+        tonic = music21.pitch.Pitch(key_sig_name).pitchClass
+        return tonic, "major"
+
+    return 0, "major"  # default to C major
 
 
 def _detect_time_signature(score: music21.stream.Score) -> tuple[int, int]:
@@ -576,6 +820,8 @@ def is_keyboard_like_source(source: str) -> bool:
         "suite",
         "toccata",
         "fantasia",
+        "fantaisie",
+        "fantasy",
         "prelude",
         "fughetta",
         "invention",
@@ -585,5 +831,21 @@ def is_keyboard_like_source(source: str) -> bool:
         "piano",
         "harpsichord",
         "clavier",
+        "etude",
+        "study",
+        "mazurka",
+        "nocturne",
+        "waltz",
+        "valse",
+        "polonaise",
+        "impromptu",
+        "ballade",
+        "bagatelle",
+        "rhapsody",
+        "intermezzo",
+        "romance",
+        "albumblatt",
+        "lied ohne worte",
+        "liebestraume",
     )
     return any(k in s for k in keywords)

@@ -19,8 +19,8 @@ from bach_gen.data.extraction import VoiceComposition
 from bach_gen.data.tokenizer import BachTokenizer, load_tokenizer
 from bach_gen.evaluation.scorer import score_composition
 from bach_gen.evaluation.statistical import load_corpus_stats
-from bach_gen.utils.midi_io import load_midi, midi_to_note_events
-from bach_gen.utils.music_theory import detect_key
+from bach_gen.utils.midi_io import load_midi, midi_key_signature, midi_time_signature, midi_to_note_events
+from bach_gen.utils.music_theory import detect_composition_key
 
 
 def _infer_mode(path: Path, n_voices: int) -> str:
@@ -86,7 +86,8 @@ def _voice_balance(voices: list[list[tuple[int, int, int]]]) -> tuple[float, int
 
 
 def _load_comp(path: Path) -> VoiceComposition:
-    tracks = midi_to_note_events(load_midi(path))
+    mid = load_midi(path)
+    tracks = midi_to_note_events(mid)
     voices = [v for v in tracks if v]
 
     if len(voices) < 2 and len(tracks) == 1 and tracks[0]:
@@ -100,12 +101,19 @@ def _load_comp(path: Path) -> VoiceComposition:
     if len(voices) < 2:
         raise ValueError("Need at least two voices")
 
-    pc_counts = np.zeros(12)
-    for v in voices:
-        for _, _, p in v:
-            pc_counts[p % 12] += 1
-    key_root, key_mode, _ = detect_key(pc_counts)
-    return VoiceComposition(voices=voices, key_root=key_root, key_mode=key_mode, source=str(path))
+    time_sig = midi_time_signature(mid)
+    key_root, key_mode, _key_conf, _key_source = detect_composition_key(
+        voices,
+        time_signature=time_sig,
+        midi_key_signature=midi_key_signature(mid),
+    )
+    return VoiceComposition(
+        voices=voices,
+        key_root=key_root,
+        key_mode=key_mode,
+        source=str(path),
+        time_signature=time_sig,
+    )
 
 
 def _collect_files(patterns: list[str], explicit: list[str]) -> list[Path]:

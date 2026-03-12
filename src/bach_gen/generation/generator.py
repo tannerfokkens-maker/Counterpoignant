@@ -36,6 +36,13 @@ from bach_gen.utils.midi_io import note_events_to_midi, save_midi
 logger = logging.getLogger(__name__)
 
 
+RANK_BY_PROXIES = {
+    "bach-similarity": "bach_similarity",
+    "rhetorical-impact": "rhetorical_impact",
+    "demo-bach-balance": "demo_bach_balance",
+}
+
+
 @dataclass
 class BeamHypothesis:
     """A single beam search hypothesis."""
@@ -58,6 +65,7 @@ class GenerationResult:
     composition: VoiceComposition
     tokens: list[int]
     score: ScoreBreakdown
+    rank_value: float = 0.0
     midi_path: str | None = None
 
     @property
@@ -172,6 +180,7 @@ def _push_top_result(
     candidates: list[GenerationResult],
     result: GenerationResult,
     top_k_results: int,
+    rank_by: str = "composite",
 ) -> None:
     """Keep only the top-k scoring candidates in memory."""
     if top_k_results <= 0:
@@ -180,9 +189,52 @@ def _push_top_result(
         candidates.append(result)
         return
 
-    worst_idx = min(range(len(candidates)), key=lambda i: candidates[i].score.composite)
-    if result.score.composite > candidates[worst_idx].score.composite:
+    worst_idx = min(range(len(candidates)), key=lambda i: _candidate_rank_value(candidates[i], rank_by))
+    if _candidate_rank_value(result, rank_by) > _candidate_rank_value(candidates[worst_idx], rank_by):
         candidates[worst_idx] = result
+
+
+def normalize_rank_by(rank_by: str | None) -> str:
+    """Normalize candidate ranking option names."""
+    if not rank_by:
+        return "composite"
+    normalized = rank_by.strip().lower().replace("_", "-")
+    if normalized not in {"composite", *RANK_BY_PROXIES.keys()}:
+        raise ValueError(f"Unsupported ranking objective: {rank_by}")
+    return normalized
+
+
+def rank_by_label(rank_by: str | None) -> str:
+    """Return a user-facing label for the ranking objective."""
+    normalized = normalize_rank_by(rank_by)
+    return {
+        "composite": "composite",
+        "bach-similarity": "Bach similarity",
+        "rhetorical-impact": "rhetorical impact",
+        "demo-bach-balance": "demo/Bach balance",
+    }[normalized]
+
+
+def score_rank_value(score: ScoreBreakdown, rank_by: str | None = "composite") -> float:
+    """Return the scalar used to rank a scored candidate."""
+    normalized = normalize_rank_by(rank_by)
+    if normalized == "composite":
+        return float(score.composite)
+
+    details = score.details if isinstance(score.details, dict) else {}
+    proxies = details.get("style_proxies", {}) if isinstance(details, dict) else {}
+    proxy_key = RANK_BY_PROXIES[normalized]
+    value = proxies.get(proxy_key)
+    if value is None:
+        return float(score.composite)
+    return float(value)
+
+
+def _candidate_rank_value(result: GenerationResult, rank_by: str | None = "composite") -> float:
+    """Return a candidate's retained ranking value."""
+    if result.rank_value:
+        return float(result.rank_value)
+    return score_rank_value(result.score, rank_by)
 
 
 def _passes_candidate_guardrails(score: ScoreBreakdown, form: str) -> bool:
@@ -271,6 +323,7 @@ def generate(
     cadence_density: str | None = None,
     min_subject_entries: int = 0,
     subject_spacing_bars: int = 8,
+    rank_by: str = "composite",
 ) -> list[GenerationResult]:
     """Generate Bach-style compositions and return top results.
 
@@ -307,11 +360,13 @@ def generate(
         cadence_density: Optional cadence control intensity (low/medium/high).
         min_subject_entries: Minimum number of prompted subject re-entries.
         subject_spacing_bars: Minimum bars between prompted subject entries.
+        rank_by: Candidate ranking objective. Default: composite.
 
     Returns:
         List of top GenerationResult, sorted by score.
     """
     device = next(model.parameters()).device
+    rank_by = normalize_rank_by(rank_by)
 
     # Auto-detect DroPE: if model was recalibrated without positional
     # embeddings, generation must also skip them.
@@ -331,6 +386,7 @@ def generate(
     # Build prompt
     prompt_tokens = _build_prompt(
         tokenizer, key_root, key_mode, key_name, subject_str, form, style,
+        num_voices=num_voices,
         length=length, meter=meter, texture=texture, imitation=imitation,
         harmonic_rhythm=harmonic_rhythm, harmonic_tension=harmonic_tension,
         chromaticism=chromaticism,
@@ -407,7 +463,8 @@ def generate(
                 composition=comp,
                 tokens=tokens,
                 score=score,
-            ), top_k_results)
+                rank_value=score_rank_value(score, rank_by),
+            ), top_k_results, rank_by=rank_by)
 
             if progress_callback:
                 progress_callback(i + 1, len(beam_sequences))
@@ -472,7 +529,8 @@ def generate(
                     composition=comp,
                     tokens=tokens,
                     score=score,
-                ), top_k_results)
+                    rank_value=score_rank_value(score, rank_by),
+                ), top_k_results, rank_by=rank_by)
                 if device.type == "mps":
                     torch.mps.empty_cache()
 
@@ -482,7 +540,7 @@ def generate(
             generated += curr_batch
 
     # Sort retained top-k candidates by score (descending)
-    top_results = sorted(candidates, key=lambda r: r.score.composite, reverse=True)
+    top_results = sorted(candidates, key=lambda r: _candidate_rank_value(r, rank_by), reverse=True)
     if len(top_results) < top_k_results:
         logger.warning(
             "Only %d/%d candidates met the %d-voice minimum for form=%s. "
@@ -497,10 +555,24 @@ def generate(
     for i, result in enumerate(top_results):
         filename = f"{form_label}_{key_name}_{i+1}.mid"
         midi_path = output_path / filename
-        mid = note_events_to_midi(voices=result.composition.voices)
+        mid = note_events_to_midi(
+            voices=result.composition.voices,
+            key_root=result.composition.key_root,
+            key_mode=result.composition.key_mode,
+            time_signature=result.composition.time_signature,
+        )
         save_midi(mid, midi_path)
         result.midi_path = str(midi_path)
-        logger.info(f"Saved {midi_path} (score: {result.score.composite:.3f})")
+        if rank_by == "composite":
+            logger.info(f"Saved {midi_path} (score: {result.score.composite:.3f})")
+        else:
+            logger.info(
+                "Saved %s (%s: %.3f, composite: %.3f)",
+                midi_path,
+                rank_by_label(rank_by),
+                _candidate_rank_value(result, rank_by),
+                result.score.composite,
+            )
 
     return top_results
 
@@ -513,6 +585,7 @@ def _build_prompt(
     subject_str: str | None,
     form: str = "2-part",
     style: str = "bach",
+    num_voices: int | None = None,
     length: str | None = None,
     meter: str | None = None,
     texture: str | None = None,
@@ -538,8 +611,19 @@ def _build_prompt(
         tokens.append(tokenizer.FORM_TO_FORM_TOKEN[form])
 
     # Voice-count token (how many voices)
-    if form in tokenizer.FORM_TO_MODE_TOKEN:
-        tokens.append(tokenizer.FORM_TO_MODE_TOKEN[form])
+    mode_token: int | None = None
+    if form == "fugue":
+        mode_token = tokenizer.MODE_FUGUE
+    elif num_voices == 2:
+        mode_token = tokenizer.MODE_2PART
+    elif num_voices == 3:
+        mode_token = tokenizer.MODE_3PART
+    elif num_voices and num_voices >= 4:
+        mode_token = tokenizer.MODE_4PART
+    elif form in tokenizer.FORM_TO_MODE_TOKEN:
+        mode_token = tokenizer.FORM_TO_MODE_TOKEN[form]
+    if mode_token is not None:
+        tokens.append(mode_token)
 
     # Length conditioning token
     # Default: infer from form if not specified
@@ -548,6 +632,8 @@ def _build_prompt(
             "chorale": "short", "invention": "medium", "sinfonia": "medium",
             "trio_sonata": "medium", "2-part": "medium",
             "fugue": "long", "quartet": "long", "sonata": "long", "motet": "long",
+            "keyboard_piece": "long", "chamber_piece": "long",
+            "orchestral_reduction": "long", "vocal_polyphony": "long",
         }
         length = _form_to_default_length.get(form)
     if length and hasattr(tokenizer, "LENGTH_TO_TOKEN") and length in tokenizer.LENGTH_TO_TOKEN:
@@ -670,6 +756,7 @@ def generate_voice_by_voice(
     cadence_density: str | None = None,
     min_subject_entries: int = 0,
     subject_spacing_bars: int = 8,
+    rank_by: str = "composite",
 ) -> list[GenerationResult]:
     """Generate compositions voice-by-voice using sequential encoding.
 
@@ -679,6 +766,7 @@ def generate_voice_by_voice(
     4. Decodes full sequence, scores, returns top K
     """
     device = next(model.parameters()).device
+    rank_by = normalize_rank_by(rank_by)
 
     # Auto-detect DroPE
     use_rope = not getattr(model.config, "drope_trained", False)
@@ -695,7 +783,7 @@ def generate_voice_by_voice(
     # Build prompt with sequential encoding mode
     prompt_tokens = _build_prompt(
         tokenizer, key_root, key_mode, key_name,
-        subject_str=None, form=form, style=style,
+        subject_str=None, form=form, style=style, num_voices=num_voices,
         length=length, meter=meter, texture=texture, imitation=imitation,
         harmonic_rhythm=harmonic_rhythm, harmonic_tension=harmonic_tension,
         chromaticism=chromaticism,
@@ -796,14 +884,15 @@ def generate_voice_by_voice(
                     composition=comp,
                     tokens=tokens,
                     score=score,
-                ), top_k_results)
+                    rank_value=score_rank_value(score, rank_by),
+                ), top_k_results, rank_by=rank_by)
 
             if progress_callback:
                 progress_callback(i + 1, num_candidates)
 
         generated += curr_batch
 
-    top_results = sorted(candidates, key=lambda r: r.score.composite, reverse=True)
+    top_results = sorted(candidates, key=lambda r: _candidate_rank_value(r, rank_by), reverse=True)
     if len(top_results) < top_k_results:
         logger.warning(
             "Only %d/%d candidates met the %d-voice minimum for form=%s (voice-by-voice). "
@@ -817,10 +906,24 @@ def generate_voice_by_voice(
     for i, result in enumerate(top_results):
         filename = f"{form_label}_{key_name}_vbv_{i+1}.mid"
         midi_path = output_path / filename
-        mid = note_events_to_midi(voices=result.composition.voices)
+        mid = note_events_to_midi(
+            voices=result.composition.voices,
+            key_root=result.composition.key_root,
+            key_mode=result.composition.key_mode,
+            time_signature=result.composition.time_signature,
+        )
         save_midi(mid, midi_path)
         result.midi_path = str(midi_path)
-        logger.info(f"Saved {midi_path} (score: {result.score.composite:.3f})")
+        if rank_by == "composite":
+            logger.info(f"Saved {midi_path} (score: {result.score.composite:.3f})")
+        else:
+            logger.info(
+                "Saved %s (%s: %.3f, composite: %.3f)",
+                midi_path,
+                rank_by_label(rank_by),
+                _candidate_rank_value(result, rank_by),
+                result.score.composite,
+            )
 
     return top_results
 

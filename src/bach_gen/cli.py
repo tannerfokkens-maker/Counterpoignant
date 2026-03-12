@@ -390,7 +390,7 @@ def _tokenize_items(
         time_sig = item.time_signature if hasattr(item, "time_signature") else (4, 4)
         num_bars = compute_measure_count(item.voices, time_sig)
 
-        labels = analyze_composition(item, time_sig)
+        labels = analyze_composition(item, time_sig, form=item_form)
         cadence_map: dict[int, int] | None = None
         subject_start_markers: set[tuple[int, int]] | None = None
         subject_end_markers: set[tuple[int, int]] | None = None
@@ -399,6 +399,7 @@ def _tokenize_items(
             cadence_events = detect_cadence_events(
                 item,
                 min_confidence=cadence_min_confidence,
+                form=item_form,
             )
             cadence_map = cadence_token_ids_by_tick(cadence_events, tokenizer.name_to_token)
 
@@ -407,6 +408,7 @@ def _tokenize_items(
                 item,
                 min_quality=subject_min_quality,
                 min_match_ratio=subject_min_match_ratio,
+                form=item_form,
             )
             subject_start_markers, subject_end_markers = subject_boundary_note_indices(subject_entries)
 
@@ -1198,8 +1200,8 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
 @click.option("--piece-balance", type=click.Choice(["none", "sqrt", "inverse"]),
               default="sqrt",
               help="Down-weight heavily-chunked pieces via WeightedRandomSampler (default: sqrt)")
-@click.option("--num-recurrent-steps", default=3, type=int,
-              help="LoopLM: number of times to loop through the layer stack (1 = standard transformer, default: 3)")
+@click.option("--num-recurrent-steps", default=2, type=int,
+              help="LoopLM: number of times to loop through the layer stack (1 = standard transformer, default: 2)")
 @click.option("--looplm-sandwich-norm", is_flag=True, default=False,
               help="LoopLM: enable sandwich normalization (RMSNorm after each sublayer) for recurrence stability")
 @click.option("--looplm-exit-gate/--no-looplm-exit-gate", default=True,
@@ -1835,7 +1837,7 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None,
               help="Beam width for beam search (disables sampling when set)")
 @click.option("--length-penalty", type=float, default=0.7,
               help="Length penalty alpha for beam search (default: 0.7)")
-@click.option("--style", type=click.Choice(["bach", "baroque", "renaissance", "classical"]),
+@click.option("--style", type=click.Choice(["bach", "baroque", "renaissance", "classical", "romantic", "modern", "medieval", "other"]),
               default="bach", help="Style conditioning (default: bach)")
 @click.option("--length", type=click.Choice(["short", "medium", "long", "extended"]),
               default=None, help="Length conditioning (default: infer from form)")
@@ -1863,6 +1865,13 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None,
               help="Minimum prompted subject re-entry markers after exposition")
 @click.option("--subject-spacing", default=8, type=int,
               help="Minimum bars between prompted subject re-entry markers")
+@click.option(
+    "--rank-by",
+    type=click.Choice(["composite", "bach-similarity", "rhetorical-impact", "demo-bach-balance"]),
+    default="composite",
+    show_default=True,
+    help="Candidate ranking objective (selection only; does not change scoring).",
+)
 def generate(
     key: str,
     subject: str | None,
@@ -1890,12 +1899,14 @@ def generate(
     cadence_density: str | None,
     min_subject_entries: int,
     subject_spacing: int,
+    rank_by: str,
 ) -> None:
     """Generate Bach-style compositions."""
     from bach_gen.data.tokenizer import load_tokenizer
     from bach_gen.model.trainer import Trainer
     from bach_gen.generation.generator import generate as gen_fn
     from bach_gen.generation.generator import generate_voice_by_voice as gen_vbv_fn
+    from bach_gen.generation.generator import rank_by_label
     from bach_gen.evaluation.statistical import load_corpus_stats
     from bach_gen.evaluation.information import load_information_calibration
 
@@ -1971,6 +1982,8 @@ def generate(
             console.print(f"  Candidate batch size: {candidate_batch_size}")
     if cadence_density is not None:
         console.print(f"  Cadence density control: {cadence_density}")
+    if rank_by != "composite":
+        console.print(f"  Candidate ranking: {rank_by_label(rank_by)}")
     if min_subject_entries > 0:
         console.print(
             f"  Subject re-entry control: min_entries={min_subject_entries}, "
@@ -2023,6 +2036,7 @@ def generate(
             cadence_density=cadence_density,
             min_subject_entries=min_subject_entries,
             subject_spacing_bars=subject_spacing,
+            rank_by=rank_by,
         ) if not voice_by_voice else gen_vbv_fn(
             model=model,
             tokenizer=tokenizer,
@@ -2049,6 +2063,7 @@ def generate(
             cadence_density=cadence_density,
             min_subject_entries=min_subject_entries,
             subject_spacing_bars=subject_spacing,
+            rank_by=rank_by,
         )
         progress.update(task, description="Done!")
 
@@ -2057,9 +2072,16 @@ def generate(
         sys.exit(1)
 
     # Display results
-    table = Table(title=f"Top {len(results)} Results — {key} ({mode})")
+    title = f"Top {len(results)} Results — {key} ({mode})"
+    if rank_by != "composite":
+        title = f"{title}, ranked by {rank_by_label(rank_by)}"
+    table = Table(title=title)
     table.add_column("#", style="bold")
-    table.add_column("Score", justify="right")
+    if rank_by == "composite":
+        table.add_column("Score", justify="right")
+    else:
+        table.add_column("Rank", justify="right")
+        table.add_column("Composite", justify="right")
     table.add_column("Voice Lead.", justify="right")
     table.add_column("Statistical", justify="right")
     table.add_column("Structural", justify="right")
@@ -2070,17 +2092,24 @@ def generate(
 
     for i, r in enumerate(results):
         s = r.score
-        table.add_row(
-            str(i + 1),
-            f"{s.composite:.3f}",
-            f"{s.voice_leading:.3f}",
-            f"{s.statistical:.3f}",
-            f"{s.structural:.3f}",
-            f"{s.contrapuntal:.3f}",
-            f"{s.completeness:.3f}",
-            f"{s.thematic_recall:.3f}",
-            r.midi_path or "—",
+        row = [str(i + 1)]
+        if rank_by == "composite":
+            row.append(f"{s.composite:.3f}")
+        else:
+            row.append(f"{r.rank_value:.3f}")
+            row.append(f"{s.composite:.3f}")
+        row.extend(
+            [
+                f"{s.voice_leading:.3f}",
+                f"{s.statistical:.3f}",
+                f"{s.structural:.3f}",
+                f"{s.contrapuntal:.3f}",
+                f"{s.completeness:.3f}",
+                f"{s.thematic_recall:.3f}",
+                r.midi_path or "—",
+            ]
         )
+        table.add_row(*row)
 
     console.print()
     console.print(table)
@@ -2123,15 +2152,13 @@ def evaluate(
     sample_rate: int,
 ) -> None:
     """Evaluate a MIDI file for Bach-style quality."""
-    from bach_gen.utils.midi_io import load_midi, midi_to_note_events
+    from bach_gen.utils.midi_io import load_midi, midi_key_signature, midi_time_signature, midi_to_note_events
     from bach_gen.data.extraction import VoiceComposition
     from bach_gen.data.tokenizer import BachTokenizer, load_tokenizer
     from bach_gen.evaluation.scorer import score_composition
     from bach_gen.evaluation.statistical import load_corpus_stats
     from bach_gen.evaluation.information import load_information_calibration
-    from bach_gen.utils.music_theory import detect_key
-
-    import numpy as np
+    from bach_gen.utils.music_theory import detect_composition_key
 
     # Load corpus stats
     stats_path = DATA_DIR / "corpus_stats.json"
@@ -2164,24 +2191,27 @@ def evaluate(
     if mode is None:
         mode = _infer_evaluate_mode(midi_file, num_tracks)
 
-    # Detect key from all voices
-    pc_counts = np.zeros(12)
-    for track in tracks:
-        for _, _, p in track:
-            pc_counts[p % 12] += 1
-    key_root, key_mode, _ = detect_key(pc_counts)
+    time_sig = midi_time_signature(mid)
+    key_root, key_mode, key_conf, key_source = detect_composition_key(
+        tracks,
+        time_signature=time_sig,
+        midi_key_signature=midi_key_signature(mid),
+    )
 
     comp = VoiceComposition(
         voices=tracks,
         key_root=key_root,
         key_mode=key_mode,
         source=midi_file,
+        time_signature=time_sig,
     )
 
     from bach_gen.utils.music_theory import pc_to_note_name
     key_name = f"{pc_to_note_name(key_root)} {key_mode}"
     console.print(f"  Detected key: {key_name}")
+    console.print(f"  Key source: {key_source} ({key_conf:.3f})")
     console.print(f"  Mode: {mode} ({comp.num_voices} voices)")
+    console.print(f"  Meter: {time_sig[0]}/{time_sig[1]}")
     for i, v in enumerate(comp.voices):
         console.print(f"  Voice {i+1}: {len(v)} notes")
 
@@ -2272,6 +2302,71 @@ def evaluate(
         sys.exit(1)
 
     console.print(f"[green]Rendered audio:[/green] {rendered}")
+
+
+@cli.command("audit-conditioning")
+@click.option("--manifest", default="data/benchmarks/bach_gold.json", show_default=True,
+              help="Benchmark manifest JSON.")
+@click.option("--out-csv", default="output/conditioning_audit.csv", show_default=True,
+              help="Per-piece CSV output.")
+@click.option("--out-json", default="output/conditioning_audit_summary.json", show_default=True,
+              help="Summary JSON output.")
+@click.option("--form", "forms", multiple=True,
+              type=click.Choice(["fugue", "invention", "sinfonia", "chorale", "motet", "trio_sonata", "quartet", "keyboard_piece", "chamber_piece", "orchestral_reduction", "vocal_polyphony"]),
+              help="Restrict to one or more forms.")
+@click.option("--group", "groups", multiple=True, help="Restrict to one or more manifest groups.")
+@click.option("--max-per-group", type=int, default=None,
+              help="Optional cap per group for quick runs.")
+@click.option("--thresholds", default=None,
+              help="Optional threshold JSON override.")
+@click.option(
+    "--pipeline",
+    type=click.Choice(["midi_eval", "prepare_data"]),
+    default="midi_eval",
+    show_default=True,
+    help="Audit the standalone MIDI-eval path or the local prepare-data extraction path.",
+)
+@click.option("--fail-on-violations", is_flag=True, default=False,
+              help="Exit non-zero if Bach-form prior checks fail.")
+def audit_conditioning(
+    manifest: str,
+    out_csv: str,
+    out_json: str,
+    forms: tuple[str, ...],
+    groups: tuple[str, ...],
+    max_per_group: int | None,
+    thresholds: str | None,
+    pipeline: str,
+    fail_on_violations: bool,
+) -> None:
+    """Audit conditioning-label quality on the Bach gold benchmark."""
+    from bach_gen.data.label_audit import (
+        build_conditioning_audit_rows,
+        render_conditioning_audit_summary,
+        summarize_conditioning_audit,
+        write_conditioning_audit,
+    )
+
+    rows = build_conditioning_audit_rows(
+        manifest_path=Path(manifest),
+        forms=set(forms) if forms else None,
+        groups=set(groups) if groups else None,
+        max_per_group=max_per_group,
+        thresholds_path=Path(thresholds) if thresholds else None,
+        pipeline=pipeline,
+    )
+    summary = summarize_conditioning_audit(rows, manifest_path=Path(manifest))
+    write_conditioning_audit(
+        rows,
+        summary,
+        out_csv=Path(out_csv),
+        out_json=Path(out_json),
+    )
+    console.print(render_conditioning_audit_summary(summary))
+    console.print(f"\n[green]Saved audit CSV:[/green] {out_csv}")
+    console.print(f"[green]Saved audit summary:[/green] {out_json}")
+    if fail_on_violations and summary.get("violations"):
+        sys.exit(1)
 
 
 @cli.command()

@@ -14,6 +14,7 @@ import math
 import random
 from collections import deque
 
+from bach_gen.data.conditioning_config import get_form_thresholds
 from bach_gen.data.extraction import VoiceComposition
 from bach_gen.utils.constants import TICKS_PER_QUARTER, ticks_per_measure
 from bach_gen.utils.music_theory import get_scale
@@ -74,16 +75,174 @@ def _note_starting_at_tick(
     return None
 
 
+def _arrival_note_around_tick(
+    notes: list[tuple[int, int, int]],
+    tick: int,
+    window_ticks: int,
+) -> tuple[int, tuple[int, int, int]] | None:
+    best: tuple[int, tuple[int, int, int]] | None = None
+    best_key = (10**12, 10**12)
+    for idx, note in enumerate(notes):
+        start, dur, _ = note
+        end = start + dur
+        if start <= tick < end:
+            priority = 0
+            distance = abs(start - tick)
+        elif abs(start - tick) <= window_ticks:
+            priority = 1
+            distance = abs(start - tick)
+        elif abs(end - tick) <= window_ticks:
+            priority = 2
+            distance = abs(end - tick)
+        else:
+            continue
+        candidate_key = (priority, distance)
+        if candidate_key < best_key:
+            best = (idx, note)
+            best_key = candidate_key
+    return best
+
+
+def _boundary_support_features(
+    voices: list[list[tuple[int, int, int]]],
+    boundary_tick: int,
+    phrase_window_ticks: int,
+) -> tuple[bool, bool, bool]:
+    """Return (rhythmic_convergence, duration_pattern, phrase_support)."""
+    converged = 0
+    long_holders = 0
+    phrase_support_votes = 0
+
+    for voice in voices:
+        active_idx = _active_note_index_at_tick(voice, boundary_tick)
+        if active_idx is None:
+            converged += 1
+            phrase_support_votes += 1
+            continue
+
+        start, dur, _ = voice[active_idx]
+        end = start + dur
+        ends_near = abs(end - boundary_tick) <= phrase_window_ticks
+        starts_near = abs(start - boundary_tick) <= phrase_window_ticks
+        next_start = voice[active_idx + 1][0] if active_idx + 1 < len(voice) else None
+        gap_after = next_start is not None and (next_start - end) >= phrase_window_ticks
+
+        if dur >= (2 * TICKS_PER_QUARTER) or ends_near:
+            converged += 1
+        if dur >= (2 * TICKS_PER_QUARTER):
+            long_holders += 1
+        if ends_near or starts_near or gap_after:
+            phrase_support_votes += 1
+
+    rhythmic_convergence = converged >= max(2, math.ceil(len(voices) * 0.5))
+    duration_pattern = long_holders >= max(1, math.ceil(len(voices) * 0.25))
+    phrase_support = phrase_support_votes >= max(2, math.ceil(len(voices) * 0.5))
+    return rhythmic_convergence, duration_pattern, phrase_support
+
+
+def _apply_cadence_min_spacing(
+    events: list[CadenceEvent],
+    *,
+    min_spacing_ticks: int,
+) -> list[CadenceEvent]:
+    if min_spacing_ticks <= 0 or len(events) <= 1:
+        return list(events)
+
+    kept: list[CadenceEvent] = []
+    for event in sorted(events, key=lambda e: e.tick):
+        if not kept:
+            kept.append(event)
+            continue
+        if event.tick - kept[-1].tick < min_spacing_ticks:
+            if event.confidence > kept[-1].confidence:
+                kept[-1] = event
+            continue
+        kept.append(event)
+    return kept
+
+
+def _apply_cadence_density_cap(
+    events: list[CadenceEvent],
+    *,
+    measure_ticks: int,
+    final_boundary_tick: int,
+    max_events_per_32_measures: int,
+) -> list[CadenceEvent]:
+    if max_events_per_32_measures <= 0 or len(events) <= max_events_per_32_measures:
+        return list(events)
+
+    final_region_start = max(0, final_boundary_tick - (2 * measure_ticks))
+    keep_ticks: set[int] = {
+        event.tick for event in events if event.tick >= final_region_start
+    }
+
+    window_ticks = max(measure_ticks, 32 * measure_ticks)
+    non_final_events = [event for event in events if event.tick < final_region_start]
+    if not non_final_events:
+        return [event for event in events if event.tick in keep_ticks]
+
+    max_tick = max(event.tick for event in non_final_events)
+    for window_start in range(0, max_tick + window_ticks, window_ticks):
+        window_end = window_start + window_ticks
+        window_events = [
+            event for event in non_final_events
+            if window_start <= event.tick < window_end
+        ]
+        if len(window_events) <= max_events_per_32_measures:
+            keep_ticks.update(event.tick for event in window_events)
+            continue
+        top_events = sorted(
+            window_events,
+            key=lambda event: (-event.confidence, event.tick),
+        )[:max_events_per_32_measures]
+        keep_ticks.update(event.tick for event in top_events)
+
+    return [event for event in events if event.tick in keep_ticks]
+
+
+def _apply_cadence_global_density_cap(
+    events: list[CadenceEvent],
+    *,
+    measure_ticks: int,
+    final_boundary_tick: int,
+    max_events_per_100_bars: float,
+) -> list[CadenceEvent]:
+    if max_events_per_100_bars <= 0:
+        return list(events)
+
+    measure_count = max(1, int(round(final_boundary_tick / max(1, measure_ticks))))
+    max_total_events = int(math.ceil(measure_count * max_events_per_100_bars / 100.0))
+    if len(events) <= max_total_events:
+        return list(events)
+
+    final_region_start = max(0, final_boundary_tick - (2 * measure_ticks))
+    final_events = [event for event in events if event.tick >= final_region_start]
+    non_final_events = [event for event in events if event.tick < final_region_start]
+    keep_non_final = max(0, max_total_events - len(final_events))
+    if len(non_final_events) <= keep_non_final:
+        return list(events)
+
+    top_non_final = sorted(
+        non_final_events,
+        key=lambda event: (-event.confidence, event.tick),
+    )[:keep_non_final]
+    keep_ticks = {event.tick for event in final_events + top_non_final}
+    return [event for event in events if event.tick in keep_ticks]
+
+
 def detect_cadence_events(
     comp: VoiceComposition,
-    min_confidence: float = 2.0,
+    min_confidence: float | None = None,
+    form: str | None = None,
 ) -> list[CadenceEvent]:
     """Detect cadence labels at bar boundaries.
 
     Heuristic strategy:
-    - Candidate locations are bar boundaries.
-    - Classify by bass arrival degree + preceding bass motion + soprano arrival.
-    - Keep only precision-biased detections with confidence >= ``min_confidence``.
+    - Candidate anchors are measure boundaries, including a rounded-up final bar.
+    - Arrival notes may start slightly before/after the boundary if the phrase
+      clearly resolves there.
+    - Confidence is form-aware and combines bass motion, soprano arrival,
+      rhythmic convergence, and phrase-ending support.
     """
     voices = _sorted_voices(comp)
     if len(voices) < 2:
@@ -104,19 +263,31 @@ def detect_cadence_events(
         measure_ticks = TICKS_PER_QUARTER * 4
 
     max_tick = max(start + dur for start, dur, _ in all_notes)
+    form_cfg = get_form_thresholds(form)
+    cadence_cfg = form_cfg.get("cadence", {})
+    if min_confidence is None:
+        min_confidence = float(cadence_cfg.get("min_confidence", 2.0))
+    boundary_window_ticks = int(
+        round(float(cadence_cfg.get("boundary_window_quarters", 1.0)) * TICKS_PER_QUARTER)
+    )
+    phrase_window_ticks = int(
+        round(float(cadence_cfg.get("phrase_support_quarters", 0.5)) * TICKS_PER_QUARTER)
+    )
+    min_spacing_measures = float(cadence_cfg.get("min_spacing_measures", 1.0))
+    max_events_per_32_measures = int(cadence_cfg.get("max_events_per_32_measures", 32))
+    max_events_per_100_bars = float(cadence_cfg.get("max_events_per_100_bars", 100.0))
+    require_phrase_support = bool(cadence_cfg.get("require_phrase_support", False))
+
     events: list[CadenceEvent] = []
 
-    for boundary_tick in range(measure_ticks, max_tick + 1, measure_ticks):
-        # Prefer a bass note that starts at the boundary; otherwise use active.
-        bass_exact = _note_starting_at_tick(bass, boundary_tick)
-        bass_active_idx = _active_note_index_at_tick(bass, boundary_tick)
-        if bass_exact is not None:
-            bass_idx, bass_note = bass_exact
-        elif bass_active_idx is not None:
-            bass_idx = bass_active_idx
-            bass_note = bass[bass_idx]
-        else:
+    final_boundary_tick = max(measure_ticks, math.ceil(max_tick / measure_ticks) * measure_ticks)
+    boundary_ticks = range(measure_ticks, final_boundary_tick + 1, measure_ticks)
+
+    for boundary_tick in boundary_ticks:
+        bass_arrival = _arrival_note_around_tick(bass, boundary_tick, boundary_window_ticks)
+        if bass_arrival is None:
             continue
+        bass_idx, bass_note = bass_arrival
 
         if bass_idx <= 0:
             continue
@@ -134,53 +305,77 @@ def detect_cadence_events(
             bass_motion in (5, -7)
             or (abs(bass_motion) <= 12 and (bass_motion % 12 == 5))
         )
+        leading_motion = prev_bass_deg == 5
         predominant_motion = prev_bass_deg in {2, 4}
 
         # Soprano arrival for cadence quality typing.
-        soprano_idx = _active_note_index_at_tick(soprano, boundary_tick)
+        soprano_arrival = _arrival_note_around_tick(soprano, boundary_tick, boundary_window_ticks)
+        soprano_idx = soprano_arrival[0] if soprano_arrival is not None else None
         soprano_deg = None
         if soprano_idx is not None:
             soprano_deg = _scale_degree(
                 soprano[soprano_idx][2] % 12, comp.key_root, comp.key_mode,
             )
 
-        # Rhythmic convergence: many voices sustain long notes or rest at boundary.
-        converged = 0
-        for voice in voices:
-            idx = _active_note_index_at_tick(voice, boundary_tick)
-            if idx is None:
-                converged += 1
-                continue
-            start, dur, _ = voice[idx]
-            ends_near_boundary = abs((start + dur) - boundary_tick) <= (TICKS_PER_QUARTER // 4)
-            if dur >= (2 * TICKS_PER_QUARTER) or ends_near_boundary:
-                converged += 1
-        rhythmic_convergence = converged >= max(2, math.ceil(len(voices) * 0.5))
-
-        duration_pattern = (
-            bass_note[1] >= 2 * TICKS_PER_QUARTER
-            or (
-                soprano_idx is not None
-                and soprano[soprano_idx][1] >= 2 * TICKS_PER_QUARTER
-            )
+        rhythmic_convergence, duration_pattern, phrase_support = _boundary_support_features(
+            voices,
+            boundary_tick,
+            phrase_window_ticks,
         )
+        if require_phrase_support and not phrase_support:
+            continue
+        if not duration_pattern:
+            duration_pattern = (
+                bass_note[1] >= 2 * TICKS_PER_QUARTER
+                or (
+                    soprano_idx is not None
+                    and soprano[soprano_idx][1] >= 2 * TICKS_PER_QUARTER
+                )
+            )
+
+        final_boundary = boundary_tick >= final_boundary_tick
 
         token_name = None
         confidence = 0.0
 
-        if bass_arrival_deg == 1 and dominant_motion:
+        if bass_arrival_deg == 1 and (dominant_motion or leading_motion):
             if soprano_deg == 1:
                 token_name = "CAD_PAC"
-                confidence = 1.0 + float(rhythmic_convergence) + float(duration_pattern)
+                confidence = (
+                    1.2
+                    + 0.6 * float(dominant_motion or leading_motion)
+                    + 0.55 * float(rhythmic_convergence)
+                    + 0.35 * float(duration_pattern)
+                    + 0.35 * float(phrase_support)
+                    + 0.15 * float(final_boundary)
+                )
             elif soprano_deg in {3, 5}:
                 token_name = "CAD_IAC"
-                confidence = 1.0 + float(rhythmic_convergence) + float(duration_pattern)
-        elif bass_arrival_deg == 5 and (predominant_motion or rhythmic_convergence):
+                confidence = (
+                    1.0
+                    + 0.6 * float(dominant_motion or leading_motion)
+                    + 0.50 * float(rhythmic_convergence)
+                    + 0.30 * float(duration_pattern)
+                    + 0.30 * float(phrase_support)
+                )
+        elif bass_arrival_deg == 5 and (predominant_motion or rhythmic_convergence or phrase_support):
             token_name = "CAD_HC"
-            confidence = float(predominant_motion) + float(rhythmic_convergence) + float(duration_pattern)
+            confidence = (
+                0.9
+                + 0.45 * float(predominant_motion)
+                + 0.45 * float(rhythmic_convergence)
+                + 0.25 * float(duration_pattern)
+                + 0.25 * float(phrase_support)
+                + 0.10 * float(soprano_deg in {2, 5, 7})
+            )
         elif bass_arrival_deg == 6 and dominant_motion:
             token_name = "CAD_DC"
-            confidence = 1.0 + float(rhythmic_convergence) + float(duration_pattern)
+            confidence = (
+                1.0
+                + 0.60 * float(rhythmic_convergence)
+                + 0.30 * float(duration_pattern)
+                + 0.30 * float(phrase_support)
+            )
 
         if token_name is None:
             continue
@@ -203,12 +398,33 @@ def detect_cadence_events(
         prev = dedup.get(event.tick)
         if prev is None or event.confidence > prev.confidence:
             dedup[event.tick] = event
-    return [dedup[tick] for tick in sorted(dedup.keys())]
+
+    pruned = [dedup[tick] for tick in sorted(dedup.keys())]
+    pruned = _apply_cadence_min_spacing(
+        pruned,
+        min_spacing_ticks=int(round(min_spacing_measures * measure_ticks)),
+    )
+    pruned = _apply_cadence_density_cap(
+        pruned,
+        measure_ticks=measure_ticks,
+        final_boundary_tick=final_boundary_tick,
+        max_events_per_32_measures=max_events_per_32_measures,
+    )
+    pruned = _apply_cadence_global_density_cap(
+        pruned,
+        measure_ticks=measure_ticks,
+        final_boundary_tick=final_boundary_tick,
+        max_events_per_100_bars=max_events_per_100_bars,
+    )
+    return pruned
 
 
 def _extract_exposition_subject(
     comp: VoiceComposition,
     default_bars: int = 2,
+    max_bars: int = 4,
+    min_notes_before_gap_break: int = 5,
+    min_span_quarters_before_gap_break: float = 4.0,
 ) -> tuple[int, list[tuple[int, int, int]], int]:
     """Return (voice_index, subject_notes, first_note_index_in_sorted_voice)."""
     voices = _sorted_voices(comp)
@@ -230,18 +446,27 @@ def _extract_exposition_subject(
     if measure_ticks <= 0:
         measure_ticks = TICKS_PER_QUARTER * 4
     cutoff_tick = earliest_tick + default_bars * measure_ticks
+    max_cutoff_tick = earliest_tick + max_bars * measure_ticks
     gap_threshold = TICKS_PER_QUARTER
+    min_span_ticks = int(round(min_span_quarters_before_gap_break * TICKS_PER_QUARTER))
 
     voice = voices[earliest_voice]
     subject: list[tuple[int, int, int]] = []
     for i, note in enumerate(voice):
         start, dur, _ = note
-        if start > cutoff_tick:
+        if start > max_cutoff_tick:
+            break
+        if start > cutoff_tick and len(subject) >= min_notes_before_gap_break:
             break
         subject.append(note)
         if i + 1 < len(voice):
             next_start = voice[i + 1][0]
-            if (next_start - (start + dur)) >= gap_threshold and len(subject) >= 3:
+            span_ticks = (start + dur) - subject[0][0]
+            if (
+                (next_start - (start + dur)) >= gap_threshold
+                and len(subject) >= min_notes_before_gap_break
+                and span_ticks >= min_span_ticks
+            ):
                 break
 
     return earliest_voice, subject, 0
@@ -270,26 +495,65 @@ def _interval_match_quality(
     return matches / len(ref_iv)
 
 
+def _note_span_ticks(notes: list[tuple[int, int, int]]) -> int:
+    if not notes:
+        return 0
+    return (notes[-1][0] + notes[-1][1]) - notes[0][0]
+
+
 def detect_subject_entries(
     comp: VoiceComposition,
-    min_match_ratio: float = 0.70,
-    min_quality: float = 0.80,
-    min_notes: int = 4,
+    min_match_ratio: float | None = None,
+    min_quality: float | None = None,
+    min_notes: int | None = None,
+    min_same_voice_spacing_ratio: float | None = None,
+    min_span_ratio: float | None = None,
+    max_span_ratio: float | None = None,
+    *,
+    form: str | None = None,
+    thresholds: dict | None = None,
 ) -> list[SubjectEntry]:
     """Detect subject entries across voices using interval matching."""
     voices = _sorted_voices(comp)
     if not voices:
         return []
 
-    exposition_voice, subject_notes, exposition_start_idx = _extract_exposition_subject(comp)
+    form_cfg = get_form_thresholds(form, thresholds)
+    subject_cfg = form_cfg.get("subject", {})
+    min_match_ratio = float(subject_cfg.get("min_match_ratio", 0.70) if min_match_ratio is None else min_match_ratio)
+    min_quality = float(subject_cfg.get("min_quality", 0.80) if min_quality is None else min_quality)
+    min_notes = int(subject_cfg.get("min_notes", 4) if min_notes is None else min_notes)
+    min_same_voice_spacing_ratio = float(
+        subject_cfg.get("min_same_voice_spacing_ratio", 0.50)
+        if min_same_voice_spacing_ratio is None
+        else min_same_voice_spacing_ratio
+    )
+    min_span_ratio = float(subject_cfg.get("min_span_ratio", 0.50) if min_span_ratio is None else min_span_ratio)
+    max_span_ratio = float(subject_cfg.get("max_span_ratio", 2.50) if max_span_ratio is None else max_span_ratio)
+
+    exposition_voice, subject_notes, exposition_start_idx = _extract_exposition_subject(
+        comp,
+        default_bars=int(subject_cfg.get("default_bars", 2)),
+        max_bars=int(subject_cfg.get("max_bars", 4)),
+        min_notes_before_gap_break=int(subject_cfg.get("min_notes_before_gap_break", 5)),
+        min_span_quarters_before_gap_break=float(
+            subject_cfg.get("min_span_quarters_before_gap_break", 4.0)
+        ),
+    )
     if exposition_voice < 0 or len(subject_notes) < min_notes:
         return []
 
     subject_len = len(subject_notes)
     min_notes_required = max(min_notes, math.ceil(subject_len * min_match_ratio))
+    subject_span_ticks = max(TICKS_PER_QUARTER, _note_span_ticks(subject_notes))
+    min_same_voice_spacing_ticks = max(
+        2 * TICKS_PER_QUARTER,
+        int(round(subject_span_ticks * min_same_voice_spacing_ratio)),
+    )
 
     entries: list[SubjectEntry] = []
     used_ranges_by_voice: dict[int, list[tuple[int, int]]] = {}
+    accepted_starts_by_voice: dict[int, list[int]] = {}
 
     for voice_idx, voice in enumerate(voices):
         if len(voice) < min_notes_required:
@@ -305,6 +569,10 @@ def detect_subject_entries(
                 ref = subject_notes[:cand_len]
                 cand = voice[i:i + cand_len]
                 quality = _interval_match_quality(ref, cand)
+                cand_span_ticks = _note_span_ticks(cand)
+                span_ratio = cand_span_ticks / max(1, _note_span_ticks(ref))
+                if not (min_span_ratio <= span_ratio <= max_span_ratio):
+                    continue
                 if quality >= best_quality:
                     best_quality = quality
                     best_end = i + cand_len - 1
@@ -323,6 +591,12 @@ def detect_subject_entries(
                 continue
 
             start_tick = voice[i][0]
+            if any(
+                abs(start_tick - prev_start) < min_same_voice_spacing_ticks
+                for prev_start in accepted_starts_by_voice.get(voice_idx, [])
+            ):
+                i += 1
+                continue
             end_note = voice[best_end]
             end_tick = end_note[0] + end_note[1]
             is_exposition = (
@@ -341,6 +615,7 @@ def detect_subject_entries(
                 ),
             )
             used_ranges_by_voice.setdefault(voice_idx, []).append((i, best_end))
+            accepted_starts_by_voice.setdefault(voice_idx, []).append(start_tick)
             i = best_end + 1
 
     # Ensure one exposition entry is always flagged if anything matched there.

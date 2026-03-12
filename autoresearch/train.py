@@ -32,7 +32,7 @@ from prepare import (
 from bach_gen.model.config import ModelConfig
 
 
-DEFAULT_MPS_HIGH_WATERMARK_RATIO = 0.6
+DEFAULT_MPS_HIGH_WATERMARK_RATIO = 0.9
 DEFAULT_MPS_LOW_WATERMARK_RATIO = 0.5
 _MPS_ENV_CONFIGURED = False
 
@@ -46,7 +46,7 @@ class ExperimentConfig:
     """
 
     # Current default is the best-feasible stage-1 long-context run on this machine.
-    description: str = "stage4096_lr4e4_eb16_mb1x16_looplm_t3_l4_gate_b005"
+    description: str = "stage4096_lr4e4_eb16_mb1x16_looplm_t2_l4_gate_b005"
     seq_len: int = 4096
     init_checkpoint: str | None = None
     batch_size: int = 1
@@ -62,7 +62,7 @@ class ExperimentConfig:
     piece_balance: str = "sqrt"
     rel_attn_bias: bool = False
     rel_attn_max_distance: int = 2048
-    num_recurrent_steps: int = 3
+    num_recurrent_steps: int = 2
     loop_step_embedding: bool = True
     looplm_sandwich_norm: bool = False
     looplm_exit_gate: bool = True
@@ -424,6 +424,8 @@ def evaluate_validation_metrics(
     n_batches = 0
     pitch_loss_sum = 0.0
     n_pitch_tokens = 0
+    loop_val_loss_sums: list[float] | None = None
+    loop_pitch_loss_sums: list[float] | None = None
     use_looplm = trainer._use_looplm_loss
 
     py_state = random.getstate()
@@ -455,6 +457,9 @@ def evaluate_validation_metrics(
                         final_logits.reshape(-1, final_logits.size(-1)),
                         labels.reshape(-1),
                     )
+                    if loop_val_loss_sums is None:
+                        loop_val_loss_sums = [0.0 for _ in output.all_logits]
+                        loop_pitch_loss_sums = [0.0 for _ in output.all_logits]
                 else:
                     final_logits = model(input_ids, attention_mask=attention_mask, use_rope=use_rope)
                     loss = trainer.criterion(
@@ -484,6 +489,26 @@ def evaluate_validation_metrics(
                 )
                 pitch_loss_sum += float(per_token_losses[valid_pitch_mask].sum().item())
                 n_pitch_tokens += int(valid_pitch_mask.sum().item())
+
+            if use_looplm and loop_val_loss_sums is not None and loop_pitch_loss_sums is not None:
+                for step_idx, step_logits in enumerate(output.all_logits):
+                    step_loss = trainer.criterion(
+                        step_logits.reshape(-1, step_logits.size(-1)),
+                        labels.reshape(-1),
+                    )
+                    loop_val_loss_sums[step_idx] += float(step_loss.item())
+
+                    if torch.any(valid_pitch_mask):
+                        step_per_token_losses = F.cross_entropy(
+                            step_logits.reshape(-1, step_logits.size(-1)),
+                            flat_labels,
+                            ignore_index=trainer.criterion.ignore_index,
+                            label_smoothing=trainer.criterion.label_smoothing,
+                            reduction="none",
+                        )
+                        loop_pitch_loss_sums[step_idx] += float(
+                            step_per_token_losses[valid_pitch_mask].sum().item()
+                        )
     finally:
         random.setstate(py_state)
         np.random.set_state(np_state)
@@ -492,10 +517,23 @@ def evaluate_validation_metrics(
     if n_batches == 0:
         raise RuntimeError("Validation loader produced zero batches")
 
+    loop_val_losses = (
+        [loss_sum / n_batches for loss_sum in loop_val_loss_sums]
+        if loop_val_loss_sums is not None
+        else []
+    )
+    loop_pitch_losses = (
+        [loss_sum / n_pitch_tokens for loss_sum in loop_pitch_loss_sums]
+        if loop_pitch_loss_sums is not None and n_pitch_tokens > 0
+        else []
+    )
+
     return {
         "val_loss": total_loss / n_batches,
         "objective_val_loss": total_objective_loss / n_batches,
         "pitch_val_loss": (pitch_loss_sum / n_pitch_tokens) if n_pitch_tokens > 0 else float("nan"),
+        "loop_val_losses": loop_val_losses,
+        "loop_pitch_losses": loop_pitch_losses,
     }
 
 
@@ -780,6 +818,8 @@ def run_timed_training(
             "val_loss": metrics["val_loss"],
             "objective_val_loss": metrics["objective_val_loss"],
             "pitch_val_loss": metrics["pitch_val_loss"],
+            "loop_val_losses": metrics["loop_val_losses"],
+            "loop_pitch_losses": metrics["loop_pitch_losses"],
             "train_loss": running_loss / max(step_count, 1),
             "training_seconds": training_seconds,
             "peak_memory_mb": peak_memory_mb,
@@ -793,6 +833,8 @@ def run_timed_training(
         }
         summary.update(summarize_series("stability_pitch", stability_pitch_history))
         summary.update(summarize_series("stability_val", stability_val_history))
+        summary.update(summarize_series("loop_val", metrics["loop_val_losses"]))
+        summary.update(summarize_series("loop_pitch", metrics["loop_pitch_losses"]))
         if return_model_state:
             summary["final_model_state"] = clone_model_state(model)
     finally:
@@ -931,6 +973,8 @@ def run_timed_gate_training(
             "val_loss": metrics["val_loss"],
             "objective_val_loss": metrics["objective_val_loss"],
             "pitch_val_loss": metrics["pitch_val_loss"],
+            "loop_val_losses": metrics["loop_val_losses"],
+            "loop_pitch_losses": metrics["loop_pitch_losses"],
             "gate_train_loss": running_loss / max(step_count, 1),
             "gate_training_seconds": training_seconds,
             "peak_memory_mb": peak_memory_mb,
@@ -942,6 +986,8 @@ def run_timed_gate_training(
             "effective_batch_size": cfg.batch_size * cfg.accumulation_steps,
             "final_model_state": clone_model_state(trainer.model),
         }
+        summary.update(summarize_series("loop_val", metrics["loop_val_losses"]))
+        summary.update(summarize_series("loop_pitch", metrics["loop_pitch_losses"]))
     finally:
         if trainer is not None:
             for name, param in trainer.model.named_parameters():

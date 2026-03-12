@@ -43,7 +43,7 @@ from typing import Union
 from bach_gen.data.extraction import VoicePair, VoiceComposition
 from bach_gen.utils.constants import (
     MIN_PITCH, MAX_PITCH, DURATION_BINS, TIME_SHIFT_BINS,
-    KEY_NAMES, SD_MIN_OCTAVE, SD_MAX_OCTAVE, STYLE_NAMES, FORM_NAMES,
+    KEY_NAMES, SD_MIN_OCTAVE, SD_MAX_OCTAVE, STYLE_NAMES, APPENDED_STYLE_NAMES, FORM_NAMES, APPENDED_FORM_NAMES,
     LENGTH_NAMES, LENGTH_BOUNDARIES, METER_NAMES, METER_MAP,
     TEXTURE_NAMES, IMITATION_NAMES, HARMONIC_RHYTHM_NAMES, HARMONIC_TENSION_NAMES,
     CHROMATICISM_NAMES, ENCODING_MODE_NAMES,
@@ -222,12 +222,19 @@ class ScaleDegreeTokenizer:
     def __init__(self, config: ScaleDegreeTokenizerConfig | None = None):
         self.config = config or ScaleDegreeTokenizerConfig()
         self._build_vocab()
+        self.STYLE_TO_TOKEN = dict(type(self).STYLE_TO_TOKEN)
+        for style_name in APPENDED_STYLE_NAMES:
+            tok_id = self.name_to_token.get(f"STYLE_{style_name.upper()}")
+            if tok_id is not None:
+                self.STYLE_TO_TOKEN[style_name] = tok_id
         self.FORM_TO_MODE_TOKEN = dict(type(self).FORM_TO_MODE_TOKEN)
         self.FORM_TO_FORM_TOKEN = dict(type(self).FORM_TO_FORM_TOKEN)
-        self.FORM_TO_MODE_TOKEN["sonata"] = self.MODE_4PART
-        sonata_tok = self.name_to_token.get("FORM_SONATA")
-        if sonata_tok is not None:
-            self.FORM_TO_FORM_TOKEN["sonata"] = sonata_tok
+        for form_name in APPENDED_FORM_NAMES:
+            tok_id = self.name_to_token.get(f"FORM_{form_name.upper()}")
+            if tok_id is not None:
+                self.FORM_TO_FORM_TOKEN[form_name] = tok_id
+        for form_name in ("sonata", "keyboard_piece", "chamber_piece", "orchestral_reduction", "vocal_polyphony"):
+            self.FORM_TO_MODE_TOKEN[form_name] = self.MODE_4PART
 
     # ------------------------------------------------------------------
     # Vocabulary construction
@@ -390,6 +397,24 @@ class ScaleDegreeTokenizer:
             self.name_to_token[name] = idx
             idx += 1
 
+        # Appended broad-corpus style tokens.
+        for style_name in APPENDED_STYLE_NAMES:
+            name = f"STYLE_{style_name.upper()}"
+            self.token_to_name[idx] = name
+            self.name_to_token[name] = idx
+            idx += 1
+
+        # Appended broad-corpus generic form tokens.
+        for name in [
+            "FORM_KEYBOARD_PIECE",
+            "FORM_CHAMBER_PIECE",
+            "FORM_ORCHESTRAL_REDUCTION",
+            "FORM_VOCAL_POLYPHONY",
+        ]:
+            self.token_to_name[idx] = name
+            self.name_to_token[name] = idx
+            idx += 1
+
         self._vocab_size = idx
 
         # Verify hardcoded class-level constants match dynamic vocab
@@ -437,9 +462,30 @@ class ScaleDegreeTokenizer:
         if form is not None and form in self.FORM_TO_FORM_TOKEN:
             tokens.append(self.FORM_TO_FORM_TOKEN[form])
 
-        # Voice-count token (how many voices)
-        if form is not None and form in self.FORM_TO_MODE_TOKEN:
-            tokens.append(self.FORM_TO_MODE_TOKEN[form])
+        if isinstance(item, VoicePair):
+            comp = VoiceComposition.from_voice_pair(item)
+        else:
+            comp = item
+
+        # Voice-count token (how many voices). Prefer the actual composition
+        # size so neutral forms are not forced into a misleading Bach-era mode.
+        mode_token: int | None
+        if form == "fugue":
+            mode_token = self.MODE_FUGUE
+        else:
+            voice_count = len(comp.voices)
+            if voice_count == 2:
+                mode_token = self.MODE_2PART
+            elif voice_count == 3:
+                mode_token = self.MODE_3PART
+            elif voice_count >= 4:
+                mode_token = self.MODE_4PART
+            elif form is not None and form in self.FORM_TO_MODE_TOKEN:
+                mode_token = self.FORM_TO_MODE_TOKEN[form]
+            else:
+                mode_token = None
+        if mode_token is not None:
+            tokens.append(mode_token)
 
         # Length conditioning token
         if length_bars is not None:
@@ -450,11 +496,6 @@ class ScaleDegreeTokenizer:
         # Meter conditioning token
         if meter is not None and meter in self.METER_TO_TOKEN:
             tokens.append(self.METER_TO_TOKEN[meter])
-
-        if isinstance(item, VoicePair):
-            comp = VoiceComposition.from_voice_pair(item)
-        else:
-            comp = item
 
         # Auto-detect meter from time signature if not explicitly provided
         if meter is None:
@@ -887,6 +928,7 @@ class ScaleDegreeTokenizer:
         current_voice = 1
         key_root = 0
         key_mode = "major"
+        time_signature = (4, 4)
 
         pending_octave: int | None = None
         pending_degree: int | None = None
@@ -895,23 +937,39 @@ class ScaleDegreeTokenizer:
         for tok in tokens:
             name = self.token_to_name.get(tok, "")
 
-            if name in (
-                "PAD", "BOS", "EOS", "SUBJECT_START", "SUBJECT_END",
-                "CAD_PAC", "CAD_IAC", "CAD_HC", "CAD_DC",
-                "BAR", "BEAT_1", "BEAT_2", "BEAT_3", "BEAT_4", "BEAT_5", "BEAT_6",
-                "MODE_2PART", "MODE_3PART", "MODE_4PART", "MODE_FUGUE",
-                "STYLE_BACH", "STYLE_BAROQUE", "STYLE_RENAISSANCE", "STYLE_CLASSICAL",
-                "FORM_CHORALE", "FORM_INVENTION", "FORM_FUGUE",
-                "FORM_SINFONIA", "FORM_QUARTET", "FORM_TRIO_SONATA", "FORM_MOTET", "FORM_SONATA",
-                "LENGTH_SHORT", "LENGTH_MEDIUM", "LENGTH_LONG", "LENGTH_EXTENDED",
-                "METER_2_4", "METER_3_4", "METER_4_4", "METER_6_8",
-                "METER_3_8", "METER_ALLA_BREVE",
-                "TEXTURE_HOMOPHONIC", "TEXTURE_POLYPHONIC", "TEXTURE_MIXED",
-                "IMITATION_NONE", "IMITATION_LOW", "IMITATION_HIGH",
-                "HARMONIC_RHYTHM_SLOW", "HARMONIC_RHYTHM_MODERATE", "HARMONIC_RHYTHM_FAST",
-                "HARMONIC_TENSION_LOW", "HARMONIC_TENSION_MODERATE", "HARMONIC_TENSION_HIGH",
-                "CHROMATICISM_LOW", "CHROMATICISM_MODERATE", "CHROMATICISM_HIGH",
-                "ENCODE_INTERLEAVED", "ENCODE_SEQUENTIAL",
+            if (
+                name in {
+                    "PAD",
+                    "BOS",
+                    "EOS",
+                    "SUBJECT_START",
+                    "SUBJECT_END",
+                    "CAD_PAC",
+                    "CAD_IAC",
+                    "CAD_HC",
+                    "CAD_DC",
+                    "BAR",
+                    "BEAT_1",
+                    "BEAT_2",
+                    "BEAT_3",
+                    "BEAT_4",
+                    "BEAT_5",
+                    "BEAT_6",
+                    "MODE_2PART",
+                    "MODE_3PART",
+                    "MODE_4PART",
+                    "MODE_FUGUE",
+                }
+                or name.startswith("STYLE_")
+                or name.startswith("FORM_")
+                or name.startswith("LENGTH_")
+                or name.startswith("METER_")
+                or name.startswith("TEXTURE_")
+                or name.startswith("IMITATION_")
+                or name.startswith("HARMONIC_RHYTHM_")
+                or name.startswith("HARMONIC_TENSION_")
+                or name.startswith("CHROMATICISM_")
+                or name.startswith("ENCODE_")
             ):
                 continue
 
@@ -940,6 +998,17 @@ class ScaleDegreeTokenizer:
                         key_root = note_name_to_pc(root_name)
                     except ValueError:
                         pass
+            elif name.startswith("METER_"):
+                meter_name = name[6:]
+                meter_map = {
+                    "2_4": (2, 4),
+                    "3_4": (3, 4),
+                    "4_4": (4, 4),
+                    "6_8": (6, 8),
+                    "3_8": (3, 8),
+                    "ALLA_BREVE": (2, 2),
+                }
+                time_signature = meter_map.get(meter_name, time_signature)
 
             elif name.startswith("OCT_"):
                 pending_octave = int(name[4:])
@@ -985,7 +1054,11 @@ class ScaleDegreeTokenizer:
             voices.append([])
 
         return VoiceComposition(
-            voices=voices, key_root=key_root, key_mode=key_mode, source="decoded",
+            voices=voices,
+            key_root=key_root,
+            key_mode=key_mode,
+            source="decoded",
+            time_signature=time_signature,
         )
 
     def decode_to_pair(self, tokens: list[int]) -> VoicePair:
