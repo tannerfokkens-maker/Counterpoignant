@@ -1701,6 +1701,7 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None,
                 phase_name="FINETUNE",
                 checkpoint_prefix="finetune_",
                 seq_len_stages=parsed_stages,
+                stage_batch_decay=0.5,
             )
 
         # Merge histories for reporting
