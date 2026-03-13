@@ -23,8 +23,9 @@ import torch.nn.functional as F
 
 from bach_gen.model.architecture import (
     CausalSelfAttention,
+    PoPEEmbedding,
+    RotaryEmbedding,
     apply_pope_emb,
-    apply_pope_no_pos,
     apply_rotary_emb,
 )
 from bach_gen.model.config import ModelConfig
@@ -96,6 +97,19 @@ def main() -> int:
     )
     attn = CausalSelfAttention(config).to(device=device, dtype=dtype)
     attn.train(args.training)
+    pos_emb = None
+    if args.pos_encoding == "pope":
+        pos_emb = PoPEEmbedding(
+            dim=attn.head_dim,
+            max_seq_len=args.seq_len,
+            theta=config.rope_theta,
+        ).to(device=device)
+    elif args.pos_encoding == "rope":
+        pos_emb = RotaryEmbedding(
+            dim=attn.head_dim,
+            max_seq_len=args.seq_len,
+            theta=config.rope_theta,
+        ).to(device=device)
 
     x = torch.randn(args.batch_size, args.seq_len, args.embed_dim, device=device, dtype=dtype)
     q = attn.q_proj(x).reshape(args.batch_size, args.seq_len, attn.num_heads, attn.head_dim).transpose(1, 2)
@@ -103,8 +117,7 @@ def main() -> int:
     v = attn.v_proj(x).reshape(args.batch_size, args.seq_len, attn.num_kv_heads, attn.head_dim).transpose(1, 2)
 
     if args.pos_encoding == "pope":
-        cos, sin = attn.max_seq_len and attn.max_seq_len, None  # appease linter
-        cos, sin = attn.pos_emb(args.seq_len)
+        cos, sin = pos_emb(args.seq_len)
         cos = cos.to(device=device)
         sin = sin.to(device=device)
         q = apply_pope_emb(q, cos, sin)
@@ -113,7 +126,7 @@ def main() -> int:
         v_out[..., 0::2] = v
         v = v_out
     elif args.pos_encoding == "rope":
-        cos, sin = attn.pos_emb(args.seq_len)
+        cos, sin = pos_emb(args.seq_len)
         cos = cos.to(device=device)
         sin = sin.to(device=device)
         q = apply_rotary_emb(q, cos, sin)
