@@ -264,10 +264,10 @@ target_embed_dim=768
 target_num_heads=12
 target_num_layers=12
 target_num_recurrent_steps=1
-mkdir -p "$models_dir"
-if [[ -f "$models_dir/pretrain_latest.pt" ]]; then
-  if .venv/bin/python - "$models_dir/pretrain_latest.pt" \
-      "$target_embed_dim" "$target_num_heads" "$target_num_layers" "$target_num_recurrent_steps" <<'PY'
+mkdir -p "\$models_dir"
+if [[ -f "\$models_dir/pretrain_latest.pt" ]]; then
+  if .venv/bin/python - "\$models_dir/pretrain_latest.pt" \
+      "\$target_embed_dim" "\$target_num_heads" "\$target_num_layers" "\$target_num_recurrent_steps" <<'PY'
 import sys
 import torch
 
@@ -308,16 +308,16 @@ print(
 raise SystemExit(1)
 PY
   then
-    echo "[\$(date '+%Y-%m-%d %H:%M:%S')] Resuming from $models_dir/pretrain_latest.pt"
-    resume_args+=(--resume "$models_dir/pretrain_latest.pt")
+    echo "[\$(date '+%Y-%m-%d %H:%M:%S')] Resuming from \$models_dir/pretrain_latest.pt"
+    resume_args+=(--resume "\$models_dir/pretrain_latest.pt")
   else
-    echo "[\$(date '+%Y-%m-%d %H:%M:%S')] Existing checkpoint in $models_dir is incompatible with target 768/12/12 model; starting fresh"
+    echo "[\$(date '+%Y-%m-%d %H:%M:%S')] Existing checkpoint in \$models_dir is incompatible with target 768/12/12 model; starting fresh"
   fi
 fi
 .venv/bin/bach-gen train \
   --curriculum \
   --data-dir "$data_dir" \
-  --models-dir "$models_dir" \
+  --models-dir "\$models_dir" \
   --finetune bach \
   --seq-len-stages "4096:40,8192:25" \
   --batch-size 16 \
