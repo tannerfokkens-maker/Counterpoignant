@@ -8,8 +8,10 @@ import torch.nn as nn
 from bach_gen.model.architecture import (
     CausalSelfAttention,
     PoPEEmbedding,
+    RotaryEmbedding,
     apply_pope_emb,
     apply_pope_no_pos,
+    apply_rotary_emb,
 )
 from bach_gen.model.config import ModelConfig
 
@@ -56,6 +58,28 @@ def test_apply_pope_emb_preserves_magnitude_per_dimension() -> None:
     expected_mag = torch.nn.functional.softplus(x)
 
     assert torch.allclose(reconstructed_mag, expected_mag, atol=1e-5, rtol=1e-5)
+
+
+def test_apply_pope_emb_preserves_input_dtype() -> None:
+    x = torch.randn(1, 2, 4, 8, dtype=torch.bfloat16)
+
+    pos = PoPEEmbedding(dim=x.shape[-1], max_seq_len=x.shape[-2])
+    cos, sin = pos(x.shape[-2])
+
+    out = apply_pope_emb(x, cos, sin)
+
+    assert out.dtype is torch.bfloat16
+
+
+def test_apply_rotary_emb_preserves_input_dtype() -> None:
+    x = torch.randn(1, 2, 4, 8, dtype=torch.bfloat16)
+
+    pos = RotaryEmbedding(dim=x.shape[-1], max_seq_len=x.shape[-2])
+    cos, sin = pos(x.shape[-2])
+
+    out = apply_rotary_emb(x, cos, sin)
+
+    assert out.dtype is torch.bfloat16
 
 
 def test_pope_embedding_long_sequence_cache_is_finite() -> None:

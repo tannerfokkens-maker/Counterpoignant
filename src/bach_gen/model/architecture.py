@@ -130,8 +130,8 @@ def apply_rotary_emb(
         Tensor of same shape with rotary embedding applied.
     """
     # Unsqueeze for broadcasting: (1, 1, T, D)
-    cos = cos.unsqueeze(0).unsqueeze(0)
-    sin = sin.unsqueeze(0).unsqueeze(0)
+    cos = cos.to(device=x.device, dtype=x.dtype).unsqueeze(0).unsqueeze(0)
+    sin = sin.to(device=x.device, dtype=x.dtype).unsqueeze(0).unsqueeze(0)
 
     # rotate_half: swap and negate first half
     d_half = x.shape[-1] // 2
@@ -191,8 +191,8 @@ def apply_pope_emb(
     """
     mag = F.softplus(x)  # (B, H, T, D)
 
-    cos = cos.unsqueeze(0).unsqueeze(0)  # (1, 1, T, D)
-    sin = sin.unsqueeze(0).unsqueeze(0)
+    cos = cos.to(device=x.device, dtype=x.dtype).unsqueeze(0).unsqueeze(0)  # (1, 1, T, D)
+    sin = sin.to(device=x.device, dtype=x.dtype).unsqueeze(0).unsqueeze(0)
 
     real = mag * cos  # (B, H, T, D)
     imag = mag * sin  # (B, H, T, D)
