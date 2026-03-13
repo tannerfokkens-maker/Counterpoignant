@@ -65,6 +65,27 @@ def _make_trainer(tmp_path: Path, lr: float = 3e-4) -> Trainer:
     )
 
 
+def test_trainer_disables_bf16_on_cpu(tmp_path: Path):
+    """bf16 should be disabled automatically when CUDA is unavailable."""
+    config = ModelConfig(vocab_size=100, embed_dim=32, num_heads=2,
+                         num_layers=1, max_seq_len=128)
+    model = BachTransformer(config)
+    trainer = Trainer(
+        model=model,
+        train_dataset=_make_dataset(10),
+        val_dataset=_make_dataset(2),
+        batch_size=2,
+        checkpoint_dir=tmp_path / "models",
+        device=torch.device("cpu"),
+        bf16=True,
+    )
+
+    assert trainer.fp16 is False
+    assert trainer.bf16 is False
+    assert trainer.autocast_enabled is False
+    assert trainer.scaler.is_enabled() is False
+
+
 # ===========================================================================
 # 1. corpus.py — get_all_works filtering
 # ===========================================================================
@@ -428,7 +449,31 @@ class TestCLIOptions:
         assert "--finetune-final-stage-only" in result.output
         assert "--log-interval" in result.output
         assert "--val-interval" in result.output
+        assert "--bf16" in result.output
         assert "--data-dir" in result.output
+
+    def test_train_rejects_fp16_and_bf16_together(self, tmp_path):
+        """--fp16 and --bf16 should be mutually exclusive."""
+        from click.testing import CliRunner
+        from bach_gen.cli import cli
+
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        seqs = [list(range(20, 50)) for _ in range(10)]
+        (data_dir / "sequences.json").write_text(json.dumps(seqs))
+        (data_dir / "mode.json").write_text('{"mode": "2-part", "num_voices": 2, "tokenizer_type": "absolute"}')
+
+        runner = CliRunner()
+        result = runner.invoke(cli, [
+            "train",
+            "--epochs", "20",
+            "--data-dir", str(data_dir),
+            "--fp16",
+            "--bf16",
+        ])
+
+        assert result.exit_code != 0
+        assert "either --fp16 or --bf16" in result.output.lower()
 
     def test_train_rejects_resume_and_pretrained_checkpoint_together(self, tmp_path):
         """Passing both --resume and --pretrained-checkpoint should error out."""

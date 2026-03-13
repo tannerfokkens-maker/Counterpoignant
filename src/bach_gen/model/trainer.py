@@ -55,6 +55,7 @@ class Trainer:
         device: torch.device | None = None,
         accumulation_steps: int = 1,
         fp16: bool = False,
+        bf16: bool = False,
         token_category_map: list[int] | None = None,
         token_category_names: list[str] | None = None,
         piece_balance: str = "none",
@@ -71,9 +72,14 @@ class Trainer:
 
         # Mixed precision — only on CUDA
         self.fp16 = fp16 and self.device.type == "cuda"
+        self.bf16 = bf16 and self.device.type == "cuda"
+        self.autocast_enabled = self.fp16 or self.bf16
+        self.autocast_dtype = torch.float16 if self.fp16 else (torch.bfloat16 if self.bf16 else None)
         self.scaler = torch.amp.GradScaler(self.device.type, enabled=self.fp16)
         if self.fp16:
             logger.info("Mixed precision (fp16) enabled")
+        elif self.bf16:
+            logger.info("Mixed precision (bf16) enabled")
 
         # Optimizer
         self.optimizer = torch.optim.AdamW(
@@ -105,6 +111,16 @@ class Trainer:
             self._token_category_map = torch.tensor(
                 token_category_map, dtype=torch.long, device=self.device
             )
+
+    def _autocast_context(self):
+        """Return the appropriate autocast context for the active precision mode."""
+        if self.autocast_enabled:
+            return torch.amp.autocast(
+                self.device.type,
+                enabled=True,
+                dtype=self.autocast_dtype,
+            )
+        return torch.amp.autocast(self.device.type, enabled=False)
 
     def reset_for_finetuning(
         self,
@@ -773,18 +789,19 @@ class Trainer:
             input_ids = batch["input_ids"].to(self.device)
             labels = batch["labels"].to(self.device)
 
-            # Create attention mask (non-PAD tokens)
-            attention_mask = (input_ids != 0).long()
-
-            with torch.amp.autocast(self.device.type, enabled=self.fp16):
+            with self._autocast_context():
                 if use_looplm:
                     output = self.model(
-                        input_ids, attention_mask=attention_mask,
+                        input_ids,
                         use_rope=use_rope, return_all_steps=True,
                     )
                     loss, logits = self._compute_looplm_loss(output, labels)
                 else:
-                    logits = self.model(input_ids, attention_mask=attention_mask, use_rope=use_rope)
+                    # Right-padded decoder training does not need an explicit padding
+                    # mask: causal masking already blocks access to future padded keys,
+                    # and losses on padded query positions are ignored. Avoiding the
+                    # dense 4D mask keeps Flash SDPA eligible on CUDA.
+                    logits = self.model(input_ids, attention_mask=None, use_rope=use_rope)
                     loss = self.criterion(
                         logits.reshape(-1, logits.size(-1)),
                         labels.reshape(-1),
@@ -801,8 +818,9 @@ class Trainer:
 
             # Step when we've accumulated enough, or at the last batch
             if (batch_idx + 1) % self.accumulation_steps == 0 or (batch_idx + 1) == len(loader):
-                # Gradient clipping (unscale first for fp16)
-                self.scaler.unscale_(self.optimizer)
+                # Gradient clipping (unscale first when using a GradScaler)
+                if self.scaler.is_enabled():
+                    self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
 
                 self.scaler.step(self.optimizer)
@@ -823,17 +841,16 @@ class Trainer:
         for batch in loader:
             input_ids = batch["input_ids"].to(self.device)
             labels = batch["labels"].to(self.device)
-            attention_mask = (input_ids != 0).long()
 
-            with torch.amp.autocast(self.device.type, enabled=self.fp16):
+            with self._autocast_context():
                 if use_looplm:
                     output = self.model(
-                        input_ids, attention_mask=attention_mask,
+                        input_ids,
                         use_rope=use_rope, return_all_steps=True,
                     )
                     loss, logits = self._compute_looplm_loss(output, labels)
                 else:
-                    logits = self.model(input_ids, attention_mask=attention_mask, use_rope=use_rope)
+                    logits = self.model(input_ids, attention_mask=None, use_rope=use_rope)
                     loss = self.criterion(
                         logits.reshape(-1, logits.size(-1)),
                         labels.reshape(-1),
@@ -1075,11 +1092,10 @@ class Trainer:
                 for batch in train_loader:
                     input_ids = batch["input_ids"].to(self.device)
                     labels = batch["labels"].to(self.device)
-                    attention_mask = (input_ids != 0).long()
 
-                    with torch.amp.autocast(self.device.type, enabled=self.fp16):
+                    with self._autocast_context():
                         output = self.model(
-                            input_ids, attention_mask=attention_mask,
+                            input_ids,
                             use_rope=use_rope, return_all_steps=True,
                         )
 
@@ -1108,7 +1124,8 @@ class Trainer:
 
                     gate_optimizer.zero_grad()
                     self.scaler.scale(loss).backward()
-                    self.scaler.unscale_(gate_optimizer)
+                    if self.scaler.is_enabled():
+                        self.scaler.unscale_(gate_optimizer)
                     torch.nn.utils.clip_grad_norm_(self.model.exit_gate.parameters(), 1.0)
                     self.scaler.step(gate_optimizer)
                     self.scaler.update()

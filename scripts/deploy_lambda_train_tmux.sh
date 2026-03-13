@@ -258,24 +258,84 @@ print(f"cuda_device_count={torch.cuda.device_count()}")
 for idx in range(torch.cuda.device_count()):
     print(f"cuda_device_{idx}={torch.cuda.get_device_name(idx)}")
 PY
+resume_args=()
+models_dir="$repo_abs/model_45M"
+target_embed_dim=768
+target_num_heads=12
+target_num_layers=12
+target_num_recurrent_steps=1
+mkdir -p "$models_dir"
+if [[ -f "$models_dir/pretrain_latest.pt" ]]; then
+  if .venv/bin/python - "$models_dir/pretrain_latest.pt" \
+      "$target_embed_dim" "$target_num_heads" "$target_num_layers" "$target_num_recurrent_steps" <<'PY'
+import sys
+import torch
+
+path = sys.argv[1]
+target_embed_dim = int(sys.argv[2])
+target_num_heads = int(sys.argv[3])
+target_num_layers = int(sys.argv[4])
+target_num_recurrent_steps = int(sys.argv[5])
+
+ckpt = torch.load(path, map_location="cpu", weights_only=False)
+cfg = ckpt.get("config")
+if isinstance(cfg, dict):
+    embed_dim = int(cfg.get("embed_dim", -1))
+    num_heads = int(cfg.get("num_heads", -1))
+    num_layers = int(cfg.get("num_layers", -1))
+    num_recurrent_steps = int(cfg.get("num_recurrent_steps", 1))
+else:
+    embed_dim = int(getattr(cfg, "embed_dim", -1))
+    num_heads = int(getattr(cfg, "num_heads", -1))
+    num_layers = int(getattr(cfg, "num_layers", -1))
+    num_recurrent_steps = int(getattr(cfg, "num_recurrent_steps", 1))
+
+if (
+    embed_dim == target_embed_dim
+    and num_heads == target_num_heads
+    and num_layers == target_num_layers
+    and num_recurrent_steps == target_num_recurrent_steps
+):
+    raise SystemExit(0)
+
+print(
+    "checkpoint architecture mismatch:",
+    f"embed_dim={embed_dim}",
+    f"num_heads={num_heads}",
+    f"num_layers={num_layers}",
+    f"num_recurrent_steps={num_recurrent_steps}",
+)
+raise SystemExit(1)
+PY
+  then
+    echo "[\$(date '+%Y-%m-%d %H:%M:%S')] Resuming from $models_dir/pretrain_latest.pt"
+    resume_args+=(--resume "$models_dir/pretrain_latest.pt")
+  else
+    echo "[\$(date '+%Y-%m-%d %H:%M:%S')] Existing checkpoint in $models_dir is incompatible with target 768/12/12 model; starting fresh"
+  fi
+fi
 .venv/bin/bach-gen train \
   --curriculum \
   --data-dir "$data_dir" \
+  --models-dir "$models_dir" \
   --finetune bach \
   --seq-len-stages "4096:40,8192:25" \
   --batch-size 16 \
   --accumulation-steps 1 \
   --lr 4e-4 \
   --finetune-lr 2e-4 \
-  --embed-dim 384 \
-  --num-heads 8 \
-  --num-layers 9 \
+  --log-interval 1 \
+  --val-interval 5 \
+  --embed-dim 768 \
+  --num-heads 12 \
+  --num-layers 12 \
   --num-recurrent-steps 1 \
   --no-looplm-exit-gate \
   --no-loop-step-embedding \
   --pos-encoding pope \
   --piece-balance sqrt \
-  --fp16
+  "\${resume_args[@]}" \
+  --bf16
 SCRIPT
 
 chmod +x "$runner"

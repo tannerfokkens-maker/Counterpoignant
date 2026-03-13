@@ -940,6 +940,52 @@ class CausalSelfAttention(nn.Module):
         )
         return torch.gather(rel_logits, dim=-1, index=gather_idx)
 
+    def _build_sdpa_mask(
+        self,
+        q: torch.Tensor,
+        k_len: int,
+        causal_mask: torch.Tensor | None,
+        pad_mask: torch.Tensor | None,
+        kv_cache: KVCache | None = None,
+        cache_read_only: bool = False,
+    ) -> tuple[torch.Tensor | None, bool]:
+        """Build SDPA mask inputs and decide whether pure causal mode is valid.
+
+        Returns:
+            (attn_mask, use_is_causal)
+        """
+        q_len = q.shape[2]
+        attn_mask = self._compute_relative_attention_bias(
+            q=q,
+            q_len=q_len,
+            k_len=k_len,
+            kv_cache=kv_cache,
+        )
+        if attn_mask is not None:
+            attn_mask = attn_mask.to(dtype=q.dtype)
+
+        use_is_causal = False
+        has_effective_padding = False
+        if pad_mask is not None:
+            # If the caller provided an all-valid mask, preserve the Flash-eligible
+            # causal path instead of materializing a dense additive mask.
+            has_effective_padding = bool((pad_mask == 0).any().item())
+
+        if kv_cache is not None or cache_read_only:
+            # Incremental mode: new Q tokens can attend to all K/V positions.
+            pass
+        elif has_effective_padding or attn_mask is not None:
+            combined = causal_mask.unsqueeze(0).unsqueeze(0)
+            if has_effective_padding:
+                combined = combined | (pad_mask == 0)
+            additive_mask = torch.zeros_like(combined, dtype=q.dtype)
+            additive_mask.masked_fill_(combined, float("-inf"))
+            attn_mask = additive_mask if attn_mask is None else attn_mask + additive_mask
+        else:
+            use_is_causal = True
+
+        return attn_mask, use_is_causal
+
     def forward(
         self,
         x: torch.Tensor,
@@ -1066,30 +1112,16 @@ class CausalSelfAttention(nn.Module):
         if attn_temperature is not None and attn_temperature != 1.0:
             q = q / math.sqrt(attn_temperature)
 
-        # Build attention mask combining causal + padding
-        attn_mask = self._compute_relative_attention_bias(
+        # Build attention mask combining causal + padding. Preserve the pure
+        # is_causal fast path when no effective padding or relative bias exists.
+        attn_mask, use_is_causal = self._build_sdpa_mask(
             q=q,
-            q_len=T,
             k_len=k_attn.shape[2],
+            causal_mask=causal_mask,
+            pad_mask=pad_mask,
             kv_cache=kv_cache,
+            cache_read_only=cache_read_only,
         )
-        if attn_mask is not None:
-            attn_mask = attn_mask.to(dtype=q.dtype)
-        use_is_causal = False
-        if kv_cache is not None or cache_read_only:
-            # Incremental mode: new Q tokens can attend to all K/V positions
-            pass
-        elif pad_mask is not None or attn_mask is not None:
-            combined = causal_mask.unsqueeze(0).unsqueeze(0)
-            if pad_mask is not None:
-                # pad_mask: (B, 1, T, T) where 0 = ignore
-                # Combine with causal mask: both must allow attention
-                combined = combined | (pad_mask == 0)
-            additive_mask = torch.zeros_like(combined, dtype=q.dtype)
-            additive_mask.masked_fill_(combined, float("-inf"))
-            attn_mask = additive_mask if attn_mask is None else attn_mask + additive_mask
-        else:
-            use_is_causal = True
 
         # Use PyTorch's scaled_dot_product_attention (Flash Attention when available)
         dropout_p = self.attn_dropout.p if self.training else 0.0

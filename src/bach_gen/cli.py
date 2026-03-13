@@ -1126,6 +1126,8 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
               help="Gradient accumulation steps (effective batch = batch_size * steps)")
 @click.option("--resume", default=None, type=click.Path(exists=True),
               help="Resume training from a checkpoint (e.g. models/latest.pt)")
+@click.option("--models-dir", default="models", type=click.Path(),
+              help="Directory for checkpoints and training artifacts (default: models)")
 @click.option("--data-dir", default=None, type=click.Path(),
               help="Directory with prepared training data (default: data/)")
 @click.option("--curriculum", is_flag=True, default=False,
@@ -1181,6 +1183,8 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
               help="Validation frequency in epochs (default: auto = epochs//20)")
 @click.option("--fp16", is_flag=True, default=False,
               help="Enable mixed precision (fp16) training — CUDA only")
+@click.option("--bf16", is_flag=True, default=False,
+              help="Enable mixed precision (bf16) training — CUDA only")
 @click.option("--embed-dim", default=DEFAULT_EMBED_DIM, type=int,
               help=f"Model embedding dimension (default: {DEFAULT_EMBED_DIM})")
 @click.option("--num-heads", default=DEFAULT_NUM_HEADS, type=int,
@@ -1222,7 +1226,7 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
               help="LoopLM: learning rate for Stage II gate training (default: 1e-3)")
 def train(epochs: int, lr: float, batch_size: int, seq_len: int | None,
           seq_len_stages: str | None, mode: str | None,
-          accumulation_steps: int, resume: str | None, data_dir: str | None,
+          accumulation_steps: int, resume: str | None, models_dir: str, data_dir: str | None,
           curriculum: bool, pretrain_epochs: int, finetune_data_dir: str,
           finetune_style: str | None,
           finetune_lr: float, finetune_final_stage_only: bool, pretrained_checkpoint: str | None,
@@ -1234,7 +1238,7 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None,
           finetune_es_min_epochs: int | None,
           log_interval: int,
           val_interval: int | None,
-          fp16: bool, embed_dim: int, num_heads: int, num_layers: int,
+          fp16: bool, bf16: bool, embed_dim: int, num_heads: int, num_layers: int,
           num_front_layers: int, num_loop_layers: int, num_back_layers: int,
           pos_encoding: str, num_kv_heads: int | None,
           rel_attn_bias: bool, rel_attn_max_distance: int,
@@ -1257,6 +1261,7 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None,
 
     # Resolve data directory
     train_data_dir = Path(data_dir) if data_dir else DATA_DIR
+    train_models_dir = MODELS_DIR if models_dir == "models" else Path(models_dir)
 
     # Load data
     seq_path = train_data_dir / "sequences.json"
@@ -1285,6 +1290,9 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None,
         sys.exit(1)
     if log_interval < 1:
         console.print("[red]--log-interval must be >= 1[/red]")
+        sys.exit(1)
+    if fp16 and bf16:
+        console.print("[red]Use at most one mixed-precision mode: choose either --fp16 or --bf16[/red]")
         sys.exit(1)
     if drope_warmup_epochs < 0:
         console.print("[red]--drope-warmup-epochs must be >= 0[/red]")
@@ -1449,17 +1457,18 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None,
         console.print("  Architecture: standard transformer (no LoopLM recurrence)")
 
     # Train
-    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    train_models_dir.mkdir(parents=True, exist_ok=True)
     trainer = Trainer(
         model=model,
         train_dataset=train_ds,
         val_dataset=val_ds,
         lr=lr,
         batch_size=batch_size,
-        checkpoint_dir=MODELS_DIR,
+        checkpoint_dir=train_models_dir,
         device=device,
         accumulation_steps=accumulation_steps,
         fp16=fp16,
+        bf16=bf16,
         token_category_map=token_category_map,
         token_category_names=token_category_names,
         piece_balance=piece_balance,
@@ -1620,7 +1629,7 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None,
                 console.print(f"  Pre-train stopped early: {pt_history['stop_reason']} "
                               f"(ran {pt_history.get('epochs_ran', '?')} epochs)")
             pretrain_ckpt = _resolve_phase_checkpoint(
-                [MODELS_DIR / "pretrain_best.pt", MODELS_DIR / "pretrain_final.pt"],
+                [train_models_dir / "pretrain_best.pt", train_models_dir / "pretrain_final.pt"],
                 "pre-training transition",
             )
 
@@ -1668,7 +1677,7 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None,
             console.print("  Model marked as drope_trained=True")
 
             drope_ckpt = _resolve_phase_checkpoint(
-                [MODELS_DIR / "drope_best.pt", MODELS_DIR / "drope_final.pt"],
+                [train_models_dir / "drope_best.pt", train_models_dir / "drope_final.pt"],
                 "DroPE transition",
             )
             trainer.resume_from_checkpoint(drope_ckpt)
@@ -1817,7 +1826,7 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None,
     console.print(f"  Final train loss: {history['train_loss'][-1]:.4f}")
     if history['val_loss']:
         console.print(f"  Best val loss: {min(history['val_loss']):.4f}")
-    console.print(f"  Checkpoints saved to {MODELS_DIR}/")
+    console.print(f"  Checkpoints saved to {train_models_dir}/")
 
     # Calibrate information-theoretic metrics
     console.print("\n[bold]Calibrating evaluation metrics...[/bold]")
@@ -1828,7 +1837,7 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None,
     cal = calibrate_from_corpus(sequences_for_cal[:50], model)
     console.print(f"  Perplexity range: {cal['perplexity_range']}")
     console.print(f"  Entropy range: {cal['entropy_range']}")
-    info_cal_path = MODELS_DIR / "information_calibration.json"
+    info_cal_path = train_models_dir / "information_calibration.json"
     save_information_calibration(info_cal_path, cal)
     save_information_calibration(train_data_dir / "information_calibration.json", cal)
     console.print(f"  Saved information calibration: {info_cal_path}")
