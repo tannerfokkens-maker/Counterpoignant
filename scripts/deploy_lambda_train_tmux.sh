@@ -259,10 +259,10 @@ for idx in range(torch.cuda.device_count()):
     print(f"cuda_device_{idx}={torch.cuda.get_device_name(idx)}")
 PY
 resume_args=()
-models_dir="$repo_abs/model_45M"
-target_embed_dim=768
-target_num_heads=12
-target_num_layers=12
+models_dir="$repo_abs/models"
+target_embed_dim=384
+target_num_heads=8
+target_num_layers=9
 target_num_recurrent_steps=1
 mkdir -p "\$models_dir"
 if [[ -f "\$models_dir/pretrain_latest.pt" ]]; then
@@ -311,7 +311,7 @@ PY
     echo "[\$(date '+%Y-%m-%d %H:%M:%S')] Resuming from \$models_dir/pretrain_latest.pt"
     resume_args+=(--resume "\$models_dir/pretrain_latest.pt")
   else
-    echo "[\$(date '+%Y-%m-%d %H:%M:%S')] Existing checkpoint in \$models_dir is incompatible with target 768/12/12 model; starting fresh"
+    echo "[\$(date '+%Y-%m-%d %H:%M:%S')] Existing checkpoint in \$models_dir is incompatible with target 384/8/9 model; starting fresh"
   fi
 fi
 .venv/bin/bach-gen train \
@@ -326,9 +326,9 @@ fi
   --finetune-lr 2e-4 \
   --log-interval 1 \
   --val-interval 5 \
-  --embed-dim 768 \
-  --num-heads 12 \
-  --num-layers 12 \
+  --embed-dim 384 \
+  --num-heads 8 \
+  --num-layers 9 \
   --num-recurrent-steps 1 \
   --no-looplm-exit-gate \
   --no-loop-step-embedding \
