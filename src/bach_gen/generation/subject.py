@@ -22,6 +22,42 @@ from bach_gen.utils.constants import (
 logger = logging.getLogger(__name__)
 
 
+_DURATION_SHORTHAND_TO_TICKS = {
+    "w": 1920,   # whole
+    "h": 960,    # half
+    "q": 480,    # quarter
+    "e": 240,    # eighth
+    "s": 120,    # sixteenth
+    "dq": 720,   # dotted quarter
+    "dh": 1440,  # dotted half
+    "de": 360,   # dotted eighth
+}
+
+
+def subject_string_to_note_events(subject_str: str) -> list[tuple[int, int, int]]:
+    """Parse a subject string into note events starting at tick 0."""
+    events: list[tuple[int, int, int]] = []
+    current_time = 0
+
+    for part in subject_str.strip().split():
+        if ":" in part:
+            note_str, dur_str = part.split(":", 1)
+            dur_ticks = _DURATION_SHORTHAND_TO_TICKS.get(dur_str, TICKS_PER_QUARTER)
+        else:
+            note_str = part
+            dur_ticks = TICKS_PER_QUARTER
+
+        midi_note = parse_note_string(note_str)
+        if midi_note is None:
+            logger.warning(f"Could not parse note: {note_str}")
+            continue
+
+        events.append((current_time, dur_ticks, midi_note))
+        current_time += dur_ticks
+
+    return events
+
+
 def parse_subject_string(
     subject_str: str,
     tokenizer: BachTokenizer,
@@ -35,34 +71,8 @@ def parse_subject_string(
     Returns:
         Token sequence for the subject (without BOS/EOS).
     """
-    duration_map = {
-        "w": 1920,   # whole
-        "h": 960,    # half
-        "q": 480,    # quarter
-        "e": 240,    # eighth
-        "s": 120,    # sixteenth
-        "dq": 720,   # dotted quarter
-        "dh": 1440,  # dotted half
-        "de": 360,   # dotted eighth
-    }
-
     tokens = [tokenizer.SUBJECT_START, tokenizer.VOICE_1]
-    current_time = 0
-
-    parts = subject_str.strip().split()
-    for part in parts:
-        # Parse note:duration or just note (default quarter)
-        if ":" in part:
-            note_str, dur_str = part.split(":", 1)
-            dur_ticks = duration_map.get(dur_str, TICKS_PER_QUARTER)
-        else:
-            note_str = part
-            dur_ticks = TICKS_PER_QUARTER
-
-        midi_note = parse_note_string(note_str)
-        if midi_note is None:
-            logger.warning(f"Could not parse note: {note_str}")
-            continue
+    for _start, dur_ticks, midi_note in subject_string_to_note_events(subject_str):
 
         # Pitch token
         pitch_tok = tokenizer._pitch_to_token(midi_note)
@@ -99,31 +109,13 @@ def parse_subject_string_sd(
     """
     from bach_gen.data.scale_degree_tokenizer import ScaleDegreeTokenizer
 
-    duration_map = {
-        "w": 1920, "h": 960, "q": 480, "e": 240, "s": 120,
-        "dq": 720, "dh": 1440, "de": 360,
-    }
-
     tokens: list[int] = [tokenizer.SUBJECT_START, tokenizer.VOICE_1]
 
     # Temporarily set encode key context for _pitch_to_degree_tokens
     tokenizer._encode_key_root = key_root
     tokenizer._encode_key_mode = key_mode
 
-    parts = subject_str.strip().split()
-    for part in parts:
-        if ":" in part:
-            note_str, dur_str = part.split(":", 1)
-            dur_ticks = duration_map.get(dur_str, TICKS_PER_QUARTER)
-        else:
-            note_str = part
-            dur_ticks = TICKS_PER_QUARTER
-
-        midi_note = parse_note_string(note_str)
-        if midi_note is None:
-            logger.warning(f"Could not parse note: {note_str}")
-            continue
-
+    for _start, dur_ticks, midi_note in subject_string_to_note_events(subject_str):
         degree_toks = tokenizer._pitch_to_degree_tokens(midi_note)
         tokens.extend(degree_toks)
 

@@ -1,655 +1,640 @@
-# Reinforcement Learning Plan: ReST → GRPO
+# Reinforcement Learning Plan: Hybrid ReST First, GRPO Only If Earned
 
 ## Overview
 
-Close the loop between generation and scoring. The model currently generates 100+ candidates and picks the best — RL trains the model to generate winners directly instead of relying on brute-force sampling.
+The goal is still the same:
+- reduce dependence on brute-force candidate search
+- push the model toward Bach-quality outputs
+- keep the "impressive demo" qualities that already matter to you
 
-Two phases:
-- **Phase 1 (ReST):** Rejection sampling + fine-tuning. Simple, immediate gains.
-- **Phase 2 (GRPO):** Group-relative policy optimization. Richer gradient signal, more sample-efficient.
+But the rollout should be more conservative than a direct jump into dense section-level RL, and more hybrid than scorer-only RL.
 
-Both phases use section-level scoring for denser reward signals.
+The main reason is simple:
+- the handcrafted scorer is much better than before, but it is still a hand-built reward
+- an LLM judge can evaluate many more plausible candidates than a human can
+- human preference is still the real gold standard for what the project actually wants
+
+So the recommended sequence is:
+
+1. **Phase 0: Freeze the judge stack and benchmark it**
+2. **Phase 1: Conservative ReST**
+   - handcrafted scorer filters hard failures
+   - LLM ranks plausible survivors
+   - human audits only the top slice
+   - section scores only as vetoes / diagnostics
+3. **Phase 1.5: Adversarial mining**
+   - explicitly collect scorer / LLM / human disagreement cases
+4. **Phase 2: Optional section-aware ReST**
+   - only if Phase 1 behaves well
+5. **Phase 3: GRPO**
+   - start with group-normalized sequence rewards
+   - preferably against a learned hybrid reward model
+   - only add dense section-level token advantages after GRPO is already stable
+
+The key principle is:
+
+- **Do not make section-level reward the main optimization target on day one.**
+
+Use it first to reject obviously broken pieces and to analyze where the scorer is helping or lying.
 
 ---
 
-## Section-Level Scoring
+## Reward Stack
 
-### The problem with sequence-level rewards
+Do not optimize raw `composite` alone.
 
-A 4096-token fugue takes ~2000 decisions. A single composite score at the end gives the model no signal about which decisions mattered. Did the score drop because of bad voice leading in bar 12, or because the subject never returned after bar 20? The model can't tell.
+The current evaluator already distinguishes:
+- `bach_similarity`
+- `rhetorical_impact`
+- `demo_bach_balance`
 
-### Section boundaries
+That should be reflected in the reward.
 
-Split sequences at natural musical boundaries. These are already detectable from the token stream:
+### Recommended reward for RL / ReST selection
 
-1. **BAR tokens.** Every BAR token is a candidate boundary. Group into sections of 4 bars (the standard phrase length in tonal music).
-2. **Cadence tokens.** Once cadence conditioning is implemented (per the conditioning plan), every `CAD_PAC`/`CAD_HC`/`CAD_DC` marks a section boundary.
-3. **Voice entry points.** In fugues, a new voice entering (first note in a previously silent voice) marks a structural boundary — end of one exposition entry, start of the next.
-
-Use 4-bar groupings as the default, with cadence/entry boundaries overriding when available.
-
-### Section-level scorer
-
-Score each section independently on the dimensions that can be evaluated locally:
-
-| Dimension | Section-level? | Notes |
-|-----------|---------------|-------|
-| Voice leading | Yes | Parallel fifths, crossings, leaps — all local |
-| Contrapuntal | Mostly | Register consistency, melodic coherence, rhythmic complementarity — all local. Sequential patterns need ≥2 sections |
-| Thematic recall | Partially | Can check if subject/fragments appear in this section. Full thematic recall needs the whole piece |
-| Statistical | Yes | Interval bigram distributions per section |
-| Structural | Partially | Cadence quality at section boundaries. Key consistency local |
-| Completeness | No | Only meaningful for full sequence |
-
-Implementation:
+Use a reward stack like:
 
 ```python
-def score_section(
-    comp: VoiceComposition,
-    section_start_tick: int,
-    section_end_tick: int,
-    subject_intervals: list[int] | None = None,
-    key_root: int = 0,
-    key_mode: str = "major",
-) -> float:
-    """Score a single section of a composition.
-    
-    Returns a scalar reward for this section.
-    """
-    # Extract notes within the section window
-    section_comp = extract_section(comp, section_start_tick, section_end_tick)
-    
-    # Voice leading (fully local)
-    vl_score, _ = score_voice_leading(section_comp)
-    
-    # Contrapuntal (local metrics only)
-    cp_score, _ = score_contrapuntal_local(section_comp)
-    
-    # Thematic fragment presence
-    frag_score = check_fragment_presence(section_comp, subject_intervals)
-    
-    # Statistical (local interval bigrams)
-    stat_score, _ = score_statistical(section_comp)
-    
-    # Cadence quality (if section ends at a phrase boundary)
-    cad_score = score_cadence_at_boundary(section_comp, key_root, key_mode)
-    
-    # Section composite
-    return (
-        vl_score * 0.30
-        + cp_score * 0.25
-        + frag_score * 0.20
-        + stat_score * 0.10
-        + cad_score * 0.15
-    )
+reward = (
+    0.45 * bach_similarity
+    + 0.35 * demo_bach_balance
+    + 0.20 * rhetorical_impact
+    - hard_failure_penalties
+)
 ```
 
-### Cumulative reward
+Where `hard_failure_penalties` includes:
+- broken or absent cadence at ending
+- missing or collapsed voices
+- incomplete structure
+- strong fugue/chorale/form mismatch flags
+- any explicit scorer failure flags already known to be real problems
 
-For a sequence with N sections, the reward at token t is the sum of rewards for all completed sections up to t:
+### Why not raw composite?
 
-```
-R(t) = sum(section_score[i] for i in completed_sections_before(t))
-```
+Because raw composite still overweights some “clean and dramatic” patterns that are attractive but not necessarily deeper or more Bach-like.
 
-This gives the model credit assignment: if section 3 scored badly, the tokens in section 3 get lower cumulative reward than tokens in sections 1-2.
+The current split reward is closer to the actual project goal:
+- strong Bach resemblance
+- strong demo effect
+- no structural failures
+
+## Judge Hierarchy
+
+The long-term RL target should not be "handcrafted scorer only."
+
+The right hierarchy is:
+
+1. **Handcrafted scorer**
+   - fast
+   - deterministic
+   - ideal for hard failures and structural guardrails
+
+2. **LLM judge**
+   - scalable
+   - much better than heuristics at comparing plausible musical candidates
+   - should operate as a ranking layer, not as the only safety check
+
+3. **Human preference**
+   - slow and expensive
+   - highest-quality signal
+   - best used to calibrate the LLM judge and any learned reward model
+
+### Recommended operational flow
+
+For each prompt-grouped candidate pool:
+
+1. Use the handcrafted scorer to reject broken candidates.
+2. Use the LLM to rank the plausible survivors.
+3. Use human listening only on the top slice, not the full pool.
+
+This is the scalable version of the musical judgment stack you actually want.
+
+### Long-term reward target
+
+The best eventual GRPO reward is a **learned hybrid reward model** distilled from:
+- handcrafted structural signals
+- LLM preference judgments
+- a smaller human preference set
+
+That is the most realistic path to scalable reward without turning the project into scorer-only optimization.
 
 ---
 
-## Phase 1: ReST (Reinforced Self-Training)
+## Phase 0: Freeze the Judge Stack Before RL
 
-### Algorithm
+Before any RL:
 
-```
+1. Freeze the scorer version.
+2. Freeze the LLM judging prompt / schema if the LLM is in the loop.
+3. Save the benchmark outputs used to justify both.
+4. Do not keep changing the reward during an RL run.
+
+Why:
+- if reward changes midstream, iteration-to-iteration progress becomes uninterpretable
+- rollback gets harder
+- reward hacking becomes harder to detect
+
+### What to freeze
+
+At minimum, freeze:
+- scorer weights and failure penalties
+- LLM judge prompt
+- LLM output schema
+- candidate representation fed to the LLM
+- pairwise or best-of-k judging format
+- human review rubric used for spot audits
+
+### Phase 0 acceptance gates
+
+Do not start RL unless all are true:
+- Bach benchmark still passes
+- non-Bach conditioning audit still passes
+- your current base model can already generate a few clearly good samples
+- the reward ranks those good samples above obvious failures
+- the LLM ranking agrees with your ear on a small pilot set
+
+---
+
+## Section-Level Scoring: Use as Diagnostic First
+
+Dense section reward is attractive, but it is also the easiest place to inject noisy supervision.
+
+The safe use order is:
+
+### First use
+- section scores as:
+  - rejection criteria
+  - diagnostics
+  - logging
+
+### Later use
+- section scores as:
+  - ranking features inside ReST
+  - token-level advantages inside GRPO
+
+### Default section boundaries
+
+Keep simple, robust boundaries:
+- 4-bar chunks by default
+- cadence boundaries can refine them
+- fugue subject-entry boundaries are optional, not required
+
+Do **not** make token-level reward depend on fragile boundary logic in the first implementation.
+
+---
+
+## Phase 1: Conservative ReST
+
+This should be the first real RL-style phase.
+
+### Why ReST first
+
+ReST is lower risk because:
+- it keeps updates supervised
+- winners are human-inspectable
+- rollback is easy
+- it tells you quickly whether the scorer is useful as a training signal at all
+
+### ReST algorithm
+
+```text
 for iteration in range(max_iterations):
-    1. Generate candidate pool
-    2. Score all candidates (section-level + full-sequence)
-    3. Filter to top performers
-    4. Fine-tune model on winners + real data
-    5. Evaluate: if no improvement, stop ReST → move to GRPO
+    1. Generate a prompt-grouped candidate pool
+    2. Score each candidate with frozen handcrafted reward
+    3. Reject hard failures
+    4. Ask the frozen LLM judge to rank the survivors
+    5. Keep conservative winners
+    6. Fine-tune on winners + real Bach data
+    7. Evaluate against a fixed prompt benchmark
+    8. If no improvement or music gets worse, stop
 ```
 
-### Step 1: Generate candidate pool
+### Prompt pool
 
-For each iteration, generate across diverse prompts:
+Use a smaller and more controlled prompt pool than the original draft.
+
+Start with:
+- 8 to 12 prompts
+- spread across fugue, invention, sinfonia, chorale
+- fixed keys and fixed seeds for evaluation
+
+Example:
 
 ```python
 PROMPTS = [
     {"key": "B minor", "mode": "fugue", "voices": 4},
     {"key": "D minor", "mode": "fugue", "voices": 4},
-    {"key": "G major", "mode": "fugue", "voices": 3},
-    {"key": "C minor", "mode": "fugue", "voices": 4},
     {"key": "Eb major", "mode": "fugue", "voices": 4},
     {"key": "F# minor", "mode": "sinfonia", "voices": 3},
     {"key": "A minor", "mode": "invention", "voices": 2},
     {"key": "Bb major", "mode": "chorale", "voices": 4},
-    # ... 20-30 diverse prompts covering keys, forms, voice counts
 ]
-
-CANDIDATES_PER_PROMPT = 50  # Lower than generation (speed matters in the loop)
 ```
 
-Total per iteration: ~1000-1500 candidates.
+### Candidate count
 
-Temperature: 0.9 (exploratory — we want diversity in the candidate pool, the filter handles quality).
+Start smaller:
+- `16-24` candidates per prompt
 
-### Step 2: Score candidates
+Why:
+- faster iterations
+- easier debugging
+- enough diversity to test whether the scorer helps
 
-For each candidate:
-1. Split into 4-bar sections
-2. Score each section independently
-3. Compute section-level reward curve
-4. Also compute the full-sequence composite score (existing scorer)
-5. Record both the sequence and its per-section rewards
+### Winner filtering
 
-```python
-@dataclass
-class ScoredCandidate:
-    tokens: list[int]
-    prompt: dict
-    section_rewards: list[float]  # per-section scores
-    composite: float              # full-sequence composite
-    mean_section: float           # mean of section scores
-```
+For the first version, keep it conservative.
 
-### Step 3: Filter to winners
+A candidate is a winner only if:
+- handcrafted reward is above the `75th` percentile within its prompt group
+- no hard failure flags are present
+- no section score is below a low floor such as `0.30`
+- the LLM judge ranks it in the top tier of the surviving group
 
-Selection criteria (all must be met):
-- Full-sequence composite ≥ 75th percentile within its prompt group
-- No section scores below 0.3 (reject candidates with one terrible section)
-- Mean section score ≥ 70th percentile
+That means:
+- section scores act as vetoes
+- handcrafted sequence reward still drives safety
+- the LLM is the scalable musical preference layer
 
-This gives ~20-25% of candidates as winners. Not too aggressive (avoids mode collapse), not too loose (maintains quality pressure).
+### LLM judgment format
 
-### Step 4: Fine-tune on winners + real data
+The safest first LLM format is not free-form scoring.
 
-```python
-# Mix ratio: 50% winners, 50% original training data
-train_sequences = winners + sample(bach_training_data, len(winners))
-shuffle(train_sequences)
+Use one of:
+- pairwise A/B preference
+- best-of-4 or best-of-6 ranking among scorer-filtered survivors
 
-# Fine-tune for 3-5 epochs with low learning rate
-optimizer = AdamW(model.parameters(), lr=1e-5, weight_decay=0.01)
-# Use cosine schedule within each ReST iteration
-```
+Do not ask the LLM to judge obviously broken candidates. That is wasted compute and teaches less.
 
-Key details:
-- **Always mix real data.** Without this, the model forgets Bach and converges to "high-scoring but boring" patterns.
-- **Low learning rate.** We're nudging, not retraining. 1e-5 is 10x lower than the original fine-tune LR.
-- **Few epochs.** 3-5 epochs per iteration. Overfitting to one iteration's winners is the main risk.
-- **Save checkpoint after each iteration.** If iteration N is worse than N-1, roll back.
+### Human review during ReST
 
-### Step 5: Evaluate and decide
+Humans should not rank the whole pool.
 
-After fine-tuning, generate a fixed evaluation set (same prompts, same seeds):
-- 20 candidates per prompt, 10 prompts = 200 total
-- Score with full-sequence scorer
-- Track: mean composite, mean thematic recall, mean contrapuntal, mean voice leading
+Instead:
+- review a small sample of LLM-selected winners every iteration
+- review disagreement cases where scorer and LLM disagree sharply
+- stop the run if the top samples sound worse even while the metrics improve
 
-```python
-@dataclass
-class IterationMetrics:
-    iteration: int
-    mean_composite: float
-    mean_thematic_recall: float
-    mean_contrapuntal: float
-    mean_voice_leading: float
-    top_10_mean: float  # mean of top 10% scores
-    winner_rate: float  # fraction scoring above baseline threshold
-```
+### Training mix
 
-**Plateau detection:**
-```python
-def should_stop_rest(history: list[IterationMetrics], patience: int = 3) -> bool:
-    """Stop ReST if no improvement in `patience` iterations."""
-    if len(history) < patience + 1:
-        return False
-    recent = history[-patience:]
-    best_before = max(h.mean_composite for h in history[:-patience])
-    best_recent = max(h.mean_composite for h in recent)
-    return best_recent <= best_before + 0.005  # 0.5% improvement threshold
-```
+Always mix winners with real Bach data.
 
-### ReST implementation: `rest_train.py`
+Recommended first ratio:
+- `60%` real Bach
+- `40%` winners
 
-New file: `src/bach_gen/training/rest_train.py`
+This is more conservative than a 50/50 mix and better for early experiments.
 
-```python
-def rest_loop(
-    model: BachTransformer,
-    tokenizer: BachTokenizer,
-    bach_data: list[list[int]],
-    prompts: list[dict],
-    candidates_per_prompt: int = 50,
-    winner_percentile: float = 75,
-    min_section_score: float = 0.3,
-    mix_ratio: float = 0.5,
-    lr: float = 1e-5,
-    epochs_per_iter: int = 3,
-    max_iterations: int = 20,
-    patience: int = 3,
-    output_dir: Path = Path("models_NEW/rest"),
-    device: torch.device = None,
-) -> BachTransformer:
-    """Run the full ReST loop."""
-    
-    history: list[IterationMetrics] = []
-    best_composite = 0.0
-    
-    for iteration in range(max_iterations):
-        logger.info(f"=== ReST Iteration {iteration + 1}/{max_iterations} ===")
-        
-        # 1. Generate
-        candidates = generate_candidate_pool(
-            model, tokenizer, prompts, candidates_per_prompt, device
-        )
-        
-        # 2. Score (section-level + full)
-        scored = score_all_candidates(candidates, tokenizer)
-        
-        # 3. Filter
-        winners = filter_winners(scored, winner_percentile, min_section_score)
-        logger.info(f"  Winners: {len(winners)}/{len(scored)} "
-                    f"({len(winners)/len(scored)*100:.0f}%)")
-        
-        # 4. Fine-tune
-        train_data = build_training_mix(winners, bach_data, mix_ratio)
-        fine_tune_iteration(model, train_data, lr, epochs_per_iter, device)
-        
-        # 5. Evaluate
-        metrics = evaluate_iteration(model, tokenizer, prompts[:10], device)
-        metrics.iteration = iteration + 1
-        history.append(metrics)
-        
-        logger.info(f"  Composite: {metrics.mean_composite:.4f} "
-                    f"(best: {best_composite:.4f})")
-        
-        # Save checkpoint
-        save_path = output_dir / f"rest_iter_{iteration + 1}.pt"
-        save_checkpoint(model, save_path, metrics)
-        
-        if metrics.mean_composite > best_composite:
-            best_composite = metrics.mean_composite
-            save_checkpoint(model, output_dir / "rest_best.pt", metrics)
-        
-        # Plateau check
-        if should_stop_rest(history, patience):
-            logger.info(f"  Plateau detected after {iteration + 1} iterations.")
-            break
-    
-    # Load best checkpoint
-    model = load_checkpoint(output_dir / "rest_best.pt")
-    return model
-```
+### Fine-tune schedule per ReST iteration
 
-### CLI integration
+Start with:
+- `lr = 1e-5`
+- `epochs_per_iter = 1 or 2`
 
-Add to `cli.py`:
+Do **not** start with `3-5` epochs per iteration.
 
-```
-uv run bach-gen rest-train \
-    --model-path models_NEW/finetune_best.pt \
-    --candidates 50 \
-    --winner-percentile 75 \
-    --mix-ratio 0.5 \
-    --lr 1e-5 \
-    --epochs-per-iter 3 \
-    --max-iterations 20 \
-    --patience 3
-```
+That is too aggressive for the first loop and increases the risk of drifting toward reward-friendly artifacts.
 
-### Expected timeline
+### ReST evaluation
 
-- Each iteration: ~30 min generation (50 candidates × 30 prompts with KV cache) + ~10 min training + ~10 min eval = ~50 min
-- 10-15 iterations to plateau = ~8-12 hours
-- Run overnight, wake up to a better model
+After each iteration, evaluate on a fixed held-out prompt set:
+- same prompts
+- same seeds
+- same candidate count
+
+Track:
+- mean reward
+- mean `bach_similarity`
+- mean `demo_bach_balance`
+- mean `rhetorical_impact`
+- winner rate above a fixed threshold
+
+Also listen to a few top samples every iteration.
+
+If scores rise while listening quality drops, stop. That is reward hacking.
+
+### ReST stop criteria
+
+Stop ReST if any of these happen:
+- no improvement for `3` iterations
+- reward rises but listening quality clearly worsens
+- diversity collapses
+- output quality gets narrower or more stereotyped
 
 ---
 
-## Phase 2: GRPO (Group Relative Policy Optimization)
+## Phase 1.5: Adversarial Mining
 
-### When to switch
+This phase is important enough that it should be explicit.
 
-Move to GRPO when ReST satisfies any of:
-- Plateau detected (no improvement for 3 iterations)
-- Winner rate exceeds 80% (nearly all candidates are good — sampling can't improve further)
-- Mean composite stops improving but variance is still high (model is inconsistent)
+Between ReST and GRPO, mine failure cases.
 
-### Why GRPO over PPO
+### What to collect
 
-- **No value model needed.** PPO requires a separate critic network (~doubling parameters). With 5.7M params, you can't afford that.
-- **Group normalization replaces the baseline.** Instead of learning V(s), GRPO normalizes rewards within each group of candidates from the same prompt. Same variance reduction, zero extra parameters.
-- **Your scorer is deterministic.** PPO's advantage over simpler methods comes from handling stochastic rewards. Your scorer always gives the same score for the same sequence.
+Collect candidates that are:
+- high `rhetorical_impact`, low `bach_similarity`
+- high `bach_similarity`, but dull or inert
+- structurally broken despite good local writing
+- repetitive but scorer-friendly
+- highly ranked by the LLM but disliked by a human
+- highly ranked by the scorer but rejected by the LLM
 
-### Algorithm
+These become:
+- a qualitative inspection set
+- a future negative set for reward calibration
+- the highest-value human-labeling set
 
-```
-for step in range(max_steps):
-    1. Sample a prompt
-    2. Generate G candidates from current policy (G = group size, e.g. 16)
-    3. Score all G candidates (section-level rewards)
-    4. Compute per-token advantages using group normalization
-    5. Policy gradient update with KL penalty against reference model
-```
+### Why this matters
 
-### Section-level advantage computation
+GRPO will exploit exactly these cases if you do not surface them first.
 
-This is where section scoring pays off most. Instead of one reward per sequence, each section contributes to the advantage of its tokens:
+### Human preference collection target
 
-```python
-def compute_section_advantages(
-    section_rewards: list[list[float]],  # [G candidates][N sections each]
-    group_size: int,
-) -> list[list[float]]:
-    """Compute per-section advantages using group normalization.
-    
-    For each section position, normalize rewards across the group:
-    advantage[i][s] = (reward[i][s] - mean_s) / (std_s + eps)
-    
-    where mean_s and std_s are computed across all G candidates
-    for section position s.
-    """
-    max_sections = max(len(r) for r in section_rewards)
-    advantages = []
-    
-    for i in range(group_size):
-        adv_i = []
-        for s in range(len(section_rewards[i])):
-            # Gather rewards at this section position across group
-            section_s_rewards = [
-                section_rewards[j][s]
-                for j in range(group_size)
-                if s < len(section_rewards[j])
-            ]
-            mean_s = sum(section_s_rewards) / len(section_s_rewards)
-            std_s = (sum((r - mean_s)**2 for r in section_s_rewards) 
-                     / len(section_s_rewards)) ** 0.5
-            
-            adv_i.append((section_rewards[i][s] - mean_s) / (std_s + 1e-8))
-        
-        advantages.append(adv_i)
-    
-    return advantages
-```
+You do not need a huge human dataset to get started.
 
-### Per-token advantage assignment
+A realistic target is:
+- `500-1,000` pairwise rankings for the first useful signal
+- `2,000-5,000` pairwise rankings for a genuinely strong small-project reward model
 
-Each token inherits the advantage of its section:
-
-```python
-def assign_token_advantages(
-    tokens: list[int],
-    section_boundaries: list[int],  # token indices where sections start
-    section_advantages: list[float],
-) -> list[float]:
-    """Map section-level advantages to per-token advantages."""
-    token_advantages = []
-    current_section = 0
-    
-    for t in range(len(tokens)):
-        if (current_section + 1 < len(section_boundaries) and 
-            t >= section_boundaries[current_section + 1]):
-            current_section += 1
-        
-        token_advantages.append(section_advantages[current_section])
-    
-    return token_advantages
-```
-
-### Policy gradient with KL penalty
-
-```python
-def grpo_loss(
-    model: BachTransformer,
-    ref_model: BachTransformer,   # frozen copy of model before GRPO
-    tokens: torch.Tensor,         # (G, T) token sequences
-    advantages: torch.Tensor,     # (G, T) per-token advantages
-    kl_coeff: float = 0.05,       # KL penalty coefficient
-) -> torch.Tensor:
-    """GRPO policy gradient loss with KL regularization."""
-    # Current policy log probs
-    logits = model(tokens[:, :-1])
-    log_probs = F.log_softmax(logits, dim=-1)
-    token_log_probs = log_probs.gather(-1, tokens[:, 1:].unsqueeze(-1)).squeeze(-1)
-    
-    # Reference policy log probs (no grad)
-    with torch.no_grad():
-        ref_logits = ref_model(tokens[:, :-1])
-        ref_log_probs = F.log_softmax(ref_logits, dim=-1)
-        ref_token_log_probs = ref_log_probs.gather(
-            -1, tokens[:, 1:].unsqueeze(-1)
-        ).squeeze(-1)
-    
-    # KL divergence (per token)
-    kl_div = token_log_probs - ref_token_log_probs
-    
-    # Policy gradient: maximize advantage-weighted log prob, minimize KL
-    loss = -(advantages[:, :-1] * token_log_probs).mean() + kl_coeff * kl_div.mean()
-    
-    return loss
-```
-
-### KL coefficient schedule
-
-Start with `kl_coeff = 0.1` (conservative — stay close to reference). Decay to 0.01 over training. If KL divergence exceeds a threshold (e.g., 0.5 nats), temporarily increase kl_coeff to pull the model back.
-
-### GRPO hyperparameters
-
-```python
-GRPO_CONFIG = {
-    "group_size": 16,           # candidates per prompt per step
-    "lr": 5e-6,                 # lower than ReST — RL updates are noisier
-    "kl_coeff_init": 0.1,
-    "kl_coeff_min": 0.01,
-    "kl_decay_steps": 500,
-    "max_steps": 2000,
-    "eval_interval": 50,
-    "section_length_bars": 4,
-    "ref_model_update_interval": None,  # keep fixed (no target network)
-}
-```
-
-### GRPO implementation: `grpo_train.py`
-
-New file: `src/bach_gen/training/grpo_train.py`
-
-```python
-def grpo_loop(
-    model: BachTransformer,
-    tokenizer: BachTokenizer,
-    prompts: list[dict],
-    config: dict = GRPO_CONFIG,
-    output_dir: Path = Path("models_NEW/grpo"),
-    device: torch.device = None,
-) -> BachTransformer:
-    """Run GRPO training loop."""
-    
-    # Freeze reference model
-    ref_model = deepcopy(model)
-    ref_model.eval()
-    for p in ref_model.parameters():
-        p.requires_grad = False
-    
-    optimizer = AdamW(model.parameters(), lr=config["lr"], weight_decay=0.01)
-    
-    best_composite = 0.0
-    
-    for step in range(config["max_steps"]):
-        # Sample a prompt
-        prompt = random.choice(prompts)
-        
-        # Generate group
-        group_tokens = []
-        for _ in range(config["group_size"]):
-            tokens = generate_one(model, tokenizer, prompt, 
-                                  temperature=0.9, device=device)
-            group_tokens.append(tokens)
-        
-        # Score sections
-        section_rewards = []
-        for tokens in group_tokens:
-            comp = tokenizer.decode(tokens)
-            boundaries, rewards = score_sections(
-                comp, section_length_bars=config["section_length_bars"]
-            )
-            section_rewards.append(rewards)
-        
-        # Compute advantages
-        advantages = compute_section_advantages(
-            section_rewards, config["group_size"]
-        )
-        
-        # Map to per-token advantages
-        # ... (assign_token_advantages for each candidate)
-        
-        # Pad and batch
-        # ... (standard padding)
-        
-        # Compute loss
-        loss = grpo_loss(model, ref_model, batch_tokens, batch_advantages,
-                         kl_coeff=current_kl_coeff(step, config))
-        
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-        
-        # Eval
-        if (step + 1) % config["eval_interval"] == 0:
-            metrics = evaluate_iteration(model, tokenizer, prompts[:10], device)
-            logger.info(f"Step {step+1}: composite={metrics.mean_composite:.4f}")
-            
-            if metrics.mean_composite > best_composite:
-                best_composite = metrics.mean_composite
-                save_checkpoint(model, output_dir / "grpo_best.pt", metrics)
-    
-    return model
-```
-
-### Memory considerations
-
-GRPO needs both the current model and frozen reference model in memory. At 5.7M params in fp32, that's ~46MB total — trivial on your 96GB machine. The real cost is generating 16 candidates per step. With KV cache, this should take ~10-15 seconds per step.
+Collect these mostly from disagreement cases and close musical decisions, not trivial "good vs broken" comparisons.
 
 ---
 
-## Automatic Pipeline: `rl_train.py`
+## Phase 2: Optional Section-Aware ReST
 
-The full automatic loop that runs ReST until plateau, then switches to GRPO:
+Only do this if conservative ReST behaves well.
+
+This phase adds section scores as ranking features, but still keeps the optimization target sequence-level.
+
+### Safe use of section scores here
+
+Use section statistics like:
+- minimum section score
+- mean section score
+- section variance
+
+as selection features, not direct token rewards.
+
+Example winner score:
 
 ```python
-def rl_pipeline(
-    model_path: Path,
-    bach_data_path: Path,
-    output_dir: Path,
-    rest_config: dict,
-    grpo_config: dict,
-):
-    """Full RL pipeline: ReST → GRPO."""
-    
-    model, config = load_checkpoint(model_path)
-    tokenizer = load_tokenizer(...)
-    bach_data = load_training_data(bach_data_path)
-    
-    prompts = generate_diverse_prompts()
-    
-    # Phase 1: ReST
-    logger.info("=" * 60)
-    logger.info("  PHASE 1: ReST")
-    logger.info("=" * 60)
-    
-    model = rest_loop(
-        model=model,
-        tokenizer=tokenizer,
-        bach_data=bach_data,
-        prompts=prompts,
-        output_dir=output_dir / "rest",
-        **rest_config,
-    )
-    
-    rest_metrics = load_metrics(output_dir / "rest")
-    logger.info(f"ReST complete. Best composite: {rest_metrics.best_composite:.4f}")
-    
-    # Phase 2: GRPO
-    logger.info("=" * 60)
-    logger.info("  PHASE 2: GRPO")
-    logger.info("=" * 60)
-    
-    model = grpo_loop(
-        model=model,
-        tokenizer=tokenizer,
-        prompts=prompts,
-        config=grpo_config,
-        output_dir=output_dir / "grpo",
-    )
-    
-    grpo_metrics = load_metrics(output_dir / "grpo")
-    logger.info(f"GRPO complete. Best composite: {grpo_metrics.best_composite:.4f}")
-    
-    # Final evaluation
-    logger.info("=" * 60)
-    logger.info("  FINAL EVALUATION")
-    logger.info("=" * 60)
-    
-    final_eval = full_evaluation(model, tokenizer, prompts, 
-                                  candidates=200, output_dir=output_dir / "final")
-    
-    logger.info(f"Final best composite: {final_eval.top_composite:.4f}")
-    logger.info(f"Final mean composite: {final_eval.mean_composite:.4f}")
+winner_score = (
+    0.75 * sequence_reward
+    + 0.15 * mean_section_score
+    + 0.10 * min_section_score
+)
 ```
 
-### CLI
+This gives some pressure toward avoiding dead sections without letting noisy section labels dominate.
 
+---
+
+## Phase 3: GRPO
+
+Do not start GRPO until:
+- ReST clearly helps
+- adversarial mining has been done
+- the reward has survived that pressure test
+
+### Why GRPO still makes sense
+
+GRPO is still the right RL choice here because:
+- no value network needed
+- group normalization is natural for prompt-grouped candidate generation
+- your reward is deterministic
+
+### But start with sequence-level GRPO
+
+The safest first GRPO objective is:
+- one scalar reward per sequence
+- normalized within the prompt group
+
+Do **not** start with token-level section advantages in the first GRPO version.
+
+### Preferred GRPO reward source
+
+Best case:
+- a learned hybrid reward model trained on handcrafted + LLM + human preferences
+
+Acceptable first version:
+- a frozen scalar reward stack plus LLM-ranked preference data distilled into sequence rewards
+
+Avoid:
+- direct dense RL against a raw heuristic composite only
+
+### Initial GRPO loss
+
+```python
+loss = (
+    -(advantages * token_log_probs).mean()
+    + kl_coeff * kl_div.mean()
+)
 ```
-uv run bach-gen rl-train \
-    --model-path models_NEW/finetune_best.pt \
-    --output-dir models_NEW/rl \
-    --rest-candidates 50 \
-    --rest-max-iterations 20 \
-    --grpo-group-size 16 \
-    --grpo-max-steps 2000
+
+Where `advantages` are:
+- per-sequence
+- prompt-group normalized
+
+### GRPO group design
+
+Recommended:
+- fixed prompt
+- generate `G=8` or `G=12` candidates
+- compute normalized reward within the group
+
+Do not start at `G=16` unless throughput is clearly fine.
+
+### KL schedule
+
+Start conservatively:
+- `kl_coeff = 0.1`
+
+Only relax after you see stable behavior.
+
+### Section-level advantages come later
+
+Only add token-level section advantages after:
+- sequence-level GRPO is stable
+- samples are improving by ear
+- no obvious reward hacking has appeared
+
+That should be treated as a second GRPO phase, not the first.
+
+---
+
+## Automatic Pipeline
+
+The full automatic loop should still be:
+
+```text
+Base model
+  -> Conservative ReST
+  -> Adversarial mining / scorer + LLM + human check
+  -> Optional section-aware ReST
+  -> Sequence-level GRPO
+  -> Optional dense section-aware GRPO
+```
+
+Not:
+
+```text
+Base model
+  -> section-level ReST
+  -> dense GRPO
 ```
 
 ---
 
 ## Implementation Order
 
-1. **`score_section()`** — extract sections from a composition, score locally. Build on existing scorer infrastructure. Test against full-sequence scores to verify consistency.
+1. **Freeze scorer + LLM judge**
+   - save benchmark outputs
+   - save reward weights / penalty logic
+   - save LLM judge prompt and schema
 
-2. **`rest_train.py`** — the ReST loop. Uses existing `_generate_one`, `score_composition`, and `Trainer.fine_tune`. Wire up the generate → filter → train cycle.
+2. **Build prompt benchmark + listening set**
+   - fixed held-out prompts
+   - fixed seeds
+   - stable evaluation outputs
 
-3. **CLI `rest-train` command** — expose ReST with sensible defaults. Run it overnight. Evaluate results.
+3. **Implement conservative ReST**
+   - handcrafted filter
+   - LLM ranking
+   - section veto only
+   - low LR
+   - 1-2 epochs per iteration
 
-4. **`grpo_train.py`** — implement after ReST plateaus. The section-level advantage computation is the novel piece; the policy gradient is standard.
+4. **Add adversarial mining**
+   - save top failures by reward profile
+   - save scorer / LLM / human disagreements
 
-5. **CLI `rl-train` command** — the full automatic pipeline.
+5. **Collect initial human preference data**
+   - pairwise judgments on disagreement sets
+   - start small and high-quality
 
-6. **Monitoring dashboard** (optional) — log iteration metrics to JSON, plot composite/thematic_recall/contrapuntal over iterations. Makes it easy to see if RL is actually helping.
+6. **Train a learned hybrid reward model**
+   - distilled from handcrafted + LLM + human signals
+
+7. **Implement optional section-aware ReST ranking**
+   - still no token-level reward
+
+8. **Implement sequence-level GRPO**
+   - group-normalized scalar reward
+   - strong KL penalty
+
+9. **Only then consider dense section-aware GRPO**
+
+---
+
+## CLI Suggestions
+
+### Conservative ReST
+
+```bash
+uv run bach-gen rest-train \
+  --model-path models/finetune_best.pt \
+  --candidates 24 \
+  --winner-percentile 75 \
+  --mix-ratio 0.4 \
+  --lr 1e-5 \
+  --epochs-per-iter 1 \
+  --max-iterations 10 \
+  --patience 3
+```
+
+### First GRPO pass
+
+```bash
+uv run bach-gen grpo-train \
+  --model-path models/rest_best.pt \
+  --group-size 8 \
+  --lr 5e-6 \
+  --kl-coeff 0.1 \
+  --max-steps 500
+```
 
 ---
 
 ## Risks and Mitigations
 
 | Risk | Mitigation |
-|------|-----------|
-| Mode collapse (model generates one "safe" pattern) | 50% real Bach data in every ReST iteration. Diverse prompts (keys, forms, voices). Monitor output diversity |
-| Reward hacking (model exploits scorer weaknesses) | Section-level scoring is harder to hack than sequence-level. Monitor qualitative samples every iteration. If scores rise but music sounds worse, the scorer has a bug |
-| Catastrophic forgetting of base capabilities | Always start from fine-tune checkpoint, not from scratch. Keep learning rate low (1e-5 ReST, 5e-6 GRPO). Mix real data |
-| GRPO KL divergence blows up | KL penalty with automatic coefficient scaling. If KL > threshold, increase penalty. Save checkpoints frequently |
-| Section scoring is too noisy for advantage computation | Start with 4-bar sections. If too noisy, increase to 8-bar. If still noisy, fall back to sequence-level rewards for GRPO (less ideal but still works) |
-| Generation too slow for the RL loop | KV cache makes this feasible. 50 candidates × 30 prompts × 50 min each with KV cache ≈ 30 min per ReST iteration |
+|------|------------|
+| Reward hacking | Freeze scorer version, add adversarial mining, listen every iteration |
+| Mode collapse | Keep real Bach in every ReST iteration, use prompt-grouped winners, track diversity |
+| Overfitting to a few prompts | Use fixed train prompts plus separate held-out eval prompts |
+| Noisy section rewards | Use section scores only as vetoes / diagnostics first |
+| GRPO instability | Start with sequence-level rewards only, strong KL, small group size |
+| False score gains | Require both metric improvement and qualitative approval |
+| Forgetting base musical competence | Low LR, short ReST iterations, KL regularization in GRPO |
+| LLM judge inconsistency | Freeze prompt/schema, use pairwise or small-group ranking, audit with human labels |
+| LLM representation mismatch | Keep symbolic rendering format fixed, periodically spot-check against real listening |
 
 ---
 
 ## Expected Outcomes
 
-**After ReST (5-15 iterations):**
-- Mean composite score should increase by 0.05-0.15 (from ~0.65 to ~0.75)
-- Top candidate quality should improve (less reliance on brute-force sampling)
-- 20 candidates should give comparable quality to current 100 candidates
+### After conservative ReST
 
-**After GRPO (500-2000 steps):**
-- Model should become more consistent (lower variance across candidates)
-- Section-level quality should improve (fewer "dead" sections in otherwise good pieces)
-- Cadence placement and subject recall should specifically improve (these are the dimensions with clearest section-level signal)
+You should expect:
+- modest but real improvement in average reward
+- better top-1 selection quality at lower candidate counts
+- no catastrophic style drift
 
-**The real test:** Generate 10 candidates instead of 100 and see if the quality is comparable to pre-RL generation with 100 candidates. If yes, RL worked — the model internalized what the scorer values.
+Good outcome:
+- `10-20` candidates after ReST feel closer to `50-100` candidates before ReST
+
+### After sequence-level GRPO
+
+You should expect:
+- more consistency
+- fewer obviously weak candidates
+- stronger alignment to the reward stack
+
+But you should **not** assume:
+- automatic musical improvement without listening checks
+- that higher reward always means better music
+
+### The real success criterion
+
+The real success criterion is not “reward went up.”
+
+It is:
+- fewer candidates needed for good outputs
+- better average sample quality
+- preserved or improved Bach-likeness
+- preserved or improved demo impact
+
+If that happens, RL helped.
+
+If the score rises but the music narrows, stiffens, or becomes formulaic, the reward is being gamed.
+
+### The real gold standard
+
+The real gold standard is:
+- handcrafted scorer for structural guardrails
+- LLM judgment for scalable ranking
+- human preference for final truth and calibration
+
+If those three agree more often over time, the RL stack is improving for the right reasons.
+
+---
+
+## Bottom Line
+
+RL still looks promising here.
+
+But the safest path is:
+- **ReST first**
+- **handcrafted guardrails first**
+- **LLM ranking before large-scale human review**
+- **sequence-level reward first**
+- **section scores as veto/diagnostic first**
+- **GRPO only after the scorer survives adversarial pressure**
+
+And the best long-term target is not scorer-only RL. It is:
+- handcrafted structural constraints
+- LLM musical preference at scale
+- human calibration on the hard cases
+
+That path is slower than jumping straight into dense section-level GRPO, but much more likely to produce a model you actually want to keep.

@@ -34,6 +34,13 @@ from bach_gen.model.trainer import Trainer
 from bach_gen.utils.constants import FORM_DEFAULTS
 
 VALID_FORMS = {"fugue", "chorale"}
+SUMMARY_METRIC_TO_KEY = {
+    "selection": "selection_score",
+    "composite": "composite",
+    "bach-similarity": "bach_similarity",
+    "demo-bach-balance": "demo_bach_balance",
+    "rhetorical-impact": "rhetorical_impact",
+}
 
 
 def _parse_float_list(raw: str) -> list[float]:
@@ -115,6 +122,7 @@ def _extract_top_metrics(results: list[GenerationResult]) -> dict[str, object]:
     details = score.details if isinstance(score.details, dict) else {}
     cp = details.get("contrapuntal", {}) if isinstance(details, dict) else {}
     guard = details.get("guardrails", {}) if isinstance(details, dict) else {}
+    style_proxies = details.get("style_proxies", {}) if isinstance(details, dict) else {}
     onset = _onset_stats(top.composition.voices)
     vb_ratio, vb_min, vb_max = _voice_balance(top.composition.voices)
 
@@ -133,6 +141,9 @@ def _extract_top_metrics(results: list[GenerationResult]) -> dict[str, object]:
         "contrapuntal": float(score.contrapuntal),
         "completeness": float(score.completeness),
         "thematic_recall": float(score.thematic_recall),
+        "bach_similarity": float(style_proxies.get("bach_similarity", 0.0)),
+        "demo_bach_balance": float(style_proxies.get("demo_bach_balance", 0.0)),
+        "rhetorical_impact": float(style_proxies.get("rhetorical_impact", 0.0)),
         "cp_voice_independence": float(cp.get("voice_independence", 0.0)),
         "cp_rhythmic_complementarity": float(cp.get("rhythmic_complementarity", 0.0)),
         "cp_onset_staggering": float(cp.get("onset_staggering", 0.0)),
@@ -211,12 +222,37 @@ def main() -> None:
     parser.add_argument("--fugue-key", default="D minor", help="Key for fugue runs.")
     parser.add_argument("--chorale-key", default="D minor", help="Key for chorale runs.")
     parser.add_argument("--style", default="baroque", help="Style conditioning.")
+    parser.add_argument("--fugue-voices", type=int, default=4, help="Fugue voice count.")
     parser.add_argument("--texture-fugue", default="polyphonic", help="Fugue texture token.")
     parser.add_argument("--texture-chorale", default="homophonic", help="Chorale texture token.")
     parser.add_argument("--imitation-fugue", default="high", help="Fugue imitation token.")
     parser.add_argument("--imitation-chorale", default="none", help="Chorale imitation token.")
+    parser.add_argument(
+        "--harmonic-rhythm-fugue",
+        default=None,
+        choices=["slow", "moderate", "fast"],
+        help="Optional fugue harmonic-rhythm token.",
+    )
     parser.add_argument("--tension", default=None, choices=["low", "moderate", "high"], help="Optional tension token.")
+    parser.add_argument(
+        "--chromaticism-fugue",
+        default=None,
+        choices=["low", "moderate", "high"],
+        help="Optional fugue chromaticism token.",
+    )
     parser.add_argument("--meter", default="4_4", help="Meter token.")
+    parser.add_argument(
+        "--rank-by",
+        default="composite",
+        choices=["composite", "bach-similarity", "rhetorical-impact", "demo-bach-balance"],
+        help="Candidate ranking objective passed to generation.",
+    )
+    parser.add_argument(
+        "--summary-metric",
+        default="selection",
+        choices=list(SUMMARY_METRIC_TO_KEY.keys()),
+        help="Aggregate metric used to rank sweep settings.",
+    )
     parser.add_argument("--max-length-fugue", type=int, default=FORM_DEFAULTS["fugue"][1], help="Fugue max tokens.")
     parser.add_argument("--max-length-chorale", type=int, default=FORM_DEFAULTS["chorale"][1], help="Chorale max tokens.")
     parser.add_argument("--seed-base", type=int, default=1337, help="Base seed for deterministic sweeps.")
@@ -277,7 +313,10 @@ def main() -> None:
         key = args.fugue_key if form == "fugue" else args.chorale_key
         texture = args.texture_fugue if form == "fugue" else args.texture_chorale
         imitation = args.imitation_fugue if form == "fugue" else args.imitation_chorale
+        harmonic_rhythm = args.harmonic_rhythm_fugue if form == "fugue" else None
+        chromaticism = args.chromaticism_fugue if form == "fugue" else None
         max_len = args.max_length_fugue if form == "fugue" else args.max_length_chorale
+        num_voices = args.fugue_voices if form == "fugue" else FORM_DEFAULTS[form][0]
         seed = args.seed_base + idx
         _set_seed(seed)
 
@@ -302,9 +341,13 @@ def main() -> None:
             "top_k_results": args.top,
             "max_length": max_len,
             "style": args.style,
+            "num_voices": num_voices,
             "texture": texture,
             "imitation": imitation,
+            "harmonic_rhythm": harmonic_rhythm or "",
             "tension": args.tension or "",
+            "chromaticism": chromaticism or "",
+            "rank_by": args.rank_by,
             "status": "ok",
             "error": "",
             "num_results": 0,
@@ -322,12 +365,16 @@ def main() -> None:
                 max_length=max_len,
                 output_dir=run_dir,
                 form=form,
+                num_voices=num_voices,
                 style=args.style,
                 meter=args.meter,
                 texture=texture,
                 imitation=imitation,
+                harmonic_rhythm=harmonic_rhythm,
                 harmonic_tension=args.tension,
+                chromaticism=chromaticism,
                 candidate_batch_size=args.candidate_batch_size,
+                rank_by=args.rank_by,
             )
             base_row["num_results"] = len(results)
             metrics = _extract_top_metrics(results)
@@ -366,6 +413,9 @@ def main() -> None:
         "contrapuntal",
         "completeness",
         "thematic_recall",
+        "bach_similarity",
+        "demo_bach_balance",
+        "rhetorical_impact",
         "cp_voice_independence",
         "cp_rhythmic_complementarity",
         "cp_onset_staggering",
@@ -393,14 +443,15 @@ def main() -> None:
 
         summary_rows.append(row)
 
-    summary_rows.sort(key=lambda r: (str(r["form"]), -float(r["mean_selection_score"])))
+    summary_sort_key = SUMMARY_METRIC_TO_KEY[args.summary_metric]
+    summary_rows.sort(key=lambda r: (str(r["form"]), -float(r[f"mean_{summary_sort_key}"])))
     _write_csv(summary_path, summary_rows)
     print(f"Wrote aggregate summary: {summary_path}")
 
     elapsed = time.time() - t0
     print(f"Elapsed: {elapsed:.1f}s")
 
-    print("\nTop settings by form (mean_selection_score):")
+    print(f"\nTop settings by form (mean_{summary_sort_key}):")
     by_form: dict[str, list[dict[str, object]]] = defaultdict(list)
     for r in summary_rows:
         by_form[str(r["form"])].append(r)
@@ -409,7 +460,7 @@ def main() -> None:
         for rank, r in enumerate(by_form.get(form, [])[:5], start=1):
             print(
                 f"  {rank}. temp={float(r['temperature']):.3f} min_p={float(r['min_p']):.3f} "
-                f"score={float(r['mean_selection_score']):.4f} "
+                f"{summary_sort_key}={float(r[f'mean_{summary_sort_key}']):.4f} "
                 f"composite={float(r['mean_composite']):.4f} "
                 f"success={float(r['success_rate']):.2f}"
             )

@@ -6,6 +6,7 @@ import random
 
 import pytest
 
+from bach_gen.cli import _derive_structural_dropout_rates
 from bach_gen.data.conditioning import (
     _extract_exposition_subject,
     apply_conditioning_dropout,
@@ -181,7 +182,8 @@ def test_apply_conditioning_dropout_keeps_first_subject_pair():
         cadence_token_ids={cad},
         subject_start_token_ids={subj_start},
         subject_end_token_ids={subj_end},
-        dropout_prob=1.0,
+        cadence_dropout_prob=1.0,
+        subject_dropout_prob=1.0,
         rng=random.Random(123),
         keep_first_subject_entry=True,
     )
@@ -190,6 +192,44 @@ def test_apply_conditioning_dropout_keeps_first_subject_pair():
     assert dropped.count(subj_start) == 1
     assert dropped.count(subj_end) == 1
     assert cad not in dropped
+
+
+def test_apply_conditioning_dropout_can_split_cadence_and_subject_rates():
+    subj_start = 900
+    subj_end = 901
+    cad = 902
+    tokens = [1, subj_start, 100, subj_end, 200, subj_start, 101, subj_end, cad, 2]
+
+    dropped = apply_conditioning_dropout(
+        tokens=tokens,
+        cadence_token_ids={cad},
+        subject_start_token_ids={subj_start},
+        subject_end_token_ids={subj_end},
+        cadence_dropout_prob=0.0,
+        subject_dropout_prob=1.0,
+        rng=random.Random(123),
+        keep_first_subject_entry=True,
+    )
+
+    assert cad in dropped
+    assert dropped.count(subj_start) == 1
+    assert dropped.count(subj_end) == 1
+
+
+def test_derive_structural_dropout_rates_balances_marker_density():
+    plan = _derive_structural_dropout_rates(
+        conditioning_phase="cadence+subject",
+        shared_dropout=None,
+        cadence_dropout=None,
+        subject_dropout=None,
+        cadence_markers_per_1k=8.0,
+        droppable_subject_entries_per_1k=2.0,
+    )
+
+    assert plan["source"] == "auto-density-balanced"
+    assert plan["target_density_per_1k"] == pytest.approx(4.0)
+    assert plan["cadence_dropout"] == pytest.approx(0.5)
+    assert plan["subject_dropout"] == pytest.approx(0.0)
 
 
 def test_scale_degree_encode_inserts_cadence_and_subject_markers():

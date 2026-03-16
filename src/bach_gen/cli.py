@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -12,6 +13,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import click
+import torch
 from rich.console import Console
 from rich.logging import RichHandler
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
@@ -32,6 +34,37 @@ logger = logging.getLogger(__name__)
 DATA_DIR = Path("data")
 MODELS_DIR = Path("models")
 OUTPUT_DIR = Path("output")
+DEFAULT_CONDITIONING_DROPOUT = 0.40
+
+
+def _maybe_cast_generation_model_for_mps(
+    model,
+    *,
+    mps_bf16: bool,
+    device_type_override: str | None = None,
+):
+    """Optionally cast generation models to bf16 on MPS.
+
+    This is generation-only and opt-in because MPS bf16 can reduce memory
+    usage but may not be stable or faster for every model/backend combination.
+    """
+    if not mps_bf16:
+        return model, None
+
+    if device_type_override is not None:
+        device_type = device_type_override
+    else:
+        try:
+            device_type = next(model.parameters()).device.type
+        except StopIteration:
+            return model, None
+
+    if device_type != "mps":
+        return model, "ignored_non_mps"
+
+    model = model.to(dtype=torch.bfloat16)
+    model.eval()
+    return model, "enabled"
 
 
 def setup_logging(verbose: bool = False) -> None:
@@ -505,15 +538,16 @@ def _is_interleaved_sequence(seq: list[int], tokenizer) -> bool:
     return True
 
 
-def _print_structural_conditioning_report(
+def _collect_structural_conditioning_stats(
     sequences: list[list[int]],
     tokenizer,
-) -> None:
-    """Report cadence/subject token statistics from interleaved sequences."""
+) -> dict[str, object]:
+    """Collect cadence/subject token statistics from interleaved sequences."""
     from collections import Counter
 
     cadence_names = {"CAD_PAC", "CAD_IAC", "CAD_HC", "CAD_DC"}
     subject_start_names = {"SUBJECT_START"}
+    subject_end_names = {"SUBJECT_END"}
 
     cadence_by_form: Counter = Counter()
     bars_by_form: Counter = Counter()
@@ -522,6 +556,8 @@ def _print_structural_conditioning_report(
     subj_entries_by_form: Counter = Counter()
     subj_pieces_by_form: Counter = Counter()
     subj_position_bins: Counter = Counter()
+    interleaved_tokens_by_form: Counter = Counter()
+    droppable_subject_entries_by_form: Counter = Counter()
 
     n_interleaved = 0
     for seq in sequences:
@@ -529,9 +565,12 @@ def _print_structural_conditioning_report(
             continue
         n_interleaved += 1
         form = _extract_form_from_prefix(seq, tokenizer)
+        interleaved_tokens_by_form[form] += len(seq)
 
         bars = 0
         subj_positions: list[int] = []
+        open_subject_starts = 0
+        subject_pairs = 0
         for tok in seq:
             name = tokenizer.token_to_name.get(tok, "")
             if name == "BAR":
@@ -541,12 +580,17 @@ def _print_structural_conditioning_report(
                 cadence_types[name] += 1
             elif name in subject_start_names:
                 subj_positions.append(bars)
+                open_subject_starts += 1
+            elif name in subject_end_names and open_subject_starts > 0:
+                subject_pairs += 1
+                open_subject_starts -= 1
 
         if bars > 0:
             bars_by_form[form] += bars
         if subj_positions:
             subj_entries_by_form[form] += len(subj_positions)
             subj_pieces_by_form[form] += 1
+            droppable_subject_entries_by_form[form] += max(0, subject_pairs - 1)
             for pos in subj_positions:
                 ratio = pos / max(bars, 1)
                 if ratio < 0.33:
@@ -555,6 +599,31 @@ def _print_structural_conditioning_report(
                     subj_position_bins["mid"] += 1
                 else:
                     subj_position_bins["late"] += 1
+
+    return {
+        "n_interleaved": n_interleaved,
+        "cadence_by_form": dict(cadence_by_form),
+        "bars_by_form": dict(bars_by_form),
+        "cadence_types": dict(cadence_types),
+        "subj_entries_by_form": dict(subj_entries_by_form),
+        "subj_pieces_by_form": dict(subj_pieces_by_form),
+        "subj_position_bins": dict(subj_position_bins),
+        "interleaved_tokens_by_form": dict(interleaved_tokens_by_form),
+        "droppable_subject_entries_by_form": dict(droppable_subject_entries_by_form),
+    }
+
+
+def _print_structural_conditioning_report(
+    structural_stats: dict[str, object],
+) -> None:
+    """Report cadence/subject token statistics from interleaved sequences."""
+    n_interleaved = int(structural_stats.get("n_interleaved", 0))
+    cadence_types = dict(structural_stats.get("cadence_types", {}))
+    bars_by_form = dict(structural_stats.get("bars_by_form", {}))
+    cadence_by_form = dict(structural_stats.get("cadence_by_form", {}))
+    subj_entries_by_form = dict(structural_stats.get("subj_entries_by_form", {}))
+    subj_pieces_by_form = dict(structural_stats.get("subj_pieces_by_form", {}))
+    subj_position_bins = dict(structural_stats.get("subj_position_bins", {}))
 
     if n_interleaved == 0:
         console.print("  Structural conditioning report: no interleaved sequences found")
@@ -591,10 +660,109 @@ def _print_structural_conditioning_report(
         console.print("    Subject entries by form: (none)")
 
 
+def _marker_density_per_1k(
+    count: int,
+    token_count: int,
+) -> float:
+    """Return marker density per 1k tokens."""
+    if count <= 0 or token_count <= 0:
+        return 0.0
+    return float(count) * 1000.0 / float(token_count)
+
+
+def _derive_structural_dropout_rates(
+    *,
+    conditioning_phase: str,
+    shared_dropout: float | None,
+    cadence_dropout: float | None,
+    subject_dropout: float | None,
+    cadence_markers_per_1k: float,
+    droppable_subject_entries_per_1k: float,
+) -> dict[str, float | str | None]:
+    """Resolve cadence/subject dropout rates from manual inputs or marker density.
+
+    When both cadence and subject markers are active and no shared override is
+    provided, the auto mode chooses a retained marker-density target in log
+    space. That preserves the rarer signal while attenuating the denser one.
+    """
+    if shared_dropout is not None:
+        shared_dropout = min(max(shared_dropout, 0.0), 1.0)
+        return {
+            "cadence_dropout": shared_dropout if conditioning_phase != "none" else 0.0,
+            "subject_dropout": shared_dropout if conditioning_phase == "cadence+subject" else 0.0,
+            "source": "shared-manual",
+            "target_density_per_1k": None,
+        }
+
+    cadence_dropout = None if cadence_dropout is None else min(max(cadence_dropout, 0.0), 1.0)
+    subject_dropout = None if subject_dropout is None else min(max(subject_dropout, 0.0), 1.0)
+
+    if conditioning_phase == "none":
+        return {
+            "cadence_dropout": 0.0,
+            "subject_dropout": 0.0,
+            "source": "disabled",
+            "target_density_per_1k": None,
+        }
+
+    if conditioning_phase == "cadence":
+        return {
+            "cadence_dropout": cadence_dropout if cadence_dropout is not None else DEFAULT_CONDITIONING_DROPOUT,
+            "subject_dropout": 0.0,
+            "source": "cadence-manual" if cadence_dropout is not None else "cadence-default",
+            "target_density_per_1k": None,
+        }
+
+    resolved_cadence = cadence_dropout
+    resolved_subject = subject_dropout
+
+    if resolved_cadence is not None and resolved_subject is not None:
+        return {
+            "cadence_dropout": resolved_cadence,
+            "subject_dropout": resolved_subject,
+            "source": "split-manual",
+            "target_density_per_1k": None,
+        }
+
+    target_density = None
+    source = "auto-density-balanced"
+    if resolved_cadence is not None and cadence_markers_per_1k > 0.0:
+        target_density = cadence_markers_per_1k * (1.0 - resolved_cadence)
+        source = "cadence-manual-target"
+    elif resolved_subject is not None and droppable_subject_entries_per_1k > 0.0:
+        target_density = droppable_subject_entries_per_1k * (1.0 - resolved_subject)
+        source = "subject-manual-target"
+    elif cadence_markers_per_1k > 0.0 and droppable_subject_entries_per_1k > 0.0:
+        target_density = math.sqrt(cadence_markers_per_1k * droppable_subject_entries_per_1k)
+    else:
+        source = "sparse-markers-fallback"
+
+    if resolved_cadence is None:
+        if target_density is None or cadence_markers_per_1k <= 0.0:
+            resolved_cadence = DEFAULT_CONDITIONING_DROPOUT if cadence_markers_per_1k > 0.0 else 0.0
+        else:
+            cadence_keep = min(1.0, target_density / cadence_markers_per_1k)
+            resolved_cadence = 1.0 - cadence_keep
+    if resolved_subject is None:
+        if target_density is None or droppable_subject_entries_per_1k <= 0.0:
+            resolved_subject = 0.0
+        else:
+            subject_keep = min(1.0, target_density / droppable_subject_entries_per_1k)
+            resolved_subject = 1.0 - subject_keep
+
+    return {
+        "cadence_dropout": float(resolved_cadence),
+        "subject_dropout": float(resolved_subject),
+        "source": source,
+        "target_density_per_1k": None if target_density is None else float(target_density),
+    }
+
+
 def _apply_conditioning_dropout_to_sequences(
     sequences: list[list[int]],
     tokenizer,
-    dropout_prob: float,
+    cadence_dropout_prob: float,
+    subject_dropout_prob: float,
     seed: int,
 ) -> list[list[int]]:
     from bach_gen.data.conditioning import apply_conditioning_dropout
@@ -622,7 +790,8 @@ def _apply_conditioning_dropout_to_sequences(
             cadence_token_ids=cadence_token_ids,
             subject_start_token_ids=subject_start_token_ids,
             subject_end_token_ids=subject_end_token_ids,
-            dropout_prob=dropout_prob,
+            cadence_dropout_prob=cadence_dropout_prob,
+            subject_dropout_prob=subject_dropout_prob,
             rng=rng,
             keep_first_subject_entry=True,
         )
@@ -677,8 +846,12 @@ def _apply_conditioning_dropout_to_sequences(
 @click.option("--conditioning-phase", type=click.Choice(["none", "cadence", "cadence+subject"]),
               default="cadence+subject",
               help="Structural conditioning labels to add during tokenization")
-@click.option("--conditioning-dropout", default=0.40, type=float,
-              help="Drop probability applied to cadence/subject markers (default: 0.40)")
+@click.option("--conditioning-dropout", default=None, type=float,
+              help="Legacy shared dropout override for cadence/subject markers")
+@click.option("--cadence-dropout", default=None, type=float,
+              help="Cadence-marker dropout probability (default: auto-derived for cadence+subject)")
+@click.option("--subject-dropout", default=None, type=float,
+              help="Subject-marker dropout probability (default: auto-derived for cadence+subject)")
 @click.option("--conditioning-seed", default=1337, type=int,
               help="Random seed for conditioning dropout (default: 1337)")
 @click.option("--subject-forms", default="fugue,invention,sinfonia", type=str,
@@ -697,7 +870,8 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
                  max_groups_per_work: int, pair_strategy: str,
                  max_pairs_per_work: int, sonata_policy: str,
                  workers: int | None, local_only: bool, conditioning_phase: str,
-                 conditioning_dropout: float, conditioning_seed: int,
+                 conditioning_dropout: float | None, cadence_dropout: float | None,
+                 subject_dropout: float | None, conditioning_seed: int,
                  subject_forms: str, cadence_min_confidence: float,
                  subject_min_quality: float, subject_min_match_ratio: float,
                  skip_corpus_stats: bool) -> None:
@@ -728,8 +902,14 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
     out_dir = Path(data_dir) if data_dir else DATA_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    if not (0.0 <= conditioning_dropout <= 1.0):
+    if conditioning_dropout is not None and not (0.0 <= conditioning_dropout <= 1.0):
         console.print("[red]--conditioning-dropout must be in [0, 1][/red]")
+        sys.exit(1)
+    if cadence_dropout is not None and not (0.0 <= cadence_dropout <= 1.0):
+        console.print("[red]--cadence-dropout must be in [0, 1][/red]")
+        sys.exit(1)
+    if subject_dropout is not None and not (0.0 <= subject_dropout <= 1.0):
+        console.print("[red]--subject-dropout must be in [0, 1][/red]")
         sys.exit(1)
     if not (0.0 <= subject_min_match_ratio <= 1.0):
         console.print("[red]--subject-min-match-ratio must be in [0, 1][/red]")
@@ -785,7 +965,10 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
         console.print("  Source scope: local-only")
     console.print(
         f"  Conditioning: {conditioning_phase} "
-        f"(dropout={conditioning_dropout:.2f}, seed={conditioning_seed})"
+        f"(shared={conditioning_dropout if conditioning_dropout is not None else 'auto'}, "
+        f"cadence={cadence_dropout if cadence_dropout is not None else 'auto'}, "
+        f"subject={subject_dropout if subject_dropout is not None else 'auto'}, "
+        f"seed={conditioning_seed})"
     )
     if conditioning_phase == "cadence+subject":
         console.print(f"  Subject forms: {sorted(parsed_subject_forms)}")
@@ -979,17 +1162,64 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
 
     # Conditioning token distribution histograms
     _print_conditioning_histograms(sequences, tokenizer)
-    _print_structural_conditioning_report(sequences, tokenizer)
+    structural_stats = _collect_structural_conditioning_stats(sequences, tokenizer)
+    _print_structural_conditioning_report(structural_stats)
 
-    if conditioning_phase != "none" and conditioning_dropout > 0.0:
+    subject_form_tokens = 0
+    cadence_tokens_subject_forms = 0
+    droppable_subject_entries = 0
+    interleaved_tokens_by_form = dict(structural_stats.get("interleaved_tokens_by_form", {}))
+    cadence_by_form = dict(structural_stats.get("cadence_by_form", {}))
+    droppable_subject_entries_by_form = dict(
+        structural_stats.get("droppable_subject_entries_by_form", {})
+    )
+    for form_name in parsed_subject_forms:
+        subject_form_tokens += int(interleaved_tokens_by_form.get(form_name, 0))
+        cadence_tokens_subject_forms += int(cadence_by_form.get(form_name, 0))
+        droppable_subject_entries += int(
+            droppable_subject_entries_by_form.get(form_name, 0)
+        )
+
+    dropout_plan = _derive_structural_dropout_rates(
+        conditioning_phase=conditioning_phase,
+        shared_dropout=conditioning_dropout,
+        cadence_dropout=cadence_dropout,
+        subject_dropout=subject_dropout,
+        cadence_markers_per_1k=_marker_density_per_1k(cadence_tokens_subject_forms, subject_form_tokens),
+        droppable_subject_entries_per_1k=_marker_density_per_1k(
+            droppable_subject_entries,
+            subject_form_tokens,
+        ),
+    )
+    resolved_cadence_dropout = float(dropout_plan["cadence_dropout"])
+    resolved_subject_dropout = float(dropout_plan["subject_dropout"])
+    console.print(
+        "  Conditioning dropout plan: "
+        f"cadence={resolved_cadence_dropout:.2f}, "
+        f"subject={resolved_subject_dropout:.2f} "
+        f"[source={dropout_plan['source']}]"
+    )
+    target_density = dropout_plan.get("target_density_per_1k")
+    if target_density is not None:
+        console.print(
+            "    Marker density target (subject forms, interleaved): "
+            f"{float(target_density):.3f}/1k tokens"
+        )
+
+    if conditioning_phase != "none" and (
+        resolved_cadence_dropout > 0.0 or resolved_subject_dropout > 0.0
+    ):
         console.print(
             "  Applying conditioning dropout: "
-            f"p={conditioning_dropout:.2f} (seed={conditioning_seed})"
+            f"cadence={resolved_cadence_dropout:.2f}, "
+            f"subject={resolved_subject_dropout:.2f} "
+            f"(seed={conditioning_seed})"
         )
         sequences = _apply_conditioning_dropout_to_sequences(
             sequences,
             tokenizer,
-            dropout_prob=conditioning_dropout,
+            cadence_dropout_prob=resolved_cadence_dropout,
+            subject_dropout_prob=resolved_subject_dropout,
             seed=conditioning_seed,
         )
 
@@ -1059,8 +1289,20 @@ def prepare_data(mode: str, voices: int | None, tokenizer_type: str, max_seq_len
             "sequential_enabled": not no_sequential,
             "conditioning_phase": conditioning_phase,
             "conditioning_dropout": conditioning_dropout,
+            "cadence_dropout": resolved_cadence_dropout,
+            "subject_dropout": resolved_subject_dropout,
+            "conditioning_dropout_source": dropout_plan["source"],
+            "conditioning_dropout_target_density_per_1k": dropout_plan["target_density_per_1k"],
             "conditioning_seed": conditioning_seed,
             "subject_forms": sorted(parsed_subject_forms),
+            "subject_form_cadence_markers_per_1k": _marker_density_per_1k(
+                cadence_tokens_subject_forms,
+                subject_form_tokens,
+            ),
+            "subject_form_droppable_subject_entries_per_1k": _marker_density_per_1k(
+                droppable_subject_entries,
+                subject_form_tokens,
+            ),
             "cadence_min_confidence": cadence_min_confidence,
             "subject_min_quality": subject_min_quality,
             "subject_min_match_ratio": subject_min_match_ratio,
@@ -1880,6 +2122,8 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None,
               default=None, help="Chromaticism conditioning")
 @click.option("--candidate-batch-size", type=int, default=None,
               help="Candidates decoded in parallel during sampling (auto if omitted)")
+@click.option("--mps-bf16", is_flag=True, default=False,
+              help="Opt into bf16 model weights for generation on Apple MPS to reduce memory usage")
 @click.option("--voice-by-voice", is_flag=True, default=False,
               help="Use voice-by-voice (sequential) generation")
 @click.option("--provide-voice", default=None, type=click.Path(exists=True),
@@ -1891,8 +2135,13 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None,
 @click.option("--subject-spacing", default=8, type=int,
               help="Minimum bars between prompted subject re-entry markers")
 @click.option(
+    "--exact-voices/--min-voices-only",
+    default=None,
+    help="Require exactly the requested voice count (default: minimum voices only)",
+)
+@click.option(
     "--rank-by",
-    type=click.Choice(["composite", "bach-similarity", "rhetorical-impact", "demo-bach-balance"]),
+    type=click.Choice(["composite", "fugue-balance", "bach-similarity", "rhetorical-impact", "demo-bach-balance"]),
     default="composite",
     show_default=True,
     help="Candidate ranking objective (selection only; does not change scoring).",
@@ -1919,11 +2168,13 @@ def generate(
     tension: str | None,
     chromaticism: str | None,
     candidate_batch_size: int | None,
+    mps_bf16: bool,
     voice_by_voice: bool,
     provide_voice: str | None,
     cadence_density: str | None,
     min_subject_entries: int,
     subject_spacing: int,
+    exact_voices: bool | None,
     rank_by: str,
 ) -> None:
     """Generate Bach-style compositions."""
@@ -1957,9 +2208,13 @@ def generate(
     if subject_spacing < 1:
         console.print("[red]--subject-spacing must be >= 1[/red]")
         sys.exit(1)
+    if voice_by_voice and subject:
+        console.print("[red]--subject is currently supported only for interleaved generation (without --voice-by-voice)[/red]")
+        sys.exit(1)
 
     if max_length is None:
         max_length = FORM_DEFAULTS.get(mode, (2, 768))[1]
+    resolved_exact_voices = exact_voices if exact_voices is not None else False
 
     # Load model
     if model_path is None:
@@ -1975,6 +2230,9 @@ def generate(
 
     console.print(f"[bold]Loading model from {model_path}...[/bold]")
     model, config = Trainer.load_checkpoint(model_path)
+    model, mps_precision_state = _maybe_cast_generation_model_for_mps(
+        model, mps_bf16=mps_bf16,
+    )
 
     tokenizer = load_tokenizer(DATA_DIR / "tokenizer.json")
 
@@ -2005,13 +2263,19 @@ def generate(
         console.print(f"  Strategy: sampling ({candidates} candidates)")
         if candidate_batch_size is not None:
             console.print(f"  Candidate batch size: {candidate_batch_size}")
+    if mps_precision_state == "enabled":
+        console.print("  MPS generation precision: bf16")
+    elif mps_precision_state == "ignored_non_mps":
+        console.print("  MPS generation precision: requested bf16, ignored because device is not MPS")
     if cadence_density is not None:
         console.print(f"  Cadence density control: {cadence_density}")
     if rank_by != "composite":
         console.print(f"  Candidate ranking: {rank_by_label(rank_by)}")
-    if min_subject_entries > 0:
-        console.print(
-            f"  Subject re-entry control: min_entries={min_subject_entries}, "
+    if mode == "fugue" or exact_voices is not None:
+        console.print(f"  Voice retention: {'exact' if resolved_exact_voices else 'minimum'}")
+        if min_subject_entries > 0:
+            console.print(
+                f"  Subject re-entry control: min_entries={min_subject_entries}, "
             f"spacing={subject_spacing} bars"
         )
     if subject:
@@ -2062,6 +2326,7 @@ def generate(
             min_subject_entries=min_subject_entries,
             subject_spacing_bars=subject_spacing,
             rank_by=rank_by,
+            exact_voice_count=resolved_exact_voices,
         ) if not voice_by_voice else gen_vbv_fn(
             model=model,
             tokenizer=tokenizer,
@@ -2089,6 +2354,7 @@ def generate(
             min_subject_entries=min_subject_entries,
             subject_spacing_bars=subject_spacing,
             rank_by=rank_by,
+            exact_voice_count=resolved_exact_voices,
         )
         progress.update(task, description="Done!")
 

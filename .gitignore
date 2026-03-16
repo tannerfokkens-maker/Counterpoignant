@@ -17,7 +17,9 @@ env/
 /models/
 /models_NEW/
 /datamidiall/
+/datamidiall_sd_refresh/
 /output/
+/Counterpoignant/
 
 # IDE
 .idea/

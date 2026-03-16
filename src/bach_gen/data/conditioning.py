@@ -667,20 +667,23 @@ def apply_conditioning_dropout(
     cadence_token_ids: set[int],
     subject_start_token_ids: set[int],
     subject_end_token_ids: set[int],
-    dropout_prob: float,
+    cadence_dropout_prob: float,
+    subject_dropout_prob: float,
     rng: random.Random,
     keep_first_subject_entry: bool = True,
 ) -> list[int]:
     """Apply conditioning dropout to one token sequence.
 
-    - Cadence tokens are dropped independently with probability ``dropout_prob``.
-    - Subject start/end markers are dropped in start/end pairs.
+    - Cadence tokens are dropped independently with probability
+      ``cadence_dropout_prob``.
+    - Subject start/end markers are dropped in start/end pairs with probability
+      ``subject_dropout_prob``.
     - First subject pair can be preserved (exposition anchor).
     """
-    if dropout_prob <= 0.0:
+    cadence_dropout_prob = min(max(cadence_dropout_prob, 0.0), 1.0)
+    subject_dropout_prob = min(max(subject_dropout_prob, 0.0), 1.0)
+    if cadence_dropout_prob <= 0.0 and subject_dropout_prob <= 0.0:
         return list(tokens)
-    if dropout_prob >= 1.0:
-        dropout_prob = 1.0
 
     keep = [True] * len(tokens)
 
@@ -696,7 +699,7 @@ def apply_conditioning_dropout(
     for pair_idx, (start_i, end_i) in enumerate(pairs):
         if keep_first_subject_entry and pair_idx == 0:
             continue
-        if rng.random() < dropout_prob:
+        if rng.random() < subject_dropout_prob:
             keep[start_i] = False
             keep[end_i] = False
 
@@ -704,7 +707,7 @@ def apply_conditioning_dropout(
     for idx, tok in enumerate(tokens):
         if not keep[idx]:
             continue
-        if tok in cadence_token_ids and rng.random() < dropout_prob:
+        if tok in cadence_token_ids and rng.random() < cadence_dropout_prob:
             continue
         out.append(tok)
     return out

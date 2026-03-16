@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,8 +16,7 @@ from bach_gen.evaluation.scorer import ScoreBreakdown, score_composition
 from bach_gen.generation.sampling import sample_next_token
 from bach_gen.generation.constraints import DecodingConstraints
 from bach_gen.generation.subject import (
-    parse_subject_string, generate_subject,
-    parse_subject_string_sd, generate_subject_sd,
+    subject_string_to_note_events,
 )
 from bach_gen.model.architecture import BachTransformer
 from bach_gen.model.trainer import get_device
@@ -199,7 +199,7 @@ def normalize_rank_by(rank_by: str | None) -> str:
     if not rank_by:
         return "composite"
     normalized = rank_by.strip().lower().replace("_", "-")
-    if normalized not in {"composite", *RANK_BY_PROXIES.keys()}:
+    if normalized not in {"composite", "fugue-balance", *RANK_BY_PROXIES.keys()}:
         raise ValueError(f"Unsupported ranking objective: {rank_by}")
     return normalized
 
@@ -209,6 +209,7 @@ def rank_by_label(rank_by: str | None) -> str:
     normalized = normalize_rank_by(rank_by)
     return {
         "composite": "composite",
+        "fugue-balance": "fugue balance",
         "bach-similarity": "Bach similarity",
         "rhetorical-impact": "rhetorical impact",
         "demo-bach-balance": "demo/Bach balance",
@@ -220,6 +221,8 @@ def score_rank_value(score: ScoreBreakdown, rank_by: str | None = "composite") -
     normalized = normalize_rank_by(rank_by)
     if normalized == "composite":
         return float(score.composite)
+    if normalized == "fugue-balance":
+        return _fugue_rank_value(score)
 
     details = score.details if isinstance(score.details, dict) else {}
     proxies = details.get("style_proxies", {}) if isinstance(details, dict) else {}
@@ -237,15 +240,35 @@ def _candidate_rank_value(result: GenerationResult, rank_by: str | None = "compo
     return score_rank_value(result.score, rank_by)
 
 
-def _passes_candidate_guardrails(score: ScoreBreakdown, form: str) -> bool:
-    """Apply form-specific hard floors before candidate ranking."""
+def _fugue_rank_value(score: ScoreBreakdown) -> float:
+    """Return a fugue-focused ranking value.
+
+    Emphasizes cadential closure and developmental working-out first, while
+    still rewarding balanced, flowing texture and Bach-like statistical style.
+    """
+    details = score.details if isinstance(score.details, dict) else {}
+    cp = details.get("contrapuntal", {}) if isinstance(details, dict) else {}
+    st = details.get("structural", {}) if isinstance(details, dict) else {}
+    proxies = details.get("style_proxies", {}) if isinstance(details, dict) else {}
+    return float(
+        score.composite
+        + 0.05 * float(cp.get("voice_balance", 0.0))
+        + 0.10 * float(st.get("cadence", 0.0))
+        + 0.16 * float(cp.get("sequential_patterns", 0.0))
+        + 0.03 * float(cp.get("onset_staggering", 0.0))
+        + 0.04 * float(proxies.get("bach_similarity", score.composite))
+    )
+
+
+def _candidate_guardrail_reason(score: ScoreBreakdown, form: str) -> str | None:
+    """Return the first form-specific guardrail reason, or ``None`` if passed."""
     if form != "fugue":
-        return True
+        return None
 
     if score.voice_leading < 0.68:
-        return False
+        return "voice_leading"
     if score.completeness < 0.60:
-        return False
+        return "completeness"
 
     details = score.details if isinstance(score.details, dict) else {}
     cp = details.get("contrapuntal", {}) if isinstance(details, dict) else {}
@@ -255,20 +278,29 @@ def _passes_candidate_guardrails(score: ScoreBreakdown, form: str) -> bool:
     voice_balance = float(cp.get("voice_balance", 1.0))
     voice_indep = float(cp.get("voice_independence", 0.0))
     cadence = float(st.get("cadence", 1.0))
+    sequential = float(cp.get("sequential_patterns", 0.0))
 
     # Overly blocky.
-    if onset < 0.05:
-        return False
+    if onset < 0.08:
+        return "onset_staggering_low"
     # Over-fragmented.
     if onset > 0.95 and voice_indep < 0.45:
-        return False
+        return "over_fragmented_texture"
     # One dominant line with weak supporting voices.
-    if voice_balance < 0.25:
-        return False
+    if voice_balance < 0.35:
+        return "voice_balance"
     # Weak phrase closure.
-    if cadence < 0.30:
-        return False
-    return True
+    if cadence < 0.40:
+        return "cadence"
+    # Underdeveloped developmental working-out.
+    if sequential < 0.35:
+        return "sequential_patterns"
+    return None
+
+
+def _passes_candidate_guardrails(score: ScoreBreakdown, form: str) -> bool:
+    """Apply form-specific hard floors before candidate ranking."""
+    return _candidate_guardrail_reason(score, form) is None
 
 
 def _resolve_candidate_batch_size(
@@ -289,6 +321,74 @@ def _resolve_candidate_batch_size(
 def _required_non_empty_voices(num_voices: int) -> int:
     """Required non-empty voices for retaining a generated candidate."""
     return max(2, min(num_voices, 4))
+
+
+def _voice_count_matches_request(
+    voices: list[list[tuple[int, int, int]]],
+    *,
+    num_voices: int,
+    exact_voice_count: bool,
+) -> bool:
+    """Return whether decoded non-empty voices satisfy the request."""
+    non_empty = sum(1 for v in voices if v)
+    if exact_voice_count:
+        return non_empty == num_voices
+    return non_empty >= _required_non_empty_voices(num_voices)
+
+
+def _voice_count_rejection_reason(
+    voices: list[list[tuple[int, int, int]]],
+    *,
+    num_voices: int,
+    exact_voice_count: bool,
+) -> str | None:
+    """Return a voice-count rejection reason, or ``None`` if satisfied."""
+    non_empty = sum(1 for v in voices if v)
+    if exact_voice_count:
+        if non_empty < num_voices:
+            return "voice_count_too_few"
+        if non_empty > num_voices:
+            return "voice_count_too_many"
+        return None
+
+    required = _required_non_empty_voices(num_voices)
+    if non_empty < required:
+        return "voice_count_too_few"
+    return None
+
+
+def _log_rejection_summary(
+    rejections: Counter[str],
+    *,
+    form: str,
+    top_k_results: int,
+    generated: int,
+    exact_voice_count: bool,
+    voice_by_voice: bool = False,
+) -> None:
+    """Log a compact rejection summary for retained candidate search."""
+    mode_suffix = " (voice-by-voice)" if voice_by_voice else ""
+    voice_mode = "exact voice count" if exact_voice_count else "minimum voice count"
+    if not rejections:
+        logger.info(
+            "Candidate retention summary%s: all %d candidates survived %s for form=%s.",
+            mode_suffix,
+            generated,
+            voice_mode,
+            form,
+        )
+        return
+
+    parts = ", ".join(f"{reason}={count}" for reason, count in sorted(rejections.items()))
+    logger.info(
+        "Candidate retention summary%s: kept top %d from %d generated for form=%s [%s; %s].",
+        mode_suffix,
+        top_k_results,
+        generated,
+        form,
+        voice_mode,
+        parts,
+    )
 
 
 def generate(
@@ -324,6 +424,7 @@ def generate(
     min_subject_entries: int = 0,
     subject_spacing_bars: int = 8,
     rank_by: str = "composite",
+    exact_voice_count: bool | None = None,
 ) -> list[GenerationResult]:
     """Generate Bach-style compositions and return top results.
 
@@ -361,6 +462,8 @@ def generate(
         min_subject_entries: Minimum number of prompted subject re-entries.
         subject_spacing_bars: Minimum bars between prompted subject entries.
         rank_by: Candidate ranking objective. Default: composite.
+        exact_voice_count: Require exactly ``num_voices`` non-empty decoded voices.
+            Defaults to ``False`` when omitted.
 
     Returns:
         List of top GenerationResult, sorted by score.
@@ -377,7 +480,8 @@ def generate(
     # Resolve num_voices from form
     if num_voices is None:
         num_voices = FORM_DEFAULTS.get(form, (2, 768))[0]
-    min_non_empty_voices = _required_non_empty_voices(num_voices)
+    if exact_voice_count is None:
+        exact_voice_count = False
 
     # Parse key
     key_root, key_mode = parse_key(key_str)
@@ -417,6 +521,7 @@ def generate(
 
     # Generate candidates
     candidates: list[GenerationResult] = []
+    rejections: Counter[str] = Counter()
 
     # Form label for filenames
     form_label = form.replace("-", "")
@@ -450,12 +555,17 @@ def generate(
             comp.key_mode = key_mode
             comp.source = f"beam_{i+1}"
 
-            non_empty = sum(1 for v in comp.voices if v)
-            if non_empty < min_non_empty_voices:
+            voice_reason = _voice_count_rejection_reason(
+                comp.voices, num_voices=num_voices, exact_voice_count=exact_voice_count,
+            )
+            if voice_reason is not None:
+                rejections[voice_reason] += 1
                 continue
 
             score = score_composition(comp, token_sequence=tokens, tokenizer=tokenizer, form=form)
-            if not _passes_candidate_guardrails(score, form):
+            guardrail_reason = _candidate_guardrail_reason(score, form)
+            if guardrail_reason is not None:
+                rejections[f"guardrail_{guardrail_reason}"] += 1
                 if progress_callback:
                     progress_callback(i + 1, len(beam_sequences))
                 continue
@@ -508,8 +618,11 @@ def generate(
                 comp.source = f"generated_{i+1}"
 
                 # Keep only generations that satisfy requested voice count.
-                non_empty = sum(1 for v in comp.voices if v)
-                if non_empty < min_non_empty_voices:
+                voice_reason = _voice_count_rejection_reason(
+                    comp.voices, num_voices=num_voices, exact_voice_count=exact_voice_count,
+                )
+                if voice_reason is not None:
+                    rejections[voice_reason] += 1
                     if device.type == "mps":
                         torch.mps.empty_cache()
                     if progress_callback:
@@ -518,7 +631,9 @@ def generate(
 
                 # Score
                 score = score_composition(comp, token_sequence=tokens, tokenizer=tokenizer, form=form)
-                if not _passes_candidate_guardrails(score, form):
+                guardrail_reason = _candidate_guardrail_reason(score, form)
+                if guardrail_reason is not None:
+                    rejections[f"guardrail_{guardrail_reason}"] += 1
                     if device.type == "mps":
                         torch.mps.empty_cache()
                     if progress_callback:
@@ -541,11 +656,19 @@ def generate(
 
     # Sort retained top-k candidates by score (descending)
     top_results = sorted(candidates, key=lambda r: _candidate_rank_value(r, rank_by), reverse=True)
+    _log_rejection_summary(
+        rejections,
+        form=form,
+        top_k_results=min(top_k_results, len(top_results)),
+        generated=num_candidates if beam_width is None or beam_width <= 1 else len(beam_sequences),
+        exact_voice_count=exact_voice_count,
+    )
     if len(top_results) < top_k_results:
         logger.warning(
-            "Only %d/%d candidates met the %d-voice minimum for form=%s. "
-            "Consider increasing --candidates.",
-            len(top_results), top_k_results, min_non_empty_voices, form,
+            "Only %d/%d candidates survived retention for form=%s (%s). "
+            "Consider increasing --candidates or relaxing guardrails.",
+            len(top_results), top_k_results, form,
+            "exact voice count" if exact_voice_count else "minimum voice count",
         )
 
     # Save MIDI files
@@ -712,19 +835,103 @@ def _build_prompt(
     if key_token_name in tokenizer.name_to_token:
         tokens.append(tokenizer.name_to_token[key_token_name])
 
-    # Seed first bar to avoid empty measures eating token budget
+    if subject_str and encoding_mode == "interleaved":
+        subject_events = _encode_subject_prompt_events(
+            tokenizer=tokenizer,
+            key_root=key_root,
+            key_mode=key_mode,
+            key_name=key_name,
+            subject_str=subject_str,
+            form=form,
+            style=style,
+            num_voices=num_voices,
+            meter=meter,
+            texture=texture,
+            imitation=imitation,
+            harmonic_rhythm=harmonic_rhythm,
+            harmonic_tension=harmonic_tension,
+            chromaticism=chromaticism,
+        )
+        if subject_events:
+            tokens.extend(subject_events)
+            return tokens
+        logger.warning("Subject prompt parsed to no note events; falling back to seed bar only.")
+
+    # Seed first bar to avoid empty measures eating token budget.
     tokens.append(tokenizer.BAR)
     beat_1_tok = tokenizer.name_to_token.get("BEAT_1")
     if beat_1_tok is not None:
         tokens.append(beat_1_tok)
 
-    # NOTE: Subject injection is disabled because SUBJECT_START/END tokens
-    # were never present in the training data. The model generates its own
-    # opening material from the conditioning prefix + KEY + BAR + BEAT_1.
-    # TODO: Fix subject injection to emit tokens in training-data format
-    # (BAR/BEAT/VOICE markers, no SUBJECT_START/END) to enable melody-in mode.
-
     return tokens
+
+
+def _meter_to_time_signature(meter: str | None) -> tuple[int, int]:
+    return {
+        "2_4": (2, 4),
+        "3_4": (3, 4),
+        "4_4": (4, 4),
+        "6_8": (6, 8),
+        "3_8": (3, 8),
+        "alla_breve": (2, 2),
+    }.get(meter or "4_4", (4, 4))
+
+
+def _encode_subject_prompt_events(
+    tokenizer: BachTokenizer,
+    key_root: int,
+    key_mode: str,
+    key_name: str,
+    subject_str: str,
+    form: str,
+    style: str,
+    num_voices: int | None,
+    meter: str | None,
+    texture: str | None,
+    imitation: str | None,
+    harmonic_rhythm: str | None,
+    harmonic_tension: str | None,
+    chromaticism: str | None,
+) -> list[int]:
+    """Encode a prompted subject using the tokenizer's training-data event format."""
+    subject_notes = subject_string_to_note_events(subject_str)
+    if not subject_notes:
+        return []
+
+    requested_voices = num_voices or FORM_DEFAULTS.get(form, (2, DEFAULT_MAX_GEN_LENGTH))[0]
+    voices = [subject_notes] + [[] for _ in range(max(0, int(requested_voices) - 1))]
+    subject_comp = VoiceComposition(
+        voices=voices,
+        key_root=key_root,
+        key_mode=key_mode,
+        source="prompt-subject",
+        style=style,
+        time_signature=_meter_to_time_signature(meter),
+    )
+    encoded = tokenizer.encode(
+        subject_comp,
+        form=form,
+        style=style,
+        meter=meter,
+        texture=texture,
+        imitation=imitation,
+        harmonic_rhythm=harmonic_rhythm,
+        harmonic_tension=harmonic_tension,
+        chromaticism=chromaticism,
+        subject_start_markers={(1, 0)},
+        subject_end_markers={(1, len(subject_notes) - 1)},
+    )
+
+    key_token_name = f"KEY_{key_name}"
+    key_token = tokenizer.name_to_token.get(key_token_name)
+    if key_token is None:
+        return []
+    try:
+        key_idx = encoded.index(key_token)
+    except ValueError:
+        logger.warning("Encoded subject prompt is missing key token %s; falling back to seed bar only.", key_token_name)
+        return []
+    return encoded[key_idx + 1:-1]
 
 
 def generate_voice_by_voice(
@@ -757,6 +964,7 @@ def generate_voice_by_voice(
     min_subject_entries: int = 0,
     subject_spacing_bars: int = 8,
     rank_by: str = "composite",
+    exact_voice_count: bool | None = None,
 ) -> list[GenerationResult]:
     """Generate compositions voice-by-voice using sequential encoding.
 
@@ -775,7 +983,8 @@ def generate_voice_by_voice(
 
     if num_voices is None:
         num_voices = FORM_DEFAULTS.get(form, (2, 768))[0]
-    min_non_empty_voices = _required_non_empty_voices(num_voices)
+    if exact_voice_count is None:
+        exact_voice_count = False
 
     key_root, key_mode = parse_key(key_str)
     key_name = get_key_signature_name(key_root, key_mode)
@@ -832,6 +1041,7 @@ def generate_voice_by_voice(
         )
 
     candidates: list[GenerationResult] = []
+    rejections: Counter[str] = Counter()
     form_label = form.replace("-", "")
 
     logger.info(f"Voice-by-voice generation (candidates={num_candidates})")
@@ -873,10 +1083,14 @@ def generate_voice_by_voice(
             comp.key_mode = key_mode
             comp.source = f"vbv_generated_{i+1}"
 
-            non_empty = sum(1 for v in comp.voices if v)
-            if non_empty >= min_non_empty_voices:
+            voice_reason = _voice_count_rejection_reason(
+                comp.voices, num_voices=num_voices, exact_voice_count=exact_voice_count,
+            )
+            if voice_reason is None:
                 score = score_composition(comp, token_sequence=tokens, tokenizer=tokenizer, form=form)
-                if not _passes_candidate_guardrails(score, form):
+                guardrail_reason = _candidate_guardrail_reason(score, form)
+                if guardrail_reason is not None:
+                    rejections[f"guardrail_{guardrail_reason}"] += 1
                     if progress_callback:
                         progress_callback(i + 1, num_candidates)
                     continue
@@ -886,6 +1100,8 @@ def generate_voice_by_voice(
                     score=score,
                     rank_value=score_rank_value(score, rank_by),
                 ), top_k_results, rank_by=rank_by)
+            else:
+                rejections[voice_reason] += 1
 
             if progress_callback:
                 progress_callback(i + 1, num_candidates)
@@ -893,11 +1109,20 @@ def generate_voice_by_voice(
         generated += curr_batch
 
     top_results = sorted(candidates, key=lambda r: _candidate_rank_value(r, rank_by), reverse=True)
+    _log_rejection_summary(
+        rejections,
+        form=form,
+        top_k_results=min(top_k_results, len(top_results)),
+        generated=num_candidates,
+        exact_voice_count=exact_voice_count,
+        voice_by_voice=True,
+    )
     if len(top_results) < top_k_results:
         logger.warning(
-            "Only %d/%d candidates met the %d-voice minimum for form=%s (voice-by-voice). "
-            "Consider increasing --candidates.",
-            len(top_results), top_k_results, min_non_empty_voices, form,
+            "Only %d/%d candidates survived retention for form=%s (voice-by-voice, %s). "
+            "Consider increasing --candidates or relaxing guardrails.",
+            len(top_results), top_k_results, form,
+            "exact voice count" if exact_voice_count else "minimum voice count",
         )
 
     output_path = Path(output_dir)
