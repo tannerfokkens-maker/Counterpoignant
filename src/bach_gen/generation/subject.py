@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import random
 import logging
+from dataclasses import dataclass
 
 from bach_gen.data.tokenizer import BachTokenizer
 from bach_gen.utils.music_theory import (
@@ -33,29 +34,116 @@ _DURATION_SHORTHAND_TO_TICKS = {
     "de": 360,   # dotted eighth
 }
 
+_DURATION_ALIASES = {
+    "whole": "w",
+    "half": "h",
+    "quarter": "q",
+    "eighth": "e",
+    "eight": "e",
+    "sixteenth": "s",
+    "sixteenth_note": "s",
+    "1": "w",
+    "1/1": "w",
+    "2": "h",
+    "1/2": "h",
+    "4": "q",
+    "1/4": "q",
+    "8": "e",
+    "1/8": "e",
+    "16": "s",
+    "1/16": "s",
+}
 
-def subject_string_to_note_events(subject_str: str) -> list[tuple[int, int, int]]:
-    """Parse a subject string into note events starting at tick 0."""
-    events: list[tuple[int, int, int]] = []
+_REST_TOKENS = {"r", "rest", "silence"}
+
+
+@dataclass(frozen=True)
+class ParsedSubjectEvent:
+    """A parsed subject event before note-only filtering."""
+
+    start_tick: int
+    duration_ticks: int
+    midi_note: int | None = None
+
+    @property
+    def is_rest(self) -> bool:
+        return self.midi_note is None
+
+
+def _normalize_duration_name(duration: str) -> str:
+    """Return a normalized duration shorthand like ``q`` or ``q.``."""
+    normalized = duration.strip().lower().replace("-", "_")
+    dotted = normalized.endswith(".")
+    if dotted:
+        normalized = normalized[:-1]
+    normalized = normalized.replace("rest", "").strip()
+    normalized = normalized.replace("_note", "")
+    if normalized.startswith("dotted_"):
+        dotted = True
+        normalized = normalized[len("dotted_") :]
+    if normalized in _DURATION_ALIASES:
+        normalized = _DURATION_ALIASES[normalized]
+    if normalized in {"dq", "dh", "de"}:
+        return normalized
+    if dotted and normalized in {"w", "h", "q", "e", "s"}:
+        return f"{normalized}."
+    return normalized
+
+
+def _duration_to_ticks(duration: str | None) -> int:
+    """Parse a duration token, falling back to a quarter note."""
+    if not duration:
+        return TICKS_PER_QUARTER
+    normalized = _normalize_duration_name(duration)
+    if normalized in _DURATION_SHORTHAND_TO_TICKS:
+        return _DURATION_SHORTHAND_TO_TICKS[normalized]
+    if normalized.endswith("."):
+        base = normalized[:-1]
+        base_ticks = _DURATION_SHORTHAND_TO_TICKS.get(base)
+        if base_ticks is not None:
+            return int(round(base_ticks * 1.5))
+    return _DURATION_SHORTHAND_TO_TICKS.get(normalized, TICKS_PER_QUARTER)
+
+
+def subject_string_to_events(subject_str: str) -> list[ParsedSubjectEvent]:
+    """Parse a subject string into note/rest events starting at tick 0."""
+    events: list[ParsedSubjectEvent] = []
     current_time = 0
 
     for part in subject_str.strip().split():
         if ":" in part:
             note_str, dur_str = part.split(":", 1)
-            dur_ticks = _DURATION_SHORTHAND_TO_TICKS.get(dur_str, TICKS_PER_QUARTER)
         else:
-            note_str = part
-            dur_ticks = TICKS_PER_QUARTER
+            note_str, dur_str = part, None
 
-        midi_note = parse_note_string(note_str)
-        if midi_note is None:
-            logger.warning(f"Could not parse note: {note_str}")
+        duration_ticks = _duration_to_ticks(dur_str)
+        note_key = note_str.strip()
+        if note_key.lower() in _REST_TOKENS:
+            events.append(ParsedSubjectEvent(current_time, duration_ticks, None))
+            current_time += duration_ticks
             continue
 
-        events.append((current_time, dur_ticks, midi_note))
-        current_time += dur_ticks
+        midi_note = parse_note_string(note_key)
+        if midi_note is None:
+            logger.warning("Could not parse note: %s", note_key)
+            continue
+
+        events.append(ParsedSubjectEvent(current_time, duration_ticks, midi_note))
+        current_time += duration_ticks
 
     return events
+
+
+def subject_string_to_note_events(subject_str: str) -> list[tuple[int, int, int]]:
+    """Parse a subject string into note events starting at tick 0.
+
+    Rests advance time but are omitted from the returned note-event list.
+    """
+    return [
+        (event.start_tick, event.duration_ticks, event.midi_note)
+        for event in subject_string_to_events(subject_str)
+        if event.midi_note is not None
+    ]
 
 
 def parse_subject_string(

@@ -803,7 +803,7 @@ def _apply_conditioning_dropout_to_sequences(
 @click.option("--mode", "-m", type=click.Choice(VALID_FORMS), default="all",
               help="Composition mode (determines voice count)")
 @click.option("--voices", type=int, default=None,
-              help="Override number of voices (default: from mode)")
+              help="Override number of voices (default: 3 for fugue live mode)")
 @click.option("--tokenizer", "tokenizer_type",
               type=click.Choice(["absolute", "scale-degree"]), default="scale-degree",
               help="Tokenizer type: absolute (default) or scale-degree (key-agnostic)")
@@ -2086,7 +2086,7 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None,
 
 
 @cli.command()
-@click.option("--key", "-k", required=True, help="Key (e.g., 'C minor', 'D major')")
+@click.option("--key", "-k", default=None, help="Key (e.g., 'C minor', 'D major')")
 @click.option("--subject", "-s", default=None, help="Subject notes (e.g., 'C4 D4 Eb4 F4')")
 @click.option("--candidates", "-n", default=100, help="Number of candidates to generate")
 @click.option("--top", "-t", default=3, help="Number of top results to return")
@@ -2147,7 +2147,7 @@ def train(epochs: int, lr: float, batch_size: int, seq_len: int | None,
     help="Candidate ranking objective (selection only; does not change scoring).",
 )
 def generate(
-    key: str,
+    key: str | None,
     subject: str | None,
     candidates: int,
     top: int,
@@ -2405,6 +2405,254 @@ def generate(
     console.print()
     console.print(table)
     console.print(f"\n[green]MIDI files saved to {OUTPUT_DIR}/[/green]")
+
+
+@cli.command("live")
+@click.option("--key", "-k", default=None, help="Key (e.g., 'C minor', 'D major')")
+@click.option("--subject", "-s", default=None, help="Subject notes (e.g., 'C4:q D4:e r:e Eb4:q')")
+@click.option("--subject-midi", default=None, type=click.Path(exists=True),
+              help="Path to a MIDI file whose first non-empty track seeds the opening subject")
+@click.option("--midi-port", default=None, help="MIDI output port name (default: first available port)")
+@click.option("--list-midi-ports", is_flag=True, default=False, help="List available MIDI output ports and exit")
+@click.option("--tempo-bpm", default=120.0, type=float, help="Playback tempo for live MIDI output")
+@click.option("--prebuffer-bars", default=4, type=int,
+              help="Bars to buffer before starting playback")
+@click.option("--low-water-bars", default=2, type=int,
+              help="Refill threshold in bars once playback has started")
+@click.option("--max-live-tokens", default=None, type=int,
+              help="Optional token cap for finite live sessions (default: endless)")
+@click.option("--temperature", default=0.94, type=float, help="Sampling temperature")
+@click.option("--min-p", default=0.03, type=float,
+              help="Min-p sampling threshold (recommended primary control; 0 disables)")
+@click.option("--model-path", default=None, help="Path to model checkpoint")
+@click.option("--mode", "-m", type=click.Choice(VALID_FORMS), default=None,
+              help="Composition mode (default: auto-detect from data)")
+@click.option("--voices", type=int, default=None,
+              help="Override number of voices (default: from mode)")
+@click.option("--style", type=click.Choice(["bach", "baroque", "renaissance", "classical", "romantic", "modern", "medieval", "other"]),
+              default="bach", help="Style conditioning (default: bach)")
+@click.option("--length", type=click.Choice(["short", "medium", "long", "extended"]),
+              default=None, help="Length conditioning (default: infer from form)")
+@click.option("--meter", type=click.Choice(["2_4", "3_4", "4_4", "6_8", "3_8", "alla_breve"]),
+              default=None, help="Meter conditioning (default: alla_breve for live fugue)")
+@click.option("--texture", type=click.Choice(["homophonic", "polyphonic", "mixed"]),
+              default=None, help="Texture conditioning")
+@click.option("--imitation", type=click.Choice(["none", "low", "high"]),
+              default=None, help="Imitation conditioning")
+@click.option("--harmonic-rhythm", type=click.Choice(["slow", "moderate", "fast"]),
+              default=None, help="Harmonic rhythm conditioning")
+@click.option("--tension", type=click.Choice(["low", "moderate", "high"]),
+              default=None, help="Harmonic tension conditioning")
+@click.option("--chromaticism", type=click.Choice(["low", "moderate", "high"]),
+              default=None, help="Chromaticism conditioning")
+@click.option("--cadence-density", type=click.Choice(["low", "medium", "high"]),
+              default=None, help="Bias cadence marker injection frequency")
+@click.option("--subject-remind-bars", default=None, type=int,
+              help="If set, re-inject SUBJECT_START every N bars during live generation")
+@click.option("--mps-bf16", is_flag=True, default=False,
+              help="Opt into bf16 model weights for live generation on Apple MPS to reduce memory usage")
+@click.option("--single-channel/--split-channels", default=True,
+              help="Send all voices on one MIDI channel or split voices across channels")
+@click.option("--channel-base", default=None, type=int,
+              help="Base MIDI channel (0-15, default: auto -> channel 1)")
+@click.option("--velocity", default=80, type=int,
+              help="Fixed MIDI velocity for generated notes (1-127)")
+@click.option("--panic-on-exit/--no-panic-on-exit", default=True,
+              help="Send all-notes-off when the live session exits")
+def live(
+    key: str | None,
+    subject: str | None,
+    subject_midi: str | None,
+    midi_port: str | None,
+    list_midi_ports: bool,
+    tempo_bpm: float,
+    prebuffer_bars: int,
+    low_water_bars: int,
+    max_live_tokens: int | None,
+    temperature: float,
+    min_p: float,
+    model_path: str | None,
+    mode: str | None,
+    voices: int | None,
+    style: str,
+    length: str | None,
+    meter: str | None,
+    texture: str | None,
+    imitation: str | None,
+    harmonic_rhythm: str | None,
+    tension: str | None,
+    chromaticism: str | None,
+    cadence_density: str | None,
+    subject_remind_bars: int | None,
+    mps_bf16: bool,
+    single_channel: bool,
+    channel_base: int | None,
+    velocity: int,
+    panic_on_exit: bool,
+) -> None:
+    """Stream live MIDI generation to an output port."""
+    from bach_gen.data.tokenizer import load_tokenizer
+    from bach_gen.generation.live import (
+        autodetect_channel_base,
+        autodetect_midi_output_port,
+        list_midi_output_ports,
+        run_live_generation,
+    )
+    from bach_gen.model.trainer import Trainer
+    import mido
+
+    if subject and subject_midi:
+        console.print("[red]Specify at most one of --subject or --subject-midi.[/red]")
+        sys.exit(1)
+    if prebuffer_bars < 1:
+        console.print("[red]--prebuffer-bars must be >= 1[/red]")
+        sys.exit(1)
+    if low_water_bars < 1:
+        console.print("[red]--low-water-bars must be >= 1[/red]")
+        sys.exit(1)
+    if subject_remind_bars is not None and subject_remind_bars < 1:
+        console.print("[red]--subject-remind-bars must be >= 1[/red]")
+        sys.exit(1)
+    if channel_base is not None and not (0 <= channel_base <= 15):
+        console.print("[red]--channel-base must be between 0 and 15[/red]")
+        sys.exit(1)
+    if not (1 <= velocity <= 127):
+        console.print("[red]--velocity must be between 1 and 127[/red]")
+        sys.exit(1)
+
+    available_ports = list_midi_output_ports()
+    if list_midi_ports:
+        console.print("[bold]Available MIDI output ports:[/bold]")
+        if available_ports:
+            for port in available_ports:
+                console.print(f"  {port}")
+        else:
+            console.print("  (none found)")
+        return
+    if not key:
+        console.print("[red]--key is required unless you are only listing MIDI ports.[/red]")
+        sys.exit(1)
+
+    mode_path = DATA_DIR / "mode.json"
+    mode_info = {}
+    if mode_path.exists():
+        with open(mode_path) as f:
+            mode_info = json.load(f)
+    if mode is None:
+        mode = mode_info.get("mode", "fugue")
+    if mode == "all":
+        mode = "fugue"
+
+    if voices is None and mode == "fugue":
+        num_voices = 3
+    else:
+        num_voices = voices or FORM_DEFAULTS.get(mode, (2, 768))[0]
+
+    if meter is None and mode == "fugue":
+        meter = "alla_breve"
+    if texture is None and mode == "fugue":
+        texture = "polyphonic"
+    if imitation is None and mode == "fugue":
+        imitation = "high"
+    if harmonic_rhythm is None and mode == "fugue":
+        harmonic_rhythm = "moderate"
+    if tension is None and mode == "fugue":
+        tension = "moderate"
+    if chromaticism is None and mode == "fugue":
+        chromaticism = "high"
+
+    if model_path is None:
+        model_path = MODELS_DIR / "best.pt"
+        if not model_path.exists():
+            model_path = MODELS_DIR / "latest.pt"
+        if not model_path.exists():
+            model_path = MODELS_DIR / "final.pt"
+
+    if not Path(model_path).exists():
+        console.print(f"[red]No model found at {model_path}. Run 'bach-gen train' first.[/red]")
+        sys.exit(1)
+
+    selected_port = midi_port
+    if selected_port is None:
+        if not available_ports:
+            console.print("[red]No MIDI output ports available. Use --list-midi-ports to inspect the backend.[/red]")
+            sys.exit(1)
+        selected_port = autodetect_midi_output_port(available_ports)
+
+    resolved_channel_base = channel_base if channel_base is not None else autodetect_channel_base(selected_port)
+
+    console.print(f"[bold]Loading model from {model_path}...[/bold]")
+    model, _config = Trainer.load_checkpoint(model_path)
+    model, mps_precision_state = _maybe_cast_generation_model_for_mps(
+        model, mps_bf16=mps_bf16,
+    )
+    tokenizer = load_tokenizer(DATA_DIR / "tokenizer.json")
+
+    console.print(f"\n[bold]Starting live {mode} in {key}...[/bold]")
+    console.print(f"  MIDI port: {selected_port}")
+    if midi_port is None:
+        console.print("  MIDI port selection: auto")
+    console.print(f"  Tempo: {tempo_bpm:.1f} BPM")
+    console.print(f"  Buffer: {prebuffer_bars} bars (refill at {low_water_bars} bars)")
+    console.print("  Prompt memory: pinned")
+    console.print(f"  Output channels: {'single' if single_channel else 'split by voice'}")
+    console.print(f"  MIDI channel base: {resolved_channel_base + 1}{' (auto)' if channel_base is None else ''}")
+    if max_live_tokens is None:
+        console.print("  Mode: endless")
+    else:
+        console.print(f"  Mode: finite ({max_live_tokens} generated tokens)")
+    if subject:
+        console.print(f"  Subject: {subject}")
+    if subject_midi:
+        console.print(f"  Subject MIDI: {subject_midi}")
+    if subject_remind_bars is not None:
+        console.print(f"  Subject reminders: every {subject_remind_bars} bars")
+    if cadence_density is not None:
+        console.print(f"  Cadence density control: {cadence_density}")
+    if mps_precision_state == "enabled":
+        console.print("  MPS generation precision: bf16")
+    elif mps_precision_state == "ignored_non_mps":
+        console.print("  MPS generation precision: requested bf16, ignored because device is not MPS")
+
+    try:
+        with mido.open_output(selected_port) as midi_out:
+            run_live_generation(
+                model=model,
+                tokenizer=tokenizer,
+                midi_out=midi_out,
+                key_str=key,
+                subject_str=subject,
+                subject_midi=subject_midi,
+                temperature=temperature,
+                min_p=min_p,
+                max_live_tokens=max_live_tokens,
+                form=mode,
+                num_voices=num_voices if voices else None,
+                style=style,
+                length=length,
+                meter=meter,
+                texture=texture,
+                imitation=imitation,
+                harmonic_rhythm=harmonic_rhythm,
+                harmonic_tension=tension,
+                chromaticism=chromaticism,
+                cadence_density=cadence_density,
+                subject_remind_bars=subject_remind_bars,
+                tempo_bpm=tempo_bpm,
+                prebuffer_bars=prebuffer_bars,
+                low_water_bars=low_water_bars,
+                channel_base=resolved_channel_base,
+                single_channel=single_channel,
+                velocity=velocity,
+                panic_on_exit=panic_on_exit,
+            )
+    except Exception as exc:
+        console.print(f"[red]Live MIDI failed: {exc}[/red]")
+        if available_ports:
+            console.print("[dim]Available ports:[/dim]")
+            for port in available_ports:
+                console.print(f"  {port}")
+        sys.exit(1)
 
 
 @cli.command()

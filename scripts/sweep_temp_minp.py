@@ -37,6 +37,7 @@ VALID_FORMS = {"fugue", "chorale"}
 SUMMARY_METRIC_TO_KEY = {
     "selection": "selection_score",
     "composite": "composite",
+    "fugue-balance": "selection_score",
     "bach-similarity": "bach_similarity",
     "demo-bach-balance": "demo_bach_balance",
     "rhetorical-impact": "rhetorical_impact",
@@ -244,7 +245,7 @@ def main() -> None:
     parser.add_argument(
         "--rank-by",
         default="composite",
-        choices=["composite", "bach-similarity", "rhetorical-impact", "demo-bach-balance"],
+        choices=["composite", "fugue-balance", "bach-similarity", "rhetorical-impact", "demo-bach-balance"],
         help="Candidate ranking objective passed to generation.",
     )
     parser.add_argument(

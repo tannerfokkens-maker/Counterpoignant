@@ -489,10 +489,20 @@ def generate(
 
     # Build prompt
     prompt_tokens = _build_prompt(
-        tokenizer, key_root, key_mode, key_name, subject_str, form, style,
+        tokenizer=tokenizer,
+        key_root=key_root,
+        key_mode=key_mode,
+        key_name=key_name,
+        subject_str=subject_str,
+        form=form,
+        style=style,
         num_voices=num_voices,
-        length=length, meter=meter, texture=texture, imitation=imitation,
-        harmonic_rhythm=harmonic_rhythm, harmonic_tension=harmonic_tension,
+        length=length,
+        meter=meter,
+        texture=texture,
+        imitation=imitation,
+        harmonic_rhythm=harmonic_rhythm,
+        harmonic_tension=harmonic_tension,
         chromaticism=chromaticism,
     )
 
@@ -706,6 +716,7 @@ def _build_prompt(
     key_mode: str,
     key_name: str,
     subject_str: str | None,
+    subject_note_events: list[tuple[int, int, int]] | None = None,
     form: str = "2-part",
     style: str = "bach",
     num_voices: int | None = None,
@@ -835,13 +846,15 @@ def _build_prompt(
     if key_token_name in tokenizer.name_to_token:
         tokens.append(tokenizer.name_to_token[key_token_name])
 
-    if subject_str and encoding_mode == "interleaved":
-        subject_events = _encode_subject_prompt_events(
+    if encoding_mode == "interleaved" and (subject_note_events or subject_str):
+        if subject_note_events is None:
+            subject_note_events = subject_string_to_note_events(subject_str or "")
+        subject_events = _encode_subject_prompt_note_events(
             tokenizer=tokenizer,
             key_root=key_root,
             key_mode=key_mode,
             key_name=key_name,
-            subject_str=subject_str,
+            subject_notes=subject_note_events,
             form=form,
             style=style,
             num_voices=num_voices,
@@ -895,6 +908,41 @@ def _encode_subject_prompt_events(
 ) -> list[int]:
     """Encode a prompted subject using the tokenizer's training-data event format."""
     subject_notes = subject_string_to_note_events(subject_str)
+    return _encode_subject_prompt_note_events(
+        tokenizer=tokenizer,
+        key_root=key_root,
+        key_mode=key_mode,
+        key_name=key_name,
+        subject_notes=subject_notes,
+        form=form,
+        style=style,
+        num_voices=num_voices,
+        meter=meter,
+        texture=texture,
+        imitation=imitation,
+        harmonic_rhythm=harmonic_rhythm,
+        harmonic_tension=harmonic_tension,
+        chromaticism=chromaticism,
+    )
+
+
+def _encode_subject_prompt_note_events(
+    tokenizer: BachTokenizer,
+    key_root: int,
+    key_mode: str,
+    key_name: str,
+    subject_notes: list[tuple[int, int, int]],
+    form: str,
+    style: str,
+    num_voices: int | None,
+    meter: str | None,
+    texture: str | None,
+    imitation: str | None,
+    harmonic_rhythm: str | None,
+    harmonic_tension: str | None,
+    chromaticism: str | None,
+) -> list[int]:
+    """Encode prompted subject note events using the tokenizer's event format."""
     if not subject_notes:
         return []
 
