@@ -1,6 +1,6 @@
-# Bach Gen
+# Counterpoignant
 
-`bach-gen` is a symbolic music research project for generating, training, evaluating, and live-streaming Bach-adjacent counterpoint.
+`Counterpoignant` is a symbolic music research project for generating, training, evaluating, and live-streaming Bach-adjacent counterpoint.
 
 The project is not just a MIDI generator. It includes:
 
@@ -67,11 +67,11 @@ The more unusual pieces are:
 - **DroPE recalibration**
   - after normal positional training, the model can be recalibrated with positional embeddings removed
 
-This combination makes the project more experimental than a plain small transformer baseline.
+This combination makes Counterpoignant more experimental than a plain small transformer baseline.
 
 ## Training Pipeline
 
-The pipeline starts with `bach-gen prepare-data`.
+The pipeline starts with the `prepare-data` command.
 
 ### 1. Corpus ingestion and extraction
 
@@ -139,7 +139,7 @@ The dataset also preserves the conditioning prefix when randomly cropping long s
 
 ### 6. Training phases
 
-`bach-gen train` supports several regimes:
+The training CLI supports several regimes:
 
 - **single-phase training**
   - standard LM training on one prepared dataset
@@ -178,7 +178,7 @@ The composite score is not the only selection signal. The generator can also ran
 - `demo-bach-balance`
 - `fugue-balance`
 
-This makes the generation stack closer to evaluator-guided search than naive sampling.
+This makes Counterpoignant's generation stack closer to evaluator-guided search than naive sampling.
 
 ## Live Mode
 
@@ -195,7 +195,7 @@ Features:
 - single-channel or multi-channel synth output
 - MIDI port auto-detection
 
-This is implemented in [live.py](src/bach_gen/generation/live.py), surfaced in `bach-gen live`, and wrapped by the GUI app.
+This is implemented in [live.py](src/bach_gen/generation/live.py), surfaced through the live CLI, and wrapped by the GUI app.
 
 ## Desktop App
 
@@ -219,6 +219,8 @@ It provides:
 ## Installation
 
 Python `3.12+` is required.
+
+The project name is `Counterpoignant`; the current installed command names remain `bach-gen` and `bach-gen-studio`.
 
 Install from the repo root:
 
